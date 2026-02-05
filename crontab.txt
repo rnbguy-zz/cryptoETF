@@ -1,0 +1,8 @@
+0 8 * * * /usr/bin/find /tmp -mindepth 1 -exec rm -rf {} +
+2 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/slope_history.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+5 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/lambdatester_first_slopeonly.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+7 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/timeslope_plotter_positive.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+9 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/oversoldanalysis.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+10 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/buysignal.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+*/15 * * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/volumemonitor.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+0 8 * * * /usr/bin/find /home/ec2-user/pythonProject1/outputs -type f -name 'output_*.xlsx' | /usr/bin/awk -F'[_.]' '{print $2}' | while read d; do if [ "$(/usr/bin/date -d "$d" +\%s)" -lt "$(/usr/bin/date -d "95 days ago" +\%s)" ]; then rm -f "/home/ec2-user/pythonProject1/outputs/output_${d}.xlsx"; fi; done

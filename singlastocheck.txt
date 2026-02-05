@@ -1,0 +1,2 @@
+GIGGLEUSDT         LPS=100  Mom=22.97/25 (>= 22.0)  DropPct=0.80 (<= 0.9)  PrevRSI_Pct=0.92 (>= 0.85)  |RSI-45|=0.18 (<= 0.2)  Drop=22.89 PrevRSI=68.07 CurRSI=45.18  Dates 2026-01-02->2026-01-27  File=2026-01-30_oversold.txt
+PEPEUSDT           LPS=100  Mom=22.13/25 (>= 22.0)  DropPct=0.45 (<= 0.9)  PrevRSI_Pct=0.89 (>= 0.85)  |RSI-45|=0.02 (<= 0.2)  Drop=19.99 PrevRSI=65.01 CurRSI=45.02  Dates 2026-01-27->2026-01-30  File=2026-01-30_oversold.txt
