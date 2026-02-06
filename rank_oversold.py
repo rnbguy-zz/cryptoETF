@@ -46,7 +46,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn import __version__ as sklearn_version
-
+import tempfile
+import socket
 
 # ============================================================
 # EMAIL CONFIG (use env vars if set; falls back to defaults)
@@ -57,14 +58,17 @@ SENDER_PASSWORD = os.getenv("OVERSOLD_SENDER_PASSWORD", "qhvi syra bbad gylu")  
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
-
+SMTP_TIMEOUT_SEC = 30        # <-- ADD THIS LINE
 
 def send_email_with_analysis(body: str, df: Optional[pd.DataFrame] = None, directory: str = ".") -> None:
     """
-    Always attempts to send email. Attaches filtered CSV if df has rows.
+    Sends the email and (optionally) attaches df as CSV.
+    - Uses a connection timeout so it can't hang forever.
+    - Writes attachment to a fast temp dir by default (call with directory=tempfile.gettempdir()).
+    - Prints step-by-step progress so you know where it's stuck.
     """
     if not SENDER_PASSWORD:
-        print("Email not sent: OVERSOLD_SENDER_PASSWORD is empty.", file=sys.stderr)
+        print("Email not sent: OVERSOLD_SENDER_PASSWORD is empty.", file=sys.stderr, flush=True)
         return
 
     msg = MIMEMultipart()
@@ -73,26 +77,50 @@ def send_email_with_analysis(body: str, df: Optional[pd.DataFrame] = None, direc
     msg["Subject"] = "Oversold Analysis Alert"
     msg.attach(MIMEText(body, "plain"))
 
+    temp_csv = None
     if df is not None and not df.empty:
-        os.makedirs(directory, exist_ok=True)
-        temp_csv = os.path.join(directory, "filtered_output.csv")
-        df.to_csv(temp_csv, index=False)
+        try:
+            os.makedirs(directory, exist_ok=True)
+            temp_csv = os.path.join(directory, "filtered_output.csv")
 
-        with open(temp_csv, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(temp_csv)}"')
-        msg.attach(part)
+            print(f"[EMAIL] writing attachment csv -> {temp_csv}", flush=True)
+            t0 = time.time()
+            df.to_csv(temp_csv, index=False)
+            print(f"[EMAIL] wrote csv in {time.time()-t0:.1f}s", flush=True)
+
+            print("[EMAIL] attaching csv...", flush=True)
+            with open(temp_csv, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(temp_csv)}"')
+            msg.attach(part)
+        except Exception as e:
+            print(f"[EMAIL] attachment step failed (continuing without attachment): {e}", file=sys.stderr, flush=True)
+
+    # Make socket default timeout too (extra safety)
+    try:
+        socket.setdefaulttimeout(SMTP_TIMEOUT_SEC)
+    except Exception:
+        pass
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        print(f"[EMAIL] connecting to {SMTP_HOST}:{SMTP_PORT} (timeout={SMTP_TIMEOUT_SEC}s)...", flush=True)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SEC) as server:
+            print("[EMAIL] starttls...", flush=True)
             server.starttls()
+
+            print("[EMAIL] login...", flush=True)
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
+
+            print("[EMAIL] send_message...", flush=True)
             server.send_message(msg)
-        print("Email sent.")
+
+        print("[EMAIL] sent ok.", flush=True)
+
     except Exception as e:
-        print("Error sending email:", e, file=sys.stderr)
+        print(f"[EMAIL] ERROR sending email: {e}", file=sys.stderr, flush=True)
+
 
 
 # ============================================================
@@ -651,11 +679,6 @@ def runup_to_high_until_today(
     store_dir: Path,
     include_today: bool = True,
 ) -> Optional[Dict[str, float]]:
-    """
-    Run-up from ENTRY DAY OPEN to highest HIGH from entry_day through:
-      - today UTC (including today's in-progress 1d candle) if include_today=True
-      - otherwise through last closed UTC day
-    """
     end_day = datetime.utcnow().date() if include_today else (datetime.utcnow().date() - timedelta(days=1))
     if entry_day > end_day:
         return None
@@ -667,12 +690,14 @@ def runup_to_high_until_today(
     dday = pd.to_datetime(df["day"], errors="coerce").dt.date
     opens = pd.to_numeric(df["open"], errors="coerce")
     highs = pd.to_numeric(df["high"], errors="coerce")
+    closes = pd.to_numeric(df["close"], errors="coerce")
 
-    ok = dday.notna() & opens.notna() & highs.notna()
+    ok = dday.notna() & opens.notna() & highs.notna() & closes.notna()
     df = df.loc[ok].copy()
     dday = dday.loc[ok]
     opens = opens.loc[ok]
     highs = highs.loc[ok]
+    closes = closes.loc[ok]
     if df.empty:
         return None
 
@@ -681,17 +706,31 @@ def runup_to_high_until_today(
         return None
 
     entry_open = float(opens.loc[entry_mask].iloc[0])
+
+    # max high since entry
     max_idx = highs.idxmax()
     max_high = float(highs.loc[max_idx])
     max_high_date = dday.loc[max_idx].isoformat()
     runup_pct = ((max_high / max(entry_open, 1e-12)) - 1.0) * 100.0
+
+    # "to now" = last available close in the window (includes today's in-progress candle if include_today=True)
+    last_idx = dday.idxmax()
+    last_close = float(closes.loc[last_idx])
+    last_close_date = dday.loc[last_idx].isoformat()
+    gain_to_now_pct = ((last_close / max(entry_open, 1e-12)) - 1.0) * 100.0
 
     return {
         "entry_open": entry_open,
         "max_high_to_today": max_high,
         "max_high_date": max_high_date,
         "runup_to_high_pct": float(runup_pct),
+
+        # NEW:
+        "last_close_to_now": last_close,
+        "last_close_date": last_close_date,
+        "gain_to_now_pct": float(gain_to_now_pct),
     }
+
 
 
 # ============================================================
@@ -845,7 +884,16 @@ def build_features_for_symbol(history: List[OversoldHit], asof_file_date: date) 
 
     return feats
 
-def _label_symbol_rows(sym: str, sym_rows: List[Dict]) -> List[Dict]:
+
+def _label_symbol_rows(
+    sym: str,
+    sym_rows: List[Dict],
+    *,
+    entry_lag_days: int,
+    horizon_days: int,
+    store_dir: Path,
+    target_pct: float,
+) -> List[Dict]:
     s = get_thread_session()
 
     fdays = [datetime.strptime(r["file_date"], "%Y-%m-%d").date() for r in sym_rows]
@@ -876,7 +924,6 @@ def _label_symbol_rows(sym: str, sym_rows: List[Dict]) -> List[Dict]:
         out.append(r)
 
     return out
-
 
 def build_ml_table(
     hits: List[OversoldHit],
@@ -944,7 +991,18 @@ def build_ml_table(
                 rows.append(base_row)
 
     with ThreadPoolExecutor(max_workers=max(1, int(dl_workers))) as ex:
-        futs = [ex.submit(_label_symbol_rows, sym, sym_rows) for sym, sym_rows in train_rows_by_symbol.items()]
+        futs = [
+            ex.submit(
+                _label_symbol_rows,
+                sym,
+                sym_rows,
+                entry_lag_days=entry_lag_days,
+                horizon_days=horizon_days,
+                store_dir=store_dir,
+                target_pct=target_pct,
+            )
+            for sym, sym_rows in train_rows_by_symbol.items()
+        ]
         for fut in futs:
             rows.extend(fut.result())
 
@@ -1435,7 +1493,7 @@ def build_email_body(
         lines.append(f"target_pct:           {target_pct}")
         lines.append(f"sklearn:              {model_meta.get('sklearn_version')}")
         lines.append(f"created_utc:          {model_meta.get('created_utc')}")
-        lines.append("drop_feature:         feat_prob_drop10 (from downside model)")
+        lines.append("drop_feature:         feat_prob_drop10 (from downside model or fallback)")
         if "gate" in model_meta:
             g = model_meta.get("gate", {})
             lines.append(f"gate_used_default:    {g.get('used_default')}")
@@ -1466,6 +1524,8 @@ def build_email_body(
         except Exception:
             return "NA"
 
+    overall_gains: List[float] = []
+
     for d_str in sorted(df_pred["file_date"].unique().tolist()):
         dd = df_pred[df_pred["file_date"] == d_str].copy()
         if dd.empty:
@@ -1473,7 +1533,7 @@ def build_email_body(
 
         dd = dd.sort_values("prob_up_target_h", ascending=False).head(topk)
 
-        btc_mood = str(dd["btc_mood"].iloc[0]) if "btc_mood" in dd.columns else "UNKNOWN"
+        btc_mood = str(dd["btc_mood"].iloc[0]) if "btc_mood" in dd.columns else "BULLISH"
         btc_day = str(dd["btc_mood_day"].iloc[0]) if "btc_mood_day" in dd.columns else ""
         btc_chg = dd["btc_change_pct"].iloc[0] if "btc_change_pct" in dd.columns else np.nan
         btc_chg_s = f"{float(btc_chg):+.2f}%" if pd.notna(btc_chg) else "NA"
@@ -1481,14 +1541,34 @@ def build_email_body(
 
         lines.append(f"\nfile={d_str}  (top {len(dd)})  threshold={threshold}  {btc_banner}")
 
+        block_gains: List[float] = []
+
         for _, r in dd.iterrows():
+            g = r.get("gain_to_now_pct", np.nan)
+            try:
+                g_f = float(g)
+            except Exception:
+                g_f = float("nan")
+
+            if np.isfinite(g_f):
+                overall_gains.append(g_f)
+                block_gains.append(g_f)
+
             lines.append(
                 f"BUY  {str(r['symbol']):12s}  p={_fmt_prob(r.get('prob_up_target_h', np.nan))}  "
                 f"hits30d={int(r.get('hits_30d', 0) or 0)}  "
+                f"gainToNow={_fmt_pct(g_f)}  "
                 f"runupToHigh={_fmt_pct(r.get('runup_to_high_pct', np.nan))}  "
                 f"maxHighDate={str(r.get('max_high_date', ''))}  "
                 f"featDropP={_fmt_prob(r.get('feat_prob_drop10', np.nan))}"
             )
+
+        if block_gains:
+            lines.append(f"AVG gainToNow (file={d_str}) = {np.mean(block_gains):.2f}%")
+
+    if overall_gains:
+        lines.append("")
+        lines.append(f"AVG gainToNow (ALL printed BUY lines) = {np.mean(overall_gains):.2f}%")
 
     return "\n".join(lines)
 
@@ -1771,6 +1851,9 @@ def main() -> int:
         df_pred["max_high_to_today"] = np.nan
         df_pred["max_high_date"] = ""
         df_pred["runup_to_high_pct"] = np.nan
+        df_pred["last_close_to_now"] = np.nan
+        df_pred["last_close_date"] = ""
+        df_pred["gain_to_now_pct"] = np.nan
 
         def _runup_task(sym: str, entry_day: date) -> Optional[Dict[str, float]]:
             s = get_thread_session()
@@ -1791,6 +1874,9 @@ def main() -> int:
                 df_pred.at[idx, "max_high_to_today"] = info["max_high_to_today"]
                 df_pred.at[idx, "max_high_date"] = info["max_high_date"]
                 df_pred.at[idx, "runup_to_high_pct"] = info["runup_to_high_pct"]
+                df_pred.at[idx, "last_close_to_now"] = info.get("last_close_to_now", np.nan)
+                df_pred.at[idx, "last_close_date"] = info.get("last_close_date", "")
+                df_pred.at[idx, "gain_to_now_pct"] = info.get("gain_to_now_pct", np.nan)
 
     # Write csv (kept)
     df_pred.to_csv(OUT_PATH, index=False)
@@ -1798,32 +1884,40 @@ def main() -> int:
 
     # Print summary
     print("\n=== TOP CANDIDATES (predict window; BTC mood=BULLISH ONLY) ===")
-    if 600==1: 
-    #df_pred.empty:
+    if df_pred.empty:
         print("(none after filters)")
     else:
+        overall_gains = []
+
         for d_str in sorted(df_pred["file_date"].unique().tolist()):
             dd = df_pred[df_pred["file_date"] == d_str].copy()
             if dd.empty:
                 continue
-
             dd = dd.sort_values("prob_up_target_h", ascending=False).head(TOPK)
 
-            btc_mood = str(dd["btc_mood"].iloc[0]) if "btc_mood" in dd.columns else "UNKNOWN"
-            btc_day = str(dd["btc_mood_day"].iloc[0]) if "btc_mood_day" in dd.columns else ""
-            btc_chg = dd["btc_change_pct"].iloc[0] if "btc_change_pct" in dd.columns else np.nan
-            btc_chg_s = f"{float(btc_chg):+.2f}%" if pd.notna(btc_chg) else "NA"
-            btc_banner = f"BTC({btc_day})={btc_mood} {btc_chg_s}" if btc_day else f"BTC={btc_mood}"
-
+            btc_banner = f"BTC({dd['btc_mood_day'].iloc[0]})={dd['btc_mood'].iloc[0]} {dd['btc_change_pct'].iloc[0]:+.2f}%"
             print(f"\nfile={d_str}  threshold={args.threshold}  {btc_banner}")
+
+            block_gains = []
             for _, r in dd.iterrows():
-                runup = r.get("runup_to_high_pct", np.nan)
-                maxd = r.get("max_high_date", "")
-                feat_pdrop = r.get("feat_prob_drop10", np.nan)
+                g = float(r.get("gain_to_now_pct", np.nan))
+                if np.isfinite(g):
+                    overall_gains.append(g)
+                    block_gains.append(g)
+
                 print(
                     f"BUY  {r['symbol']:12s}  p={r['prob_up_target_h']:.3f}  "
-                    f"featDropP={feat_pdrop:.3f}  runupToHigh={runup:.1f}%  maxHighDate={maxd}"
+                    f"featDropP={float(r.get('feat_prob_drop10', 0.5)):.3f}  "
+                    f"gainToNow={g:.1f}%  "
+                    f"runupToHigh={float(r.get('runup_to_high_pct', np.nan)):.1f}%  "
+                    f"maxHighDate={r.get('max_high_date', '')}"
                 )
+
+            if block_gains:
+                print(f"AVG gainToNow (file={d_str}) = {np.mean(block_gains):.2f}%")
+
+        if overall_gains:
+            print(f"\nAVG gainToNow (ALL printed BUY lines) = {np.mean(overall_gains):.2f}%")
 
     # Email
     body = build_email_body(
@@ -1838,7 +1932,8 @@ def main() -> int:
         model_meta=model_meta,
         topk=TOPK,
     )
-    send_email_with_analysis(body, df=df_pred, directory=str(folder))
+    import tempfile
+    send_email_with_analysis(body, df=df_pred, directory=tempfile.gettempdir())
 
     return 0
 

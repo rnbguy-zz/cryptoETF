@@ -41,12 +41,17 @@ from sklearn.model_selection import train_test_split
 from sklearn import __version__ as sklearn_version
 
 
+HOLDOUT_DAYS = 7
+ENTRY_LAG_DAYS = 1
+HORIZON_DAYS = 7
+
+
 # ============================================================
 # EMAIL CONFIG (ENV VARS ONLY FOR PASSWORD)
 # ============================================================
 RECIPIENT_EMAIL = os.getenv("OVERSOLD_RECIPIENT_EMAIL", "mina.moussa@hotmail.com")
 SENDER_EMAIL = os.getenv("OVERSOLD_SENDER_EMAIL", "minamoussa903@gmail.com")
-SENDER_PASSWORD = os.getenv("OVERSOLD_SENDER_PASSWORD", "")  # MUST be set in env
+SENDER_PASSWORD = os.getenv("OVERSOLD_SENDER_PASSWORD", "qhvi syra bbad gylu")  # MUST be set in env
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
@@ -578,7 +583,15 @@ def runup_to_high_until_today(
     session: requests.Session,
     store_dir: Path,
     include_today: bool = True,
+    target_pct: float = 0.20,   # <-- NEW: strategy sell target
 ) -> Optional[Dict[str, float]]:
+    """
+    Computes:
+      - runup_to_high_pct (max high since entry vs entry_open)
+      - NEW strategy:
+          If at any point high >= entry_open*(1+target_pct), assume sold at target_pct (first hit day).
+          gain_to_now_pct becomes realized target_pct*100 once sold, else current close vs entry_open.
+    """
     end_day = datetime.utcnow().date() if include_today else (datetime.utcnow().date() - timedelta(days=1))
     if entry_day > end_day:
         return None
@@ -590,12 +603,14 @@ def runup_to_high_until_today(
     dday = pd.to_datetime(df["day"], errors="coerce").dt.date
     opens = pd.to_numeric(df["open"], errors="coerce")
     highs = pd.to_numeric(df["high"], errors="coerce")
+    closes = pd.to_numeric(df["close"], errors="coerce")
 
-    ok = dday.notna() & opens.notna() & highs.notna()
+    ok = dday.notna() & opens.notna() & highs.notna() & closes.notna()
     df = df.loc[ok].copy()
     dday = dday.loc[ok]
     opens = opens.loc[ok]
     highs = highs.loc[ok]
+    closes = closes.loc[ok]
     if df.empty:
         return None
 
@@ -604,17 +619,56 @@ def runup_to_high_until_today(
         return None
 
     entry_open = float(opens.loc[entry_mask].iloc[0])
+
+    # max high since entry
     max_idx = highs.idxmax()
     max_high = float(highs.loc[max_idx])
     max_high_date = dday.loc[max_idx].isoformat()
     runup_pct = ((max_high / max(entry_open, 1e-12)) - 1.0) * 100.0
 
+    # latest close (to "now")
+    last_idx = dday.idxmax()
+    last_close = float(closes.loc[last_idx])
+    last_close_date = dday.loc[last_idx].isoformat()
+
+    # -----------------------------
+    # NEW: "sell after +target_pct"
+    # -----------------------------
+    target_price = entry_open * (1.0 + float(target_pct))
+    hit_mask = highs >= target_price
+
+    sold_at_target = bool(hit_mask.any())
+    sell_date = ""
+    sell_price = np.nan
+
+    if sold_at_target:
+        # First day it hit target
+        first_hit_idx = dday[hit_mask].index[0]
+        sell_date = dday.loc[first_hit_idx].isoformat()
+        sell_price = float(target_price)
+        gain_to_now_pct = float(target_pct) * 100.0  # realized
+    else:
+        gain_to_now_pct = ((last_close / max(entry_open, 1e-12)) - 1.0) * 100.0  # unrealized
+
     return {
         "entry_open": entry_open,
+
         "max_high_to_today": max_high,
         "max_high_date": max_high_date,
         "runup_to_high_pct": float(runup_pct),
+
+        "last_close_to_now": last_close,
+        "last_close_date": last_close_date,
+
+        # NEW strategy fields
+        "sold_at_target": sold_at_target,
+        "sell_price": sell_price,
+        "sell_date": sell_date,
+
+        # NEW meaning: realized at target if hit, else unrealized to now
+        "gain_to_now_pct": float(gain_to_now_pct),
     }
+
 
 
 # ============================================================
@@ -1378,9 +1432,6 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    HOLDOUT_DAYS = 5
-    ENTRY_LAG_DAYS = 1
-    HORIZON_DAYS = 5
     MIN_HISTORY_HITS = 3
     TOPK = 40
     OUT_PATH = Path("ai_predictions.csv")
@@ -1629,10 +1680,23 @@ def main() -> int:
         df_pred["max_high_to_today"] = np.nan
         df_pred["max_high_date"] = ""
         df_pred["runup_to_high_pct"] = np.nan
+        df_pred["last_close_to_now"] = np.nan
+        df_pred["last_close_date"] = ""
+        df_pred["gain_to_now_pct"] = np.nan
+        df_pred["sold_at_target"] = False
+        df_pred["sell_price"] = np.nan
+        df_pred["sell_date"] = ""
 
         def _runup_task(sym: str, entry_day: date) -> Optional[Dict[str, float]]:
             s = get_thread_session()
-            return runup_to_high_until_today(sym, entry_day, session=s, store_dir=store_dir, include_today=True)
+            return runup_to_high_until_today(
+                sym,
+                entry_day,
+                session=s,
+                store_dir=store_dir,
+                include_today=True,
+                target_pct=args.target_pct,  # <-- NEW
+            )
 
         with ThreadPoolExecutor(max_workers=max(1, int(args.dl_workers))) as ex:
             futures = {}
@@ -1649,28 +1713,55 @@ def main() -> int:
                 df_pred.at[idx, "max_high_to_today"] = info["max_high_to_today"]
                 df_pred.at[idx, "max_high_date"] = info["max_high_date"]
                 df_pred.at[idx, "runup_to_high_pct"] = info["runup_to_high_pct"]
+                df_pred.at[idx, "last_close_to_now"] = info.get("last_close_to_now", np.nan)
+                df_pred.at[idx, "last_close_date"] = info.get("last_close_date", "")
+                df_pred.at[idx, "gain_to_now_pct"] = info.get("gain_to_now_pct", np.nan)
+                df_pred.at[idx, "sold_at_target"] = bool(info.get("sold_at_target", False))
+                df_pred.at[idx, "sell_price"] = info.get("sell_price", np.nan)
+                df_pred.at[idx, "sell_date"] = info.get("sell_date", "")
 
     df_pred.to_csv(OUT_PATH, index=False)
     print(f"\nWrote: {OUT_PATH}")
 
     print("\n=== TOP CANDIDATES (predict window; BTC mood=BULLISH ONLY) ===")
+    print("\n=== TOP CANDIDATES (predict window; BTC mood=BULLISH ONLY) ===")
     if df_pred.empty:
         print("(none after filters)")
     else:
+        overall_gains = []
+
         for d_str in sorted(df_pred["file_date"].unique().tolist()):
             dd = df_pred[df_pred["file_date"] == d_str].copy()
             if dd.empty:
                 continue
             dd = dd.sort_values("prob_up_target_h", ascending=False).head(TOPK)
+
             btc_banner = f"BTC({dd['btc_mood_day'].iloc[0]})={dd['btc_mood'].iloc[0]} {dd['btc_change_pct'].iloc[0]:+.2f}%"
             print(f"\nfile={d_str}  threshold={args.threshold}  {btc_banner}")
+
+            block_gains = []
             for _, r in dd.iterrows():
+                g = float(r.get("gain_to_now_pct", np.nan))
+                sold = bool(r.get("sold_at_target", False))
+                sell_tag = f"SOLD@{args.target_pct * 100:.0f}%({r.get('sell_date', '')})" if sold else "HOLD"
+                if np.isfinite(g):
+                    overall_gains.append(g)
+                    block_gains.append(g)
+
                 print(
                     f"BUY  {r['symbol']:12s}  p={r['prob_up_target_h']:.3f}  "
                     f"featDropP={float(r.get('feat_prob_drop10', 0.5)):.3f}  "
+                    f"{sell_tag:18s}  "
+                    f"gainToNow={g:.1f}%  "
                     f"runupToHigh={float(r.get('runup_to_high_pct', np.nan)):.1f}%  "
-                    f"maxHighDate={r.get('max_high_date','')}"
+                    f"maxHighDate={r.get('max_high_date', '')}"
                 )
+
+            if block_gains:
+                print(f"AVG gainToNow (file={d_str}) = {np.mean(block_gains):.2f}%")
+
+        if overall_gains:
+            print(f"\nAVG gainToNow (ALL printed BUY lines) = {np.mean(overall_gains):.2f}%")
 
     body = build_email_body(
         loaded_hits=len(hits),
