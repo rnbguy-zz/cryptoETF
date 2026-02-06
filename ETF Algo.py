@@ -42,7 +42,6 @@ import requests
 FILE_RE = re.compile(r"^\s*file=(\d{4}-\d{2}-\d{2})\b")
 BUY_RE = re.compile(r"^\s*BUY\s+([A-Z0-9]+)\b")
 
-
 @dataclass(frozen=True)
 class Signal:
     file_date: date
@@ -428,6 +427,7 @@ def run_replay(
 ) -> None:
     total_realised_gain = 0.0
     num_closed_trades = 0
+    compounded_factor = 1.0
 
     sig_by_entry_day: Dict[date, List[Signal]] = {}
     for s in signals:
@@ -562,7 +562,10 @@ def run_replay(
                     gain = (pos.exit_price / max(pos.entry_open, 1e-12) - 1.0) * 100.0
                     total_realised_gain += gain
                     num_closed_trades += 1
-
+                    compounded_factor *= (1.0 + gain / 100.0)
+                    # ---- COMPOUND SUMMARY ----
+                    compounded_pct = (compounded_factor - 1.0) * 100.0
+                    print("\n" + "=" * 80)
                     print(
                         f"Sold {sym}: close={day_candle.c:.8g}, high={day_candle.h:.8g}, low={day_candle.l:.8g}, "
                         f"exit={pos.exit_price:.8g} ({reason}), gain={gain:.2f}%. (Position CLOSED)"
@@ -637,6 +640,10 @@ def run_replay(
     else:
         print("No closed trades yet — cannot compute average.")
     print("=" * 80)
+    compounded_pct = (compounded_factor - 1.0) * 100.0
+    print(f"Compounded gain:      {compounded_pct:.2f}%")
+    print("Buy only signals with 0.7+ p-confidence, stop loss -10%, TP +20%")
+
 
 
 # ----------------------------
