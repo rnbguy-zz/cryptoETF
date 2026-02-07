@@ -40,11 +40,9 @@ from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn import __version__ as sklearn_version
 
-
 HOLDOUT_DAYS = 7
 ENTRY_LAG_DAYS = 1
 HORIZON_DAYS = 7
-
 
 # ============================================================
 # EMAIL CONFIG (ENV VARS ONLY FOR PASSWORD)
@@ -55,6 +53,307 @@ SENDER_PASSWORD = os.getenv("OVERSOLD_SENDER_PASSWORD", "qhvi syra bbad gylu")  
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
+
+import json
+
+POSITIONS_PATH = Path("positions_etf.json")
+
+TRAIL_PCT = 0.12  # 12% off peak
+TP_PCT = 0.20  # +20%
+TP_FRACTION = 0.50  # sell half
+HARD_STOP_PCT = 0.10  # -10%
+TIME_STOP_DAYS = 14
+TIME_STOP_MIN_GAIN = 0.05  # +5%
+
+
+def open_new_positions_from_predictions(
+        *,
+        state: dict,
+        df_pred_today: pd.DataFrame,
+        store_dir: Path,
+) -> List[dict]:
+    """
+    Opens new positions for symbols not currently OPEN.
+    entry_price uses entry_day open (UTC daily candle open).
+    """
+    events = []
+    positions = state.setdefault("positions", {})
+
+    if df_pred_today is None or df_pred_today.empty:
+        return events
+
+    for _, r in df_pred_today.iterrows():
+        sym = str(r["symbol"])
+        if sym in positions and positions[sym].get("status") == "OPEN":
+            continue  # one live position per symbol
+
+        entry_day = datetime.strptime(r["entry_date"], "%Y-%m-%d").date()
+        s = get_thread_session()
+        k = get_klines_window(sym, entry_day, entry_day, session=s, store_dir=store_dir)
+        if k is None or k.empty:
+            continue
+
+        entry_px = float(k.iloc[0]["open"])
+        positions[sym] = {
+            "status": "OPEN",
+            "entry_day": entry_day.isoformat(),
+            "entry_price": entry_px,
+            "remaining_frac": 1.0,
+            "took_tp": False,
+            "peak_close": entry_px,
+            "peak_day": entry_day.isoformat(),
+            "trail_px": entry_px * (1.0 - TRAIL_PCT),
+            "meta": {
+                "p": float(r.get("prob_up_target_h", np.nan)),
+                "featDropP": float(r.get("feat_prob_drop10", np.nan)),
+                "source_file_date": str(r.get("file_date", "")),
+            },
+        }
+        _append_event(
+            state, entry_day, sym, "ENTRY",
+            entry_px=entry_px,
+            p=float(r.get("prob_up_target_h", np.nan)),
+            featDropP=float(r.get("feat_prob_drop10", np.nan)),
+        )
+        events.append(state["events"][-1])
+
+    return events
+
+
+def print_etf_report(*, state: dict, new_events: List[dict], df_pred_today: pd.DataFrame) -> None:
+    asof = state.get("asof_day")
+    print("\n=== ETF MODE (UTC close) ===")
+    print(f"asof_last_closed_day={asof}")
+
+    print("\n--- HISTORICAL EVENTS (new since last run) ---")
+    if not new_events:
+        print("(none)")
+    else:
+        for ev in new_events:
+            day = ev.get("day", "")
+            sym = ev.get("symbol", "")
+            typ = ev.get("type", "")
+            if typ == "ENTRY":
+                print(f"{day}  {sym:10s}  ENTRY         entry_px={ev.get('entry_px'):.6g}  p={ev.get('p'):.3f}")
+            elif typ == "TAKE_PROFIT_20":
+                print(
+                    f"{day}  {sym:10s}  TAKE_PROFIT   sold={ev.get('sold_frac')}  gain=+20%  px={ev.get('tp_px'):.6g}")
+            elif typ == "UPDATE_PEAK":
+                print(
+                    f"{day}  {sym:10s}  UPDATE_PEAK   peak_gain={ev.get('peak_gain_pct'):.1f}%  trail_gain={ev.get('trail_gain_pct'):.1f}%")
+            elif typ.startswith("EXIT_"):
+                print(
+                    f"{day}  {sym:10s}  {typ:12s} sold={ev.get('sold_frac')}  exit_gain={ev.get('exit_gain_pct'):.1f}%")
+            else:
+                print(f"{day}  {sym:10s}  {typ}  {ev}")
+
+    print("\n--- TODAY INSTRUCTIONS ---")
+    positions = state.get("positions", {})
+    open_syms = [s for s, p in positions.items() if p.get("status") == "OPEN"]
+
+    print("OPEN POSITIONS (manage):")
+    if not open_syms:
+        print("  (none)")
+    else:
+        for sym in sorted(open_syms):
+            p = positions[sym]
+            entry = float(p["entry_price"])
+            rem = float(p["remaining_frac"])
+            peak_close = float(p.get("peak_close", entry))
+            trail_px = float(p.get("trail_px", peak_close * (1.0 - TRAIL_PCT)))
+            print(
+                f"  {sym:10s} entry={p['entry_day']} rem={rem:.2f} "
+                f"peak_gain={_pct((peak_close / entry) - 1):.1f}% "
+                f"trail_exit_gain={_pct((trail_px / entry) - 1):.1f}%"
+            )
+
+    print("\nNEW ENTRIES (if any):")
+    if df_pred_today is None or df_pred_today.empty:
+        print("  (none)")
+    else:
+        for _, r in df_pred_today.iterrows():
+            print(
+                f"  BUY {r['symbol']:10s} p={float(r['prob_up_target_h']):.3f} featDropP={float(r.get('feat_prob_drop10', 0.5)):.3f}")
+
+
+def update_positions_until_last_closed(
+        *,
+        state: dict,
+        symbols_needed: List[str],
+        store_dir: Path,
+        entry_lag_days: int,
+) -> List[dict]:
+    """
+    Replays daily candles and generates events since last run, up to last_closed_day (UTC).
+    Returns the list of NEW events generated in this run.
+    """
+    last_closed = datetime.utcnow().date() - timedelta(days=1)
+
+    prev_asof = state.get("asof_day")
+    start_day = datetime.strptime(prev_asof, "%Y-%m-%d").date() if prev_asof else None
+
+    # If first run, we still want a consistent "asof"
+    if start_day is None:
+        # start replay from earliest possible day among open positions, else last_closed
+        pos = state.get("positions", {})
+        if pos:
+            earliest = min(datetime.strptime(p["entry_day"], "%Y-%m-%d").date() for p in pos.values())
+            start_day = earliest
+        else:
+            start_day = last_closed
+
+    # We'll generate events only for days strictly after prev_asof (so the "since last run" list is clean)
+    new_events: List[dict] = []
+    positions = state.setdefault("positions", {})
+
+    # ensure klines exist for all symbols we might touch
+    # includes BTC? not required here
+    for sym in sorted(set(symbols_needed) | set(positions.keys())):
+        s = get_thread_session()
+        ensure_symbol_days(sym, start_day, last_closed, session=s, store_dir=store_dir)
+
+    d = start_day
+    while d <= last_closed:
+        for sym, p in list(positions.items()):
+            if p.get("status") != "OPEN":
+                continue
+
+            entry_day = datetime.strptime(p["entry_day"], "%Y-%m-%d").date()
+            if d < entry_day:
+                continue
+
+            s = get_thread_session()
+            k = get_klines_window(sym, d, d, session=s, store_dir=store_dir)
+            if k is None or k.empty:
+                continue
+
+            o = float(k.iloc[0]["open"])
+            h = float(k.iloc[0]["high"])
+            l = float(k.iloc[0]["low"])
+            c = float(k.iloc[0]["close"])
+
+            entry = float(p["entry_price"])
+            rem = float(p["remaining_frac"])  # 1.0 then 0.5 after TP
+            took_tp = bool(p.get("took_tp", False))
+
+            # 1) hard stop (low breaches) - exit ALL remaining
+            hard_stop_px = entry * (1.0 - HARD_STOP_PCT)
+            if rem > 0 and l <= hard_stop_px:
+                _append_event(
+                    state, d, sym, "EXIT_HARD_STOP",
+                    exit_px=hard_stop_px,
+                    exit_gain_pct=_pct((hard_stop_px / entry) - 1.0),
+                    sold_frac=rem,
+                )
+                new_events.append(state["events"][-1])
+                p["status"] = "CLOSED"
+                p["closed_day"] = _iso(d)
+                p["closed_reason"] = "HARD_STOP"
+                p["remaining_frac"] = 0.0
+                continue
+
+            # 2) take-profit: sell TP_FRACTION when high hits +20% (first time only)
+            tp_px = entry * (1.0 + TP_PCT)
+            if (not took_tp) and h >= tp_px:
+                sold_frac = min(TP_FRACTION, rem)
+                if sold_frac > 0:
+                    _append_event(
+                        state, d, sym, "TAKE_PROFIT_20",
+                        tp_px=tp_px,
+                        tp_gain_pct=_pct(TP_PCT),
+                        sold_frac=sold_frac,
+                        remaining_after=rem - sold_frac,
+                    )
+                    new_events.append(state["events"][-1])
+                    p["took_tp"] = True
+                    p["remaining_frac"] = rem - sold_frac
+                    rem = float(p["remaining_frac"])
+
+            # 3) update peak_close and trailing stop
+            peak_close = float(p.get("peak_close", entry))
+            if c > peak_close:
+                peak_close = c
+                p["peak_close"] = peak_close
+                p["peak_day"] = _iso(d)
+                trail_px = peak_close * (1.0 - TRAIL_PCT)
+                p["trail_px"] = trail_px
+                _append_event(
+                    state, d, sym, "UPDATE_PEAK",
+                    peak_close=peak_close,
+                    peak_gain_pct=_pct((peak_close / entry) - 1.0),
+                    trail_px=trail_px,
+                    trail_gain_pct=_pct((trail_px / entry) - 1.0),
+                )
+                new_events.append(state["events"][-1])
+
+            # 4) trailing stop: close <= trail_px exits ALL remaining
+            trail_px = float(p.get("trail_px", peak_close * (1.0 - TRAIL_PCT)))
+            if rem > 0 and c <= trail_px:
+                _append_event(
+                    state, d, sym, "EXIT_TRAIL",
+                    exit_px=trail_px,
+                    exit_gain_pct=_pct((trail_px / entry) - 1.0),
+                    sold_frac=rem,
+                )
+                new_events.append(state["events"][-1])
+                p["status"] = "CLOSED"
+                p["closed_day"] = _iso(d)
+                p["closed_reason"] = "TRAIL_STOP"
+                p["remaining_frac"] = 0.0
+                continue
+
+            # 5) time stop
+            age = (d - entry_day).days
+            if rem > 0 and age >= TIME_STOP_DAYS:
+                if c < entry * (1.0 + TIME_STOP_MIN_GAIN):
+                    _append_event(
+                        state, d, sym, "EXIT_TIME",
+                        exit_px=c,
+                        exit_gain_pct=_pct((c / entry) - 1.0),
+                        sold_frac=rem,
+                        age_days=age,
+                    )
+                    new_events.append(state["events"][-1])
+                    p["status"] = "CLOSED"
+                    p["closed_day"] = _iso(d)
+                    p["closed_reason"] = "TIME_STOP"
+                    p["remaining_frac"] = 0.0
+                    continue
+
+        d += timedelta(days=1)
+
+    state["asof_day"] = _iso(last_closed)
+    return new_events
+
+
+def _load_positions(path: Path = POSITIONS_PATH) -> dict:
+    if not path.exists():
+        return {"asof_day": None, "positions": {}, "events": []}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"asof_day": None, "positions": {}, "events": []}
+
+
+def _save_positions(state: dict, path: Path = POSITIONS_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _pct(x: float) -> float:
+    return float(x) * 100.0
+
+
+def _iso(d: date) -> str:
+    return d.isoformat()
+
+
+def _append_event(state: dict, day: date, symbol: str, etype: str, **fields) -> None:
+    ev = {"day": _iso(day), "symbol": symbol, "type": etype}
+    ev.update(fields)
+    state["events"].append(ev)
 
 
 def send_email_with_analysis(body: str, df: Optional[pd.DataFrame] = None, directory: str = ".") -> None:
@@ -201,7 +500,7 @@ def _binance_trigger_cooldown(seconds: float = 1.0) -> None:
 
 
 def _binance_get_with_cooldown(
-    session: requests.Session, url: str, *, params: Dict, timeout: int = 30
+        session: requests.Session, url: str, *, params: Dict, timeout: int = 30
 ) -> Optional[requests.Response]:
     MAX_RETRIES = 6
     last_resp: Optional[requests.Response] = None
@@ -427,12 +726,12 @@ def _fill_tombstones(start_day: date, end_day: date, df: pd.DataFrame) -> pd.Dat
 
 
 def ensure_symbol_days(
-    symbol: str,
-    need_start: date,
-    need_end: date,
-    *,
-    session: requests.Session,
-    store_dir: Path,
+        symbol: str,
+        need_start: date,
+        need_end: date,
+        *,
+        session: requests.Session,
+        store_dir: Path,
 ) -> pd.DataFrame:
     if need_end < need_start:
         return _normalize_store_df(pd.DataFrame())
@@ -488,12 +787,12 @@ def ensure_symbol_days(
 
 
 def get_klines_window(
-    symbol: str,
-    start_day: date,
-    end_day: date,
-    *,
-    session: requests.Session,
-    store_dir: Path,
+        symbol: str,
+        start_day: date,
+        end_day: date,
+        *,
+        session: requests.Session,
+        store_dir: Path,
 ) -> pd.DataFrame:
     if end_day < start_day:
         return pd.DataFrame()
@@ -511,12 +810,12 @@ def get_klines_window(
 
 
 def prefetch_symbol_windows(
-    hits: List[OversoldHit],
-    *,
-    entry_lag_days: int,
-    horizon_days: int,
-    store_dir: Path,
-    dl_workers: int,
+        hits: List[OversoldHit],
+        *,
+        entry_lag_days: int,
+        horizon_days: int,
+        store_dir: Path,
+        dl_workers: int,
 ) -> None:
     if not hits:
         return
@@ -550,14 +849,14 @@ def prefetch_symbol_windows(
 # LABELS + RUNUP
 # ============================================================
 def label_drop_pct_within_horizon(
-    symbol: str,
-    file_day: date,
-    *,
-    session: requests.Session,
-    store_dir: Path,
-    drop_pct: float,
-    horizon_days: int,
-    entry_lag_days: int,
+        symbol: str,
+        file_day: date,
+        *,
+        session: requests.Session,
+        store_dir: Path,
+        drop_pct: float,
+        horizon_days: int,
+        entry_lag_days: int,
 ) -> Optional[int]:
     last_closed = datetime.utcnow().date() - timedelta(days=1)
     entry_day = file_day + timedelta(days=entry_lag_days)
@@ -577,13 +876,21 @@ def label_drop_pct_within_horizon(
 
 
 def runup_to_high_until_today(
-    symbol: str,
-    entry_day: date,
-    *,
-    session: requests.Session,
-    store_dir: Path,
-    include_today: bool = True,
+        symbol: str,
+        entry_day: date,
+        *,
+        session: requests.Session,
+        store_dir: Path,
+        include_today: bool = True,
+        target_pct: float = 0.20,  # <-- NEW: strategy sell target
 ) -> Optional[Dict[str, float]]:
+    """
+    Computes:
+      - runup_to_high_pct (max high since entry vs entry_open)
+      - NEW strategy:
+          If at any point high >= entry_open*(1+target_pct), assume sold at target_pct (first hit day).
+          gain_to_now_pct becomes realized target_pct*100 once sold, else current close vs entry_open.
+    """
     end_day = datetime.utcnow().date() if include_today else (datetime.utcnow().date() - timedelta(days=1))
     if entry_day > end_day:
         return None
@@ -595,12 +902,14 @@ def runup_to_high_until_today(
     dday = pd.to_datetime(df["day"], errors="coerce").dt.date
     opens = pd.to_numeric(df["open"], errors="coerce")
     highs = pd.to_numeric(df["high"], errors="coerce")
+    closes = pd.to_numeric(df["close"], errors="coerce")
 
-    ok = dday.notna() & opens.notna() & highs.notna()
+    ok = dday.notna() & opens.notna() & highs.notna() & closes.notna()
     df = df.loc[ok].copy()
     dday = dday.loc[ok]
     opens = opens.loc[ok]
     highs = highs.loc[ok]
+    closes = closes.loc[ok]
     if df.empty:
         return None
 
@@ -609,16 +918,54 @@ def runup_to_high_until_today(
         return None
 
     entry_open = float(opens.loc[entry_mask].iloc[0])
+
+    # max high since entry
     max_idx = highs.idxmax()
     max_high = float(highs.loc[max_idx])
     max_high_date = dday.loc[max_idx].isoformat()
     runup_pct = ((max_high / max(entry_open, 1e-12)) - 1.0) * 100.0
 
+    # latest close (to "now")
+    last_idx = dday.idxmax()
+    last_close = float(closes.loc[last_idx])
+    last_close_date = dday.loc[last_idx].isoformat()
+
+    # -----------------------------
+    # NEW: "sell after +target_pct"
+    # -----------------------------
+    target_price = entry_open * (1.0 + float(target_pct))
+    hit_mask = highs >= target_price
+
+    sold_at_target = bool(hit_mask.any())
+    sell_date = ""
+    sell_price = np.nan
+
+    if sold_at_target:
+        # First day it hit target
+        first_hit_idx = dday[hit_mask].index[0]
+        sell_date = dday.loc[first_hit_idx].isoformat()
+        sell_price = float(target_price)
+        gain_to_now_pct = float(target_pct) * 100.0  # realized
+    else:
+        gain_to_now_pct = ((last_close / max(entry_open, 1e-12)) - 1.0) * 100.0  # unrealized
+
     return {
         "entry_open": entry_open,
+
         "max_high_to_today": max_high,
         "max_high_date": max_high_date,
         "runup_to_high_pct": float(runup_pct),
+
+        "last_close_to_now": last_close,
+        "last_close_date": last_close_date,
+
+        # NEW strategy fields
+        "sold_at_target": sold_at_target,
+        "sell_price": sell_price,
+        "sell_date": sell_date,
+
+        # NEW meaning: realized at target if hit, else unrealized to now
+        "gain_to_now_pct": float(gain_to_now_pct),
     }
 
 
@@ -626,11 +973,11 @@ def runup_to_high_until_today(
 # BTC MOOD (OUTPUT ONLY) - YOU SAID "ALWAYS BULLISH"
 # ============================================================
 def btc_market_mood_for_file_date(
-    file_day: date,
-    *,
-    session: requests.Session,
-    store_dir: Path,
-    entry_lag_days: int,
+        file_day: date,
+        *,
+        session: requests.Session,
+        store_dir: Path,
+        entry_lag_days: int,
 ) -> Dict[str, object]:
     entry_day = file_day + timedelta(days=int(entry_lag_days))
     mood_day = entry_day - timedelta(days=1)
@@ -651,11 +998,11 @@ def btc_market_mood_for_file_date(
 
 
 def add_btc_mood_columns_and_filter_dates_bullish_only(
-    df_pred: pd.DataFrame,
-    *,
-    store_dir: Path,
-    entry_lag_days: int,
-    dl_workers: int,
+        df_pred: pd.DataFrame,
+        *,
+        store_dir: Path,
+        entry_lag_days: int,
+        dl_workers: int,
 ) -> pd.DataFrame:
     if df_pred is None or df_pred.empty:
         return df_pred
@@ -758,16 +1105,16 @@ def build_features_for_symbol(history: List[OversoldHit], asof_file_date: date) 
 
 
 def build_ml_table(
-    hits: List[OversoldHit],
-    *,
-    train_end_date: date,
-    predict_start_date: date,
-    target_pct: float,
-    horizon_days: int,
-    entry_lag_days: int,
-    store_dir: Path,
-    min_history_hits: int,
-    dl_workers: int,
+        hits: List[OversoldHit],
+        *,
+        train_end_date: date,
+        predict_start_date: date,
+        target_pct: float,
+        horizon_days: int,
+        entry_lag_days: int,
+        store_dir: Path,
+        min_history_hits: int,
+        dl_workers: int,
 ) -> Tuple[pd.DataFrame, List[date], List[date]]:
     by_symbol: Dict[str, List[OversoldHit]] = defaultdict(list)
     symbols_in_file: Dict[date, set] = defaultdict(set)
@@ -883,17 +1230,17 @@ def _oversold_folder_fingerprint(folder: Path) -> dict:
 
 
 def _ml_table_cache_key(
-    *,
-    folder: Path,
-    latest_file_date: date,
-    holdout_days: int,
-    target_pct: float,
-    horizon_days: int,
-    entry_lag_days: int,
-    min_history_hits: int,
-    drop_pct: float,
-    drop_horizon_days: int,
-    feature_schema_version: str = "v1",
+        *,
+        folder: Path,
+        latest_file_date: date,
+        holdout_days: int,
+        target_pct: float,
+        horizon_days: int,
+        entry_lag_days: int,
+        min_history_hits: int,
+        drop_pct: float,
+        drop_horizon_days: int,
+        feature_schema_version: str = "v1",
 ) -> str:
     fp = _oversold_folder_fingerprint(folder)
 
@@ -967,24 +1314,24 @@ def _save_cached_ml_table(cache_root: Path, key: str, df_all: pd.DataFrame, trai
 
 
 def get_or_build_ml_table_cached(
-    hits: List[OversoldHit],
-    *,
-    folder: Path,
-    cache_root: Path,
-    latest_file_date: date,
-    holdout_days: int,
-    train_end_date: date,
-    predict_start_date: date,
-    target_pct: float,
-    horizon_days: int,
-    entry_lag_days: int,
-    store_dir: Path,
-    min_history_hits: int,
-    dl_workers: int,
-    drop_pct: float,
-    drop_horizon_days: int,
-    feature_schema_version: str = "v1",
-    verbose: bool = True,
+        hits: List[OversoldHit],
+        *,
+        folder: Path,
+        cache_root: Path,
+        latest_file_date: date,
+        holdout_days: int,
+        train_end_date: date,
+        predict_start_date: date,
+        target_pct: float,
+        horizon_days: int,
+        entry_lag_days: int,
+        store_dir: Path,
+        min_history_hits: int,
+        dl_workers: int,
+        drop_pct: float,
+        drop_horizon_days: int,
+        feature_schema_version: str = "v1",
+        verbose: bool = True,
 ):
     key = _ml_table_cache_key(
         folder=folder,
@@ -1058,10 +1405,10 @@ def load_model_bundle(path: Path) -> Optional[Dict]:
 
 
 def _gate_candidate_and_maybe_replace_default(
-    *,
-    candidate_bundle: Dict,
-    candidate_prec1: float,
-    candidate_sup1: int,
+        *,
+        candidate_bundle: Dict,
+        candidate_prec1: float,
+        candidate_sup1: int,
 ) -> Tuple[Dict, bool, str]:
     passed = (candidate_prec1 > GATE_MIN_PREC1) and (candidate_sup1 >= GATE_MIN_SUP1)
     if passed:
@@ -1104,10 +1451,10 @@ def _get_feature_cols(df: pd.DataFrame, label_cols: Tuple[str, ...]) -> List[str
 
 
 def train_and_report(
-    df_train: pd.DataFrame,
-    label_col: str,
-    feature_cols: List[str],
-    seed: int = 42,
+        df_train: pd.DataFrame,
+        label_col: str,
+        feature_cols: List[str],
+        seed: int = 42,
 ) -> Tuple[RandomForestClassifier, Dict]:
     df_train = df_train.dropna(subset=[label_col]).copy()
     y = df_train[label_col].astype(int).values
@@ -1149,13 +1496,13 @@ def train_and_report(
 # DOWNSIDE LABELS + SKIP-OOF FEATURE (WITH FALLBACK)
 # ============================================================
 def build_downside_labels_inplace(
-    df_train: pd.DataFrame,
-    *,
-    store_dir: Path,
-    drop_pct: float,
-    drop_horizon_days: int,
-    entry_lag_days: int,
-    dl_workers: int,
+        df_train: pd.DataFrame,
+        *,
+        store_dir: Path,
+        drop_pct: float,
+        drop_horizon_days: int,
+        entry_lag_days: int,
+        dl_workers: int,
 ) -> pd.DataFrame:
     df_train = df_train.copy()
     df_train["label_down10"] = np.nan
@@ -1193,10 +1540,10 @@ def build_downside_labels_inplace(
 
 
 def build_downside_prob_feature_skip_oof(
-    df_train: pd.DataFrame,
-    base_feature_cols: List[str],
-    *,
-    seed: int = 42,
+        df_train: pd.DataFrame,
+        base_feature_cols: List[str],
+        *,
+        seed: int = 42,
 ) -> Tuple[pd.DataFrame, Optional[RandomForestClassifier], Optional[List[str]]]:
     df_train = df_train.copy()
     usable = df_train.dropna(subset=["label_down10"]).copy()
@@ -1204,7 +1551,8 @@ def build_downside_prob_feature_skip_oof(
 
     # Fallback: if can't train downside model, fill 0.5
     if usable.empty or usable["label_down10"].nunique() < 2:
-        print("\nNOTE: Downside model not trainable (label_down10 has <2 classes). Using feat_prob_drop10=0.5 fallback.")
+        print(
+            "\nNOTE: Downside model not trainable (label_down10 has <2 classes). Using feat_prob_drop10=0.5 fallback.")
         df_train["feat_prob_drop10"] = 0.5
         return df_train, None, None
 
@@ -1222,9 +1570,9 @@ def build_downside_prob_feature_skip_oof(
 
 
 def train_main_model_with_drop_feature(
-    df_train: pd.DataFrame,
-    *,
-    seed: int = 42,
+        df_train: pd.DataFrame,
+        *,
+        seed: int = 42,
 ) -> Tuple[RandomForestClassifier, List[str], Dict]:
     df_train = df_train.dropna(subset=["label"]).copy()
 
@@ -1248,11 +1596,11 @@ def train_main_model_with_drop_feature(
 
 
 def predict_dates(
-    clf: RandomForestClassifier,
-    feature_cols: List[str],
-    df_all: pd.DataFrame,
-    predict_dates_list: List[date],
-    threshold: float,
+        clf: RandomForestClassifier,
+        feature_cols: List[str],
+        df_all: pd.DataFrame,
+        predict_dates_list: List[date],
+        threshold: float,
 ) -> pd.DataFrame:
     df_pred = df_all[df_all["file_date"].isin([d.isoformat() for d in predict_dates_list])].copy()
     if df_pred.empty:
@@ -1275,17 +1623,17 @@ def predict_dates(
 # OUTPUT BODY (unchanged style)
 # ============================================================
 def build_email_body(
-    *,
-    loaded_hits: int,
-    df_all_len: int,
-    train_dates: List[date],
-    predict_dates_list: List[date],
-    df_pred: pd.DataFrame,
-    threshold: float,
-    target_pct: float,
-    holdout_days: int,
-    model_meta: Optional[Dict] = None,
-    topk: int = 40,
+        *,
+        loaded_hits: int,
+        df_all_len: int,
+        train_dates: List[date],
+        predict_dates_list: List[date],
+        df_pred: pd.DataFrame,
+        threshold: float,
+        target_pct: float,
+        holdout_days: int,
+        model_meta: Optional[Dict] = None,
+        topk: int = 40,
 ) -> str:
     lines: List[str] = []
     lines.append("Oversold Analysis Alert")
@@ -1458,7 +1806,8 @@ def main() -> int:
     print(f"\nTotal samples (train + predict): {len(df_all)}")
     print(f"Train dates: {train_dates[0]} .. {train_dates[-1]}  ({len(train_dates)} days)")
     if predict_dates_list:
-        print(f"Predict dates (classify only): {predict_dates_list[0]} .. {predict_dates_list[-1]}  ({len(predict_dates_list)} days)")
+        print(
+            f"Predict dates (classify only): {predict_dates_list[0]} .. {predict_dates_list[-1]}  ({len(predict_dates_list)} days)")
     else:
         print("Predict dates (classify only): (none found yet)")
 
@@ -1488,9 +1837,9 @@ def main() -> int:
             saved_train_end = model_meta.get("train_end_date")
             saved_drop_cfg = model_meta.get("drop_cfg", {})
             if (
-                saved_train_end == train_end_date.isoformat()
-                and saved_drop_cfg.get("DROP_PCT") == DROP_PCT
-                and saved_drop_cfg.get("DROP_HORIZON_DAYS") == DROP_HORIZON_DAYS
+                    saved_train_end == train_end_date.isoformat()
+                    and saved_drop_cfg.get("DROP_PCT") == DROP_PCT
+                    and saved_drop_cfg.get("DROP_HORIZON_DAYS") == DROP_HORIZON_DAYS
             ):
                 need_retrain = False
         except Exception:
@@ -1583,8 +1932,8 @@ def main() -> int:
                 "min_prec1": GATE_MIN_PREC1,
                 "min_sup1": GATE_MIN_SUP1,
                 "passed": (not used_default)
-                and (gate_candidate_prec1 > GATE_MIN_PREC1)
-                and (gate_candidate_sup1 >= GATE_MIN_SUP1),
+                          and (gate_candidate_prec1 > GATE_MIN_PREC1)
+                          and (gate_candidate_sup1 >= GATE_MIN_SUP1),
                 "used_default": used_default,
                 "default_path": str(DEFAULT_MODEL_BUNDLE_PATH),
                 "message": gate_msg,
@@ -1631,10 +1980,23 @@ def main() -> int:
         df_pred["max_high_to_today"] = np.nan
         df_pred["max_high_date"] = ""
         df_pred["runup_to_high_pct"] = np.nan
+        df_pred["last_close_to_now"] = np.nan
+        df_pred["last_close_date"] = ""
+        df_pred["gain_to_now_pct"] = np.nan
+        df_pred["sold_at_target"] = False
+        df_pred["sell_price"] = np.nan
+        df_pred["sell_date"] = ""
 
         def _runup_task(sym: str, entry_day: date) -> Optional[Dict[str, float]]:
             s = get_thread_session()
-            return runup_to_high_until_today(sym, entry_day, session=s, store_dir=store_dir, include_today=True)
+            return runup_to_high_until_today(
+                sym,
+                entry_day,
+                session=s,
+                store_dir=store_dir,
+                include_today=True,
+                target_pct=args.target_pct,  # <-- NEW
+            )
 
         with ThreadPoolExecutor(max_workers=max(1, int(args.dl_workers))) as ex:
             futures = {}
@@ -1651,28 +2013,15 @@ def main() -> int:
                 df_pred.at[idx, "max_high_to_today"] = info["max_high_to_today"]
                 df_pred.at[idx, "max_high_date"] = info["max_high_date"]
                 df_pred.at[idx, "runup_to_high_pct"] = info["runup_to_high_pct"]
+                df_pred.at[idx, "last_close_to_now"] = info.get("last_close_to_now", np.nan)
+                df_pred.at[idx, "last_close_date"] = info.get("last_close_date", "")
+                df_pred.at[idx, "gain_to_now_pct"] = info.get("gain_to_now_pct", np.nan)
+                df_pred.at[idx, "sold_at_target"] = bool(info.get("sold_at_target", False))
+                df_pred.at[idx, "sell_price"] = info.get("sell_price", np.nan)
+                df_pred.at[idx, "sell_date"] = info.get("sell_date", "")
 
     df_pred.to_csv(OUT_PATH, index=False)
     print(f"\nWrote: {OUT_PATH}")
-
-    print("\n=== TOP CANDIDATES (predict window; BTC mood=BULLISH ONLY) ===")
-    if df_pred.empty:
-        print("(none after filters)")
-    else:
-        for d_str in sorted(df_pred["file_date"].unique().tolist()):
-            dd = df_pred[df_pred["file_date"] == d_str].copy()
-            if dd.empty:
-                continue
-            dd = dd.sort_values("prob_up_target_h", ascending=False).head(TOPK)
-            btc_banner = f"BTC({dd['btc_mood_day'].iloc[0]})={dd['btc_mood'].iloc[0]} {dd['btc_change_pct'].iloc[0]:+.2f}%"
-            print(f"\nfile={d_str}  threshold={args.threshold}  {btc_banner}")
-            for _, r in dd.iterrows():
-                print(
-                    f"BUY  {r['symbol']:12s}  p={r['prob_up_target_h']:.3f}  "
-                    f"featDropP={float(r.get('feat_prob_drop10', 0.5)):.3f}  "
-                    f"runupToHigh={float(r.get('runup_to_high_pct', np.nan)):.1f}%  "
-                    f"maxHighDate={r.get('max_high_date','')}"
-                )
 
     body = build_email_body(
         loaded_hits=len(hits),
