@@ -1,0 +1,8 @@
+/oversold_analysis/
+/models/
+/kline_store/
+/onlineservers/outputs/
+/onlineservers/oversold_analysis/
+/onlineservers/plots/
+/onlineservers/csvs/
+/80 compound/models/default_model_76.joblib

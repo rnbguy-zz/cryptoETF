@@ -41,14 +41,13 @@ from sklearn.model_selection import train_test_split
 from sklearn import __version__ as sklearn_version
 
 
-HOLDOUT_DAYS = 7
+HOLDOUT_DAYS = 5
 ENTRY_LAG_DAYS = 1
 HORIZON_DAYS = 7
 DROP_PCT = 0.10
-DROP_HORIZON_DAYS = 7
+DROP_HORIZON_DAYS = 5
 OFFLINE_CACHE_ONLY = 0
-TP_PCT = 0.20             # +20%
-MIN_HISTORY_HITS = 1
+
 # ============================================================
 # EMAIL CONFIG (ENV VARS ONLY FOR PASSWORD)
 # ============================================================
@@ -64,6 +63,7 @@ import json
 POSITIONS_PATH = Path("positions_etf.json")
 
 TRAIL_PCT = 0.12          # 12% off peak
+TP_PCT = 0.20             # +20%
 TP_FRACTION = 0.1        # sell half
 HARD_STOP_PCT = 0.10      # -10%
 TIME_STOP_DAYS = 14
@@ -927,7 +927,7 @@ def runup_to_high_until_today(
     session: requests.Session,
     store_dir: Path,
     include_today: bool = True,
-    target_pct: float = TP_PCT,
+    target_pct: float = 0.20,
     offline_cache_only: bool = False,
 ) -> Optional[Dict[str, float]]:
     """
@@ -2084,7 +2084,7 @@ def main() -> int:
 
     ap.add_argument("--threshold", type=float, default=0.50)
     ap.add_argument("--cache-dir", default="kline_store")
-    ap.add_argument("--target-pct", type=float, default=TP_PCT)
+    ap.add_argument("--target-pct", type=float, default=0.20)
     ap.add_argument("--dl-workers", type=int, default=16)
     ap.add_argument("--retrain", action="store_true")
     ap.add_argument("--skip-oof", action="store_true", help="Kept for compatibility; script always uses skip-oof path.")
@@ -2098,10 +2098,12 @@ def main() -> int:
     args = ap.parse_args()
     OFFLINE_CACHE_ONLY = bool(args.offline_cache_only)
 
+    MIN_HISTORY_HITS = 3
     TOPK = 40
     OUT_PATH = Path("ai_predictions.csv")
 
     DROP_PCT = 0.10
+    DROP_HORIZON_DAYS = 5
 
     folder = Path(args.dir)
     store_dir = Path(args.cache_dir)
@@ -2115,8 +2117,8 @@ def main() -> int:
         return 2
 
     latest_file_date = file_dates[-1]
-    train_end_date = latest_file_date - timedelta(days=max(1, HOLDOUT_DAYS))
-    predict_start_date = train_end_date + timedelta(days=1)
+    train_end_date = datetime.strptime("2026-01-30", "%Y-%m-%d").date()
+    predict_start_date = datetime.strptime("2026-01-31", "%Y-%m-%d").date()
 
     if train_end_date < file_dates[0]:
         print(
