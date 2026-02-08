@@ -41,13 +41,9 @@ from sklearn.model_selection import train_test_split
 from sklearn import __version__ as sklearn_version
 
 
-HORIZON_DAYS = 7
-MIN_HISTORY_HITS = 3
-TP_PCT = 0.20             # +20%
-HOLDOUT_DAYS = 20
-
-
+HOLDOUT_DAYS = 5
 ENTRY_LAG_DAYS = 1
+HORIZON_DAYS = 7
 DROP_PCT = 0.10
 DROP_HORIZON_DAYS = 5
 OFFLINE_CACHE_ONLY = 0
@@ -67,6 +63,7 @@ import json
 POSITIONS_PATH = Path("positions_etf.json")
 
 TRAIL_PCT = 0.12          # 12% off peak
+TP_PCT = 0.20             # +20%
 TP_FRACTION = 0.1        # sell half
 HARD_STOP_PCT = 0.10      # -10%
 TIME_STOP_DAYS = 14
@@ -1736,7 +1733,7 @@ def train_and_report(
     y = df_train[label_col].astype(int).values
     X = df_train[feature_cols].astype(float).values
 
-    X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y)
+    X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=2, random_state=seed, stratify=y)
 
     clf = _rf_default(seed=seed)
     clf.fit(X_tr, y_tr)
@@ -2098,20 +2095,13 @@ def main() -> int:
         help="Never fetch klines from Binance; use cached parquet only. Missing days will be reported.",
     )
 
-    # DEBUG / INVESTIGATION
-    ap.add_argument(
-        "--debug-overlap-days",
-        default="2026-01-31,2026-02-01,2026-02-02,2026-02-03",
-        help="Comma-separated file_date days to print top overlap candidates for (BEFORE buy filter).",
-    )
-
     args = ap.parse_args()
     OFFLINE_CACHE_ONLY = bool(args.offline_cache_only)
 
+    MIN_HISTORY_HITS = 3
     TOPK = 40
     OUT_PATH = Path("ai_predictions.csv")
 
-    # Keep these globals consistent with your script
     DROP_PCT = 0.10
     DROP_HORIZON_DAYS = 5
 
@@ -2127,9 +2117,7 @@ def main() -> int:
         return 2
 
     latest_file_date = file_dates[-1]
-
-    # NOTE: your current split uses TODAY. If you want it anchored to data instead, swap date.today() for latest_file_date.
-    predict_start_date = date.today() - timedelta(days=HOLDOUT_DAYS - 1)
+    predict_start_date = latest_file_date - timedelta(days=HOLDOUT_DAYS)
     train_end_date = predict_start_date - timedelta(days=1)
 
     if train_end_date < file_dates[0]:
@@ -2194,13 +2182,6 @@ def main() -> int:
     else:
         print("Predict dates (classify only): (none found yet)")
 
-    # ---- DEBUG: confirm split anchors ----
-    print("\n[DEBUG] today=", date.today(), " latest_file_date=", latest_file_date)
-    print("[DEBUG] predict_start_date=", predict_start_date, " train_end_date=", train_end_date)
-    if predict_dates_list:
-        tail = [d.isoformat() for d in predict_dates_list[-10:]]
-        print("[DEBUG] predict_dates_list tail=", tail)
-
     df_train = build_df_train_for_models(df_all, train_dates)
 
     if df_train.empty:
@@ -2232,32 +2213,7 @@ def main() -> int:
         min_history_hits=MIN_HISTORY_HITS,
     )
 
-    # ---- DEBUG: show which model meta we used ----
-    print("\n[DEBUG] model_meta summary:", {
-        "created_utc": model_meta.get("created_utc"),
-        "train_end_date": model_meta.get("train_end_date"),
-        "predict_start_date": model_meta.get("predict_start_date"),
-        "holdout_days": model_meta.get("holdout_days"),
-        "threshold": model_meta.get("threshold"),
-        "target_pct": model_meta.get("target_pct"),
-        "horizon_days": model_meta.get("horizon_days"),
-        "gate": model_meta.get("gate", {}),
-    })
-
-    # ---- DEBUG: Train-set probability distribution (main model) ----
-    try:
-        X_train_dbg = df_train[feat_cols_main].astype(float).values
-        train_probs = clf_main.predict_proba(X_train_dbg)[:, 1]
-        s_train = pd.Series(train_probs)
-        print("\n=== DEBUG: TRAIN SET PROB STATS (main model) ===")
-        print(s_train.describe(percentiles=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]))
-        print("Train count >=0.5:", int((s_train >= 0.5).sum()))
-        print("Train count >=0.6:", int((s_train >= 0.6).sum()))
-        print("Train count >=0.7:", int((s_train >= 0.7).sum()))
-    except Exception as e:
-        print(f"[DEBUG] Train prob stats failed: {e}", file=sys.stderr)
-
-    # Build feat_prob_drop10 for predict window (ensure column exists)
+    # Build feat_prob_drop10 for predict window
     df_all = df_all.copy()
     if "feat_prob_drop10" not in df_all.columns:
         df_all["feat_prob_drop10"] = 0.5
@@ -2274,51 +2230,9 @@ def main() -> int:
             probs2 = clf_down.predict_proba(X2)[:, 1]
             df_all.loc[df_pred_base.index, "feat_prob_drop10"] = probs2
 
-    # Predict (NO BUY FILTER YET)
-    df_pred_all = predict_dates(clf_main, feat_cols_main, df_all, predict_dates_list, threshold=args.threshold)
-
-    # ---- DEBUG: Predict-window probability distribution (before buy filter) ----
-    if df_pred_all is None or df_pred_all.empty:
-        print("\n=== DEBUG: PRED WINDOW EMPTY (before buy filter) ===")
-    else:
-        s_pred = pd.Series(pd.to_numeric(df_pred_all["prob_up_target_h"], errors="coerce"))
-        print("\n=== DEBUG: PRED WINDOW PROB STATS (before buy filter) ===")
-        print(s_pred.describe(percentiles=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]))
-        print("Pred count >=0.5:", int((s_pred >= 0.5).sum()))
-        print("Pred count >=0.6:", int((s_pred >= 0.6).sum()))
-        print("Pred count >=0.7:", int((s_pred >= 0.7).sum()))
-
-        # DEBUG: mean downside prob by day (first 10)
-        try:
-            print("\n=== DEBUG: MEAN feat_prob_drop10 BY file_date (head 10) ===")
-            print(df_pred_all.groupby("file_date")["feat_prob_drop10"].mean().head(10))
-        except Exception as e:
-            print(f"[DEBUG] feat_prob_drop10 mean-by-day failed: {e}", file=sys.stderr)
-
-        # DEBUG: overlap days table (top 10 each day) BEFORE buy filter
-        try:
-            watch_days = [d.strip() for d in str(args.debug_overlap_days).split(",") if d.strip()]
-            if watch_days:
-                tmp = df_pred_all[df_pred_all["file_date"].isin(watch_days)].copy()
-                print("\n=== DEBUG: OVERLAP DAYS (BEFORE BUY FILTER) ===")
-                print("[DEBUG] overlap days present:", tmp["file_date"].value_counts().to_dict())
-                if not tmp.empty:
-                    show = (
-                        tmp.sort_values(["file_date", "prob_up_target_h"], ascending=[True, False])
-                           .groupby("file_date").head(10)[
-                               ["file_date", "symbol", "prob_up_target_h", "feat_prob_drop10", "hits_30d"]
-                           ]
-                    )
-                    print(show.to_string(index=False))
-        except Exception as e:
-            print(f"[DEBUG] overlap table failed: {e}", file=sys.stderr)
-
-    # NOW apply buy filter
-    df_pred = df_pred_all.copy()
-    if df_pred is None:
-        df_pred = pd.DataFrame()
-    else:
-        df_pred = df_pred[df_pred["pred_buy"] == 1].copy()
+    # Predict
+    df_pred = predict_dates(clf_main, feat_cols_main, df_all, predict_dates_list, threshold=args.threshold)
+    df_pred = df_pred[df_pred["pred_buy"] == 1].copy()
 
     # BTC mood output-only (thread offline flag through)
     df_pred = add_btc_mood_columns_and_filter_dates_bullish_only(
@@ -2326,7 +2240,6 @@ def main() -> int:
         store_dir=store_dir,
         entry_lag_days=ENTRY_LAG_DAYS,
         dl_workers=args.dl_workers,
-        offline_cache_only=OFFLINE_CACHE_ONLY,
     )
 
     # Add entry_date
@@ -2335,7 +2248,7 @@ def main() -> int:
             lambda s: (datetime.strptime(s, "%Y-%m-%d").date() + timedelta(days=ENTRY_LAG_DAYS)).isoformat()
         )
 
-    # Runup calc (uses offline flag)
+    # Runup calc
     if not df_pred.empty:
         df_pred["entry_open"] = np.nan
         df_pred["max_high_to_today"] = np.nan
@@ -2382,11 +2295,57 @@ def main() -> int:
                 df_pred.at[idx, "sell_price"] = info.get("sell_price", np.nan)
                 df_pred.at[idx, "sell_date"] = info.get("sell_date", "")
 
-    # Save output
     df_pred.to_csv(OUT_PATH, index=False)
     print(f"\nWrote: {OUT_PATH}")
 
-    # Build + email body
+    # ============================================================
+    # ETF MODE: open entries for each prediction day, then replay to last closed
+    # ============================================================
+    state = _load_positions()
+
+    pred_days = sorted(df_pred["file_date"].unique().tolist()) if not df_pred.empty else []
+
+    last_entry_file_date = state.get("last_entry_file_date")
+    if last_entry_file_date:
+        pred_days = [d for d in pred_days if d > last_entry_file_date]
+
+    entry_events: List[dict] = []
+    for d_str in pred_days:
+        df_day = df_pred[df_pred["file_date"] == d_str].copy()
+        entry_events.extend(
+            open_new_positions_from_predictions(
+                state=state,
+                df_pred_today=df_day,
+                store_dir=store_dir,
+                offline_cache_only=OFFLINE_CACHE_ONLY,
+            )
+        )
+
+    if pred_days:
+        state["last_entry_file_date"] = pred_days[-1]
+
+    symbols_needed = (
+        sorted(set(state.get("positions", {}).keys()) | set(df_pred["symbol"].tolist()))
+        if not df_pred.empty
+        else sorted(state.get("positions", {}).keys())
+    )
+
+    replay_events = update_positions_until_last_closed(
+        state=state,
+        symbols_needed=symbols_needed,
+        store_dir=store_dir,
+        entry_lag_days=ENTRY_LAG_DAYS,
+        offline_cache_only=OFFLINE_CACHE_ONLY,
+        progress=True,
+    )
+
+    new_events = entry_events + replay_events
+
+    df_pred_today = df_pred[df_pred["file_date"] == pred_days[-1]].copy() if pred_days else pd.DataFrame()
+
+    print_etf_report(state=state, new_events=new_events, df_pred_today=df_pred_today)
+    _save_positions(state)
+
     body = build_email_body(
         loaded_hits=len(hits),
         df_all_len=len(df_all),
@@ -2401,7 +2360,6 @@ def main() -> int:
     )
     send_email_with_analysis(body, df=df_pred, directory=str(folder))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
