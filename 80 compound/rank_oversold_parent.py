@@ -43,7 +43,7 @@ from sklearn import __version__ as sklearn_version
 
 HOLDOUT_DAYS = 5
 ENTRY_LAG_DAYS = 1
-HORIZON_DAYS = 7
+HORIZON_DAYS = 21
 DROP_PCT = 0.10
 DROP_HORIZON_DAYS = 5
 OFFLINE_CACHE_ONLY = 0
@@ -1906,7 +1906,8 @@ def build_email_body(
     df_pred: pd.DataFrame,
     threshold: float,
     target_pct: float,
-    holdout_days: int,
+    horizon_days: int,
+    drop_hor: int,
     model_meta: Optional[Dict] = None,
     topk: int = 40,
 ) -> str:
@@ -1927,9 +1928,10 @@ def build_email_body(
         lines.append("")
         lines.append(f"Model trained_through: {model_meta.get('train_end_date')}")
         lines.append(f"Model predict_from:   {model_meta.get('predict_start_date')}")
-        lines.append(f"holdout_days:         {holdout_days}")
+        lines.append(f"horizon days:         {horizon_days}")
         lines.append(f"threshold:            {threshold}")
         lines.append(f"target_pct:           {target_pct}")
+        lines.append(f"drop_hor:              {drop_hor}")
         lines.append(f"sklearn:              {model_meta.get('sklearn_version')}")
         lines.append(f"created_utc:          {model_meta.get('created_utc')}")
         lines.append("drop_feature:         feat_prob_drop10 (from downside model or fallback)")
@@ -2096,6 +2098,37 @@ def main() -> int:
     )
 
     args = ap.parse_args()
+    # --------------------------------------------------
+    # CLEAN MODEL + CACHE ONLY WHEN --retrain IS SET
+    # --------------------------------------------------
+    if args.retrain:
+        # Paths to your model bundles
+        rolling_path = BASE_DIR / "models" / "rolling_bundle.joblib"
+        default_path = BASE_DIR / "models" / "default_model_76.joblib"
+
+        for p in [rolling_path, default_path]:
+            try:
+                if p.exists():
+                    print(f"[CLEAN] Deleting {p}")
+                    p.unlink()
+            except Exception as e:
+                print(f"[CLEAN] Failed to delete {p}: {e}", file=sys.stderr)
+
+        # Empty the kline_store directory (but keep the folder)
+        store_dir = Path(args.cache_dir)
+        if store_dir.exists() and store_dir.is_dir():
+            print(f"[CLEAN] Clearing contents of {store_dir}")
+            for f in store_dir.iterdir():
+                try:
+                    if f.is_file():
+                        f.unlink()
+                    elif f.is_dir():
+                        # remove subdirectories recursively
+                        import shutil
+                        shutil.rmtree(f)
+                except Exception as e:
+                    print(f"[CLEAN] Failed to remove {f}: {e}", file=sys.stderr)
+
     OFFLINE_CACHE_ONLY = bool(args.offline_cache_only)
 
     MIN_HISTORY_HITS = 3
@@ -2103,7 +2136,6 @@ def main() -> int:
     OUT_PATH = Path("ai_predictions.csv")
 
     DROP_PCT = 0.10
-    DROP_HORIZON_DAYS = 5
 
     folder = Path(args.dir)
     store_dir = Path(args.cache_dir)
@@ -2233,6 +2265,7 @@ def main() -> int:
     # Predict
     df_pred = predict_dates(clf_main, feat_cols_main, df_all, predict_dates_list, threshold=args.threshold)
     df_pred = df_pred[df_pred["pred_buy"] == 1].copy()
+    df_pred = df_pred[df_pred["prob_up_target_h"] >= 0.70].copy()
 
     # BTC mood output-only (thread offline flag through)
     df_pred = add_btc_mood_columns_and_filter_dates_bullish_only(
@@ -2354,7 +2387,8 @@ def main() -> int:
         df_pred=df_pred,
         threshold=args.threshold,
         target_pct=args.target_pct,
-        holdout_days=HOLDOUT_DAYS,
+        horizon_days=HORIZON_DAYS,
+        drop_hor=DROP_HORIZON_DAYS,
         model_meta=model_meta,
         topk=TOPK,
     )
