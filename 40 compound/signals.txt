@@ -1,0 +1,8 @@
+file=2026-02-01  threshold=0.55  BTC(2026-02-01)=BEARISH -2.25%
+BUY  C98USDT       p=0.603  featDropP=0.834  runupToHigh=52.3%  maxHighDate=2026-02-05
+
+file=2026-02-02  threshold=0.55  BTC(2026-02-02)=BULLISH +2.30%
+BUY  ENSOUSDT      p=0.738  featDropP=0.875  runupToHigh=21.6%  maxHighDate=2026-02-05
+
+file=2026-02-03  threshold=0.55  BTC(2026-02-03)=BEARISH -3.77%
+BUY  ENSOUSDT      p=0.703  featDropP=0.855  runupToHigh=17.1%  maxHighDate=2026-02-05

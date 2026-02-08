@@ -1,13 +1,16 @@
-file=2026-01-31  (top 3)  threshold=0.5  BTC(2026-01-31)=BULLISH -6.55%
-BUY  C98USDT       p=0.660  hits30d=12  runupToHigh=29.09%  maxHighDate=2026-02-05  featDropP=0.864
-BUY  ENSOUSDT      p=0.526  hits30d=23  runupToHigh=30.76%  maxHighDate=2026-02-01  featDropP=0.681
-BUY  AWEUSDT       p=0.519  hits30d=11  runupToHigh=43.56%  maxHighDate=2026-02-07  featDropP=0.166
+file=2026-01-29  (top 2)  threshold=0.5  BTC(2026-01-29)=BULLISH -5.21%
+BUY  ENSOUSDT      p=0.810  hits30d=21  runupToHigh=63.59%  maxHighDate=2026-02-01  featDropP=0.845
+BUY  C98USDT       p=0.621  hits30d=11  runupToHigh=82.99%  maxHighDate=2026-02-05  featDropP=0.866
 
-file=2026-02-01  (top 1)  threshold=0.5  BTC(2026-02-01)=BULLISH -2.25%
-BUY  C98USDT       p=0.580  hits30d=13  runupToHigh=82.05%  maxHighDate=2026-02-05  featDropP=0.841
+file=2026-01-30  (top 1)  threshold=0.5  BTC(2026-01-30)=BULLISH -0.46%
+BUY  ENSOUSDT      p=0.761  hits30d=22  runupToHigh=8.72%  maxHighDate=2026-02-01  featDropP=0.832
+
+file=2026-01-31  (top 2)  threshold=0.5  BTC(2026-01-31)=BULLISH -6.55%
+BUY  ENSOUSDT      p=0.719  hits30d=23  runupToHigh=30.76%  maxHighDate=2026-02-01  featDropP=0.822
+BUY  C98USDT       p=0.512  hits30d=12  runupToHigh=29.09%  maxHighDate=2026-02-05  featDropP=0.816
 
 file=2026-02-02  (top 1)  threshold=0.5  BTC(2026-02-02)=BULLISH +2.30%
-BUY  ENSOUSDT      p=0.551  hits30d=23  runupToHigh=40.47%  maxHighDate=2026-02-07  featDropP=0.698
+BUY  ENSOUSDT      p=0.722  hits30d=23  runupToHigh=40.47%  maxHighDate=2026-02-07  featDropP=0.828
 
 file=2026-02-03  (top 1)  threshold=0.5  BTC(2026-02-03)=BULLISH -3.77%
-BUY  ENSOUSDT      p=0.549  hits30d=23  runupToHigh=35.18%  maxHighDate=2026-02-07  featDropP=0.656
+BUY  ENSOUSDT      p=0.657  hits30d=23  runupToHigh=35.18%  maxHighDate=2026-02-07  featDropP=0.797

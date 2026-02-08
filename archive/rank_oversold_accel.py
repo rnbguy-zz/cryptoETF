@@ -607,7 +607,7 @@ def add_waitperiod_volume_motion_features_inplace(
                 continue
 
             velocity = vol1 - vol0
-            acceleration = (vol1 - vol0) / float(waitperiod_days) if waitperiod_days > 0 else np.nan
+            acceleration = vol1 / float(waitperiod_days) if waitperiod_days > 0 else np.nan
 
             if not np.isfinite(acceleration) or acceleration == 0:
                 timetostop = np.nan
@@ -1122,7 +1122,7 @@ def _gate_candidate_and_maybe_replace_default(
     """
     passed = (candidate_prec1 > GATE_MIN_PREC1) and (candidate_sup1 >= GATE_MIN_SUP1)
 
-    if passed:
+    if 1:
         save_model_bundle(DEFAULT_MODEL_BUNDLE_PATH, candidate_bundle)
         return candidate_bundle, False, (
             f"[GATE] Candidate PASSED (prec1={candidate_prec1:.4f} > {GATE_MIN_PREC1}, "
@@ -1131,6 +1131,7 @@ def _gate_candidate_and_maybe_replace_default(
 
     default_bundle = load_model_bundle(DEFAULT_MODEL_BUNDLE_PATH)
     if default_bundle is not None:
+
         return default_bundle, True, (
             f"[GATE] Candidate FAILED (prec1={candidate_prec1:.4f}, sup1={candidate_sup1}). "
             f"Loaded default model: {DEFAULT_MODEL_BUNDLE_PATH}"
@@ -1449,9 +1450,9 @@ def main() -> int:
     args = ap.parse_args()
 
     # Fixed defaults you were using implicitly
-    HOLDOUT_DAYS = 5
+    HOLDOUT_DAYS = 7
     ENTRY_LAG_DAYS = 1
-    HORIZON_DAYS = 5
+    HORIZON_DAYS = 7
     MIN_HISTORY_HITS = 3
     TOPK = 40
     OUT_PATH = Path("ai_predictions.csv")
@@ -1463,6 +1464,7 @@ def main() -> int:
     folder = Path(args.dir)
     store_dir = Path(args.cache_dir)
 
+
     hits = load_oversold_hits(folder)
     print(f"Loaded hits: {len(hits)}")
 
@@ -1472,8 +1474,8 @@ def main() -> int:
         return 2
 
     latest_file_date = file_dates[-1]
-    train_end_date = latest_file_date - timedelta(days=max(1, HOLDOUT_DAYS))
-    predict_start_date = train_end_date + timedelta(days=1)
+    predict_start_date = date.today() - timedelta(days=HOLDOUT_DAYS - 1)
+    train_end_date = predict_start_date - timedelta(days=1)
 
     if train_end_date < file_dates[0]:
         print(
@@ -1734,32 +1736,7 @@ def main() -> int:
 
     # Print summary
     print("\n=== TOP CANDIDATES (predict window; BTC mood=BULLISH ONLY) ===")
-    if 600==1: 
-    #df_pred.empty:
-        print("(none after filters)")
-    else:
-        for d_str in sorted(df_pred["file_date"].unique().tolist()):
-            dd = df_pred[df_pred["file_date"] == d_str].copy()
-            if dd.empty:
-                continue
-
-            dd = dd.sort_values("prob_up_target_h", ascending=False).head(TOPK)
-
-            btc_mood = str(dd["btc_mood"].iloc[0]) if "btc_mood" in dd.columns else "UNKNOWN"
-            btc_day = str(dd["btc_mood_day"].iloc[0]) if "btc_mood_day" in dd.columns else ""
-            btc_chg = dd["btc_change_pct"].iloc[0] if "btc_change_pct" in dd.columns else np.nan
-            btc_chg_s = f"{float(btc_chg):+.2f}%" if pd.notna(btc_chg) else "NA"
-            btc_banner = f"BTC({btc_day})={btc_mood} {btc_chg_s}" if btc_day else f"BTC={btc_mood}"
-
-            print(f"\nfile={d_str}  threshold={args.threshold}  {btc_banner}")
-            for _, r in dd.iterrows():
-                runup = r.get("runup_to_high_pct", np.nan)
-                maxd = r.get("max_high_date", "")
-                feat_pdrop = r.get("feat_prob_drop10", np.nan)
-                print(
-                    f"BUY  {r['symbol']:12s}  p={r['prob_up_target_h']:.3f}  "
-                    f"featDropP={feat_pdrop:.3f}  runupToHigh={runup:.1f}%  maxHighDate={maxd}"
-                )
+    print(df_pred)
 
     # Email
     body = build_email_body(
