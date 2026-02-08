@@ -44,8 +44,8 @@ from sklearn import __version__ as sklearn_version
 HOLDOUT_DAYS = 5
 ENTRY_LAG_DAYS = 1
 HORIZON_DAYS = 21
-DROP_PCT = 0.10
 DROP_HORIZON_DAYS = 5
+DROP_PCT = 0.10
 OFFLINE_CACHE_ONLY = 0
 
 # ============================================================
@@ -1919,7 +1919,7 @@ def build_email_body(
     lines.append(f"Train dates: {train_dates[0]} .. {train_dates[-1]}  ({len(train_dates)} days)")
     if predict_dates_list:
         lines.append(
-            f"Predict dates (classify only): {predict_dates_list[0]} .. {predict_dates_list[-1]}  ({len(predict_dates_list)} days)"
+            f"Predict file dates (entry is 1 plus): {predict_dates_list[0]} .. {predict_dates_list[-1]}  ({len(predict_dates_list)} days)"
         )
     else:
         lines.append("Predict dates (classify only): (none found yet)")
@@ -2265,7 +2265,7 @@ def main() -> int:
     # Predict
     df_pred = predict_dates(clf_main, feat_cols_main, df_all, predict_dates_list, threshold=args.threshold)
     df_pred = df_pred[df_pred["pred_buy"] == 1].copy()
-    df_pred = df_pred[df_pred["prob_up_target_h"] >= 0.70].copy()
+    df_pred = df_pred[df_pred["prob_up_target_h"] >= 0.50].copy()
 
     # BTC mood output-only (thread offline flag through)
     df_pred = add_btc_mood_columns_and_filter_dates_bullish_only(

@@ -1172,7 +1172,7 @@ def main() -> int:
     ap.add_argument("--signals-file", required=True)
     ap.add_argument("--entry-lag-days", type=int, default=1)
     ap.add_argument("--tp-pct", type=float, default=0.20)
-    ap.add_argument("--sl-pct", type=float, default=0.10)
+    ap.add_argument("--sl-pct", type=float, default=0.05)
     ap.add_argument("--start", default="", help="Optional override YYYY-MM-DD")
     ap.add_argument("--end", default="", help="Optional override YYYY-MM-DD")
     ap.add_argument("--cache-path", default="binance_cache.json")
