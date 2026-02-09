@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 
+'''
+In prod:
+Increase trees a bit (stability): n_estimators=400
+Allow smaller leaves (more sensitivity): min_samples_leaf=1 (can raise recall, may drop precision)
+
+'''
+
 from __future__ import annotations
 
 import argparse
@@ -64,7 +71,7 @@ MIN_HISTORY_HITS = 3
 HORIZONS = [14,21]
 DROP_HORIZONS = [21]
 TPS = [0.2,0.25, 0.30,0.4]
-DROPS = [0.11, 0.12]
+DROPS = [0.11, 0.12,18]
 
 from itertools import product
 import math
@@ -2501,19 +2508,6 @@ def relabel_for_combo(
     sl_pct: float = HARD_STOP_PCT,
     sl_same_day_counts_as_first: bool = True,
 ) -> pd.DataFrame:
-    """
-    Take df_base (features only) and add:
-      - label (upside)
-      - label_down10 (downside)
-    for a specific combo of (TP, H, DP, DH)
-
-    NEW (optional):
-      enforce_sl_not_first=True makes label=1 only if TP is hit AND SL did NOT happen
-      before TP (and optionally not on the same day if sl_same_day_counts_as_first=True).
-
-    If enforce_sl_not_first=False, behavior is exactly as before (label uses max close >= TP).
-    """
-
     df = df_base.copy()
 
     # ---- Main label (upside) ----
@@ -2530,7 +2524,7 @@ def relabel_for_combo(
             return np.nan
 
         entry = fday + timedelta(days=int(entry_lag_days))
-        endw = entry + timedelta(days=int(drop_horizon_days))
+        endw = entry + timedelta(days=int(horizon_days))
 
         w = get_klines_window(
             sym,
