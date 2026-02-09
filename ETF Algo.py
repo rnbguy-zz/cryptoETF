@@ -1,22 +1,38 @@
 #!/usr/bin/env python3
 """
-etf_replay_from_signals.py
+etf_replay_from_signals_single_position.py
 
-REALISTIC exit ordering:
-- Uses Binance 1D candles for most checks.
-- If BOTH TP and SL are hit in the same 1D day, it fetches intraday candles for that UTC day
-  and determines which was hit first (no assumption).
+ALIGNMENT + REALISM + SINGLE-POSITION ROTATION
 
-Defaults:
-- start_day = earliest file=YYYY-MM-DD found in the signals file
-- end_day   = today UTC (datetime.utcnow().date())
+What’s different vs your current replay:
+1) Ambiguous TP+SL same day:
+   - Default fallback is SL-first (matches your label logic).
+   - Still can resolve via intraday candles if enabled.
+
+2) Horizon-bounded exits (aligns with labeling):
+   - --max-hold-days (default 21): if still OPEN on/after entry_day+max_hold_days => exit at that day's CLOSE.
+
+3) Optional strategy exits (same knobs you were using elsewhere):
+   - --trail-pct (default 0.12): exit if CLOSE <= peak_close*(1-trail_pct)
+   - --time-stop-days (default 14) and --time-stop-min-gain (default 0.05):
+        if age>=days and CLOSE < entry*(1+min_gain) => exit at CLOSE
+
+4) SINGLE POSITION at a time (your new requirement):
+   - If a new entry signal arrives while holding something, we ROTATE:
+       - Exit current at PREVIOUS DAY close (d-1 close) right before buying the new coin on day d open.
+       - Then enter the chosen new coin on day d open.
+   - If multiple signals arrive for the same entry day, we pick the one with the highest parsed p=... if present,
+     otherwise first encountered.
+
+Signals format supported:
+  file=YYYY-MM-DD
+  BUY SYMBOL ... (optional: p=0.781)
 
 Usage:
-  python etf_replay_from_signals.py --signals-file signals.txt
+  python etf_replay_from_signals_single_position.py --signals-file signals.txt
 
-Optional realism knobs:
-  --intraday-interval 1m|5m|15m|1h   (default 5m)
-  --ambiguous-fallback none|tp-first|sl-first  (default none)
+Common knobs:
+  --tp-pct 0.20 --sl-pct 0.10 --max-hold-days 21 --ambiguous-fallback sl-first --intraday-interval 1m
 """
 
 from __future__ import annotations
@@ -41,12 +57,15 @@ import requests
 
 FILE_RE = re.compile(r"^\s*file=(\d{4}-\d{2}-\d{2})\b")
 BUY_RE = re.compile(r"^\s*BUY\s+([A-Z0-9]+)\b")
+P_RE = re.compile(r"\bp=([0-9]*\.?[0-9]+)\b")
+
 
 @dataclass(frozen=True)
 class Signal:
     file_date: date
     symbol: str
     raw_line: str
+    p: float  # optional; 0.0 if missing
 
 
 def parse_signals_text(text: str) -> Tuple[List[Signal], Dict[date, List[str]]]:
@@ -68,7 +87,9 @@ def parse_signals_text(text: str) -> Tuple[List[Signal], Dict[date, List[str]]]:
             b = BUY_RE.match(line)
             if b:
                 sym = b.group(1).upper()
-                signals.append(Signal(file_date=cur_file_date, symbol=sym, raw_line=line.rstrip("\n")))
+                mp = P_RE.search(line)
+                p = float(mp.group(1)) if mp else 0.0
+                signals.append(Signal(file_date=cur_file_date, symbol=sym, raw_line=line.rstrip("\n"), p=p))
 
     signals.sort(key=lambda s: (s.file_date, s.symbol))
     return signals, raw_block
@@ -180,10 +201,6 @@ def fetch_intraday_klines_for_day(
     interval: str,
     session: requests.Session,
 ) -> List[IntraCandle]:
-    """
-    Fetch intraday klines for one UTC day [day 00:00:00 .. next day 00:00:00).
-    Binance limit is 1000 per call; for 1m you need multiple pages (~1440 mins).
-    """
     start_dt = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=timezone.utc)
     end_dt = start_dt + timedelta(days=1)
 
@@ -193,7 +210,6 @@ def fetch_intraday_klines_for_day(
     out: List[IntraCandle] = []
     cur_start = start_ms
 
-    # paginate until we reach end_ms
     while cur_start < end_ms:
         params = {
             "symbol": symbol,
@@ -221,17 +237,12 @@ def fetch_intraday_klines_for_day(
             except Exception:
                 continue
 
-        # safety: if we didn't advance, stop
         if last_open_ms is None:
             break
 
-        # next page: start after last candle open time
         cur_start = last_open_ms + 1
-
-        # light rate-limit friendliness
         time.sleep(0.05)
 
-    # dedupe/sort by ts
     by_ts: Dict[int, IntraCandle] = {c.ts_ms: c for c in out}
     return [by_ts[t] for t in sorted(by_ts.keys())]
 
@@ -292,10 +303,6 @@ def get_intraday_cached_for_day(
     cache: dict,
     cache_path: Path,
 ) -> List[IntraCandle]:
-    """
-    Cache structure:
-      cache[symbol]["intraday"][interval][YYYY-MM-DD] = [ [ts,o,h,l,c], ... ]
-    """
     sym = symbol.upper()
     cache.setdefault(sym, {}).setdefault("intraday", {})
     cache[sym]["intraday"].setdefault(interval, {})
@@ -319,7 +326,7 @@ def get_intraday_cached_for_day(
 
 
 # ----------------------------
-# Strategy hook
+# Strategy
 # ----------------------------
 
 @dataclass
@@ -331,8 +338,9 @@ class Position:
     exit_day: Optional[date] = None
     exit_price: Optional[float] = None
     exit_reason: Optional[str] = None
-    max_high_so_far: float = float("nan")
-    last_close: float = float("nan")
+
+    peak_close: float = float("nan")     # for trailing stop
+    last_close: float = float("nan")     # for reporting
 
 
 def evaluate_exit_realistic(
@@ -345,17 +353,17 @@ def evaluate_exit_realistic(
     cache: dict,
     cache_path: Path,
     intraday_interval: str,
-    ambiguous_fallback: str,  # "none"|"tp-first"|"sl-first"
+    ambiguous_fallback: str,     # "none"|"tp-first"|"sl-first"
+    resolve_ambiguous_intraday: bool,
 ) -> Optional[Tuple[str, float]]:
     """
     Returns (reason, exit_price) or None.
-    Realistic rule:
-      - If only TP is hit in 1D => TP.
-      - If only SL is hit in 1D => SL.
-      - If both hit in 1D => fetch intraday candles for that day and find which triggers first.
-        If intraday missing/empty:
-           - none => no exit (hold)
-           - tp-first/sl-first => fallback ordering
+
+    - If only TP hit in 1D: exit TP
+    - If only SL hit in 1D: exit SL
+    - If both hit in 1D:
+        - If resolve_ambiguous_intraday: use intraday candles to determine which hit first
+        - If cannot resolve or resolve_ambiguous_intraday=False: use ambiguous_fallback
     """
     tp_price = pos.entry_open * (1.0 + tp_pct)
     sl_price = pos.entry_open * (1.0 - sl_pct)
@@ -364,55 +372,52 @@ def evaluate_exit_realistic(
     hit_sl_1d = day_candle.l <= sl_price
 
     if hit_tp_1d and not hit_sl_1d:
-        return ("TP_20", tp_price)
+        return ("TP", tp_price)
     if hit_sl_1d and not hit_tp_1d:
-        return ("SL_10", sl_price)
+        return ("SL", sl_price)
     if not hit_tp_1d and not hit_sl_1d:
         return None
 
-    # BOTH hit on 1D: resolve via intraday
-    intra = get_intraday_cached_for_day(
-        pos.symbol, day_candle.day,
-        interval=intraday_interval,
-        session=session, cache=cache, cache_path=cache_path,
-    )
+    # BOTH hit on 1D
+    if resolve_ambiguous_intraday:
+        intra = get_intraday_cached_for_day(
+            pos.symbol, day_candle.day,
+            interval=intraday_interval,
+            session=session, cache=cache, cache_path=cache_path,
+        )
+    else:
+        intra = []
 
     if not intra:
-        # cannot resolve without assuming
         if ambiguous_fallback == "tp-first":
-            return ("TP_20", tp_price)
+            return ("TP_AMBIG", tp_price)
         if ambiguous_fallback == "sl-first":
-            return ("SL_10", sl_price)
-        # none: don't assume
+            return ("SL_AMBIG", sl_price)
         return None
 
     for c in intra:
-        # On each intraday candle, check whether thresholds were crossed.
-        # Still possible BOTH cross inside same intraday candle; for 1m this is rare but still possible.
-        # If it happens, we again cannot know within that minute unless you go finer (not available reliably).
         hit_tp = c.h >= tp_price
         hit_sl = c.l <= sl_price
 
         if hit_tp and not hit_sl:
-            return ("TP_20", tp_price)
+            return ("TP", tp_price)
         if hit_sl and not hit_tp:
-            return ("SL_10", sl_price)
+            return ("SL", sl_price)
         if hit_tp and hit_sl:
-            # still ambiguous even at this resolution
             if ambiguous_fallback == "tp-first":
-                return ("TP_20", tp_price)
+                return ("TP_AMBIG", tp_price)
             if ambiguous_fallback == "sl-first":
-                return ("SL_10", sl_price)
+                return ("SL_AMBIG", sl_price)
             return None
 
     return None
 
 
 # ----------------------------
-# Engine
+# Engine (SINGLE POSITION)
 # ----------------------------
 
-def run_replay(
+def run_replay_single_position(
     *,
     signals: List[Signal],
     raw_blocks: Dict[date, List[str]],
@@ -424,42 +429,56 @@ def run_replay(
     cache_path: Path,
     intraday_interval: str,
     ambiguous_fallback: str,
+    resolve_ambiguous_intraday: bool,
+    max_hold_days: int,
+    trail_pct: float,
+    time_stop_days: int,
+    time_stop_min_gain: float,
 ) -> None:
-    total_realised_gain = 0.0
-    num_closed_trades = 0
-    compounded_factor = 1.0
+    session = requests.Session()
+    cache = load_cache(cache_path)
 
+    # Build signals by ENTRY day (file_date + lag)
     sig_by_entry_day: Dict[date, List[Signal]] = {}
     for s in signals:
         e = s.file_date + timedelta(days=entry_lag_days)
         sig_by_entry_day.setdefault(e, []).append(s)
 
-    symbols = sorted({s.symbol for s in signals})
-
-    session = requests.Session()
-    cache = load_cache(cache_path)
+    # For any day, we might need candles for:
+    # - current position symbol
+    # - candidate signal symbols
+    symbols_all = sorted({s.symbol for s in signals})
 
     candles_by_symbol: Dict[str, Dict[date, Candle]] = {}
-    for sym in symbols:
+    for sym in symbols_all:
         candles_by_symbol[sym] = get_candles_cached(
             sym, start_day, end_day,
             session=session, cache=cache, cache_path=cache_path,
         )
 
-    positions: Dict[str, Position] = {}
-    trades: List[Position] = []
-
     def fmt_d(d: date) -> str:
         return d.strftime("%-d-%-m-%Y") if os.name != "nt" else d.strftime("%#d-%#m-%Y")
 
+    def gain_pct(entry: float, px: float) -> float:
+        return (px / max(entry, 1e-12) - 1.0) * 100.0
+
+    compounded_factor = 1.0
+    total_realised_gain = 0.0
+    num_closed_trades = 0
+
+    pos: Optional[Position] = None
+    trades: List[Position] = []
+
     print("=" * 80)
-    print("ETF REPLAY FROM SIGNALS (Binance 1D + intraday disambiguation, UTC days)")
+    print("ETF REPLAY (SINGLE POSITION ROTATION, horizon-bounded, ambiguity aligned)")
     print("=" * 80)
     print(f"Replay window (UTC days): {start_day.isoformat()} .. {end_day.isoformat()}")
     print(f"Entry lag days: {entry_lag_days}  TP: {tp_pct*100:.0f}%  SL: {sl_pct*100:.0f}%")
-    print(f"Intraday interval (only when TP+SL hit same day): {intraday_interval}")
+    print(f"Max hold days: {max_hold_days} (exit at CLOSE on day entry+max_hold)")
+    print(f"Trail pct: {trail_pct*100:.1f}%  Time stop: {time_stop_days}d (min gain {time_stop_min_gain*100:.1f}%)")
+    print(f"Intraday interval: {intraday_interval}  Resolve ambiguous intraday: {resolve_ambiguous_intraday}")
     print(f"Ambiguous fallback: {ambiguous_fallback}")
-    print(f"Signals parsed: {len(signals)}  Symbols: {len(symbols)}")
+    print(f"Signals parsed: {len(signals)}  Symbols: {len(symbols_all)}")
     print(f"Cache: {cache_path}")
     print("=" * 80)
 
@@ -467,13 +486,88 @@ def run_replay(
     while d <= end_day:
         day_header_printed = False
 
-        # Entries
+        # -------------------------
+        # 1) Update/exit existing position (strategy exits)
+        # -------------------------
+        if pos is not None and pos.status == "OPEN":
+            day_candle = candles_by_symbol.get(pos.symbol, {}).get(d)
+
+            if not day_header_printed:
+                print(f"\n----\nDate {fmt_d(d)}")
+                day_header_printed = True
+
+            if day_candle is None:
+                print(f"Holding {pos.symbol}: (missing 1D candle for {d.isoformat()})")
+            else:
+                pos.last_close = day_candle.c
+                # init peak_close
+                if not (pos.peak_close == pos.peak_close):
+                    pos.peak_close = day_candle.c
+                pos.peak_close = max(pos.peak_close, day_candle.c)
+
+                # exits only valid from entry_day onward
+                if d >= pos.entry_day:
+                    # TP/SL (with ambiguity handling)
+                    exit_hit = evaluate_exit_realistic(
+                        pos=pos,
+                        day_candle=day_candle,
+                        tp_pct=tp_pct,
+                        sl_pct=sl_pct,
+                        session=session,
+                        cache=cache,
+                        cache_path=cache_path,
+                        intraday_interval=intraday_interval,
+                        ambiguous_fallback=ambiguous_fallback,
+                        resolve_ambiguous_intraday=resolve_ambiguous_intraday,
+                    )
+
+                    # Trailing stop (CLOSE-based)
+                    if exit_hit is None and trail_pct > 0:
+                        trail_px = pos.peak_close * (1.0 - trail_pct)
+                        if day_candle.c <= trail_px:
+                            exit_hit = ("TRAIL", day_candle.c)
+
+                    # Time stop (CLOSE-based)
+                    if exit_hit is None and time_stop_days > 0:
+                        age = (d - pos.entry_day).days
+                        if age >= time_stop_days:
+                            if day_candle.c < pos.entry_open * (1.0 + time_stop_min_gain):
+                                exit_hit = ("TIME", day_candle.c)
+
+                    # Max hold (CLOSE-based) — aligns with horizon-bounded label world
+                    if exit_hit is None and max_hold_days > 0:
+                        if d >= (pos.entry_day + timedelta(days=max_hold_days)):
+                            exit_hit = ("MAX_HOLD", day_candle.c)
+
+                    if exit_hit is not None:
+                        reason, exit_price = exit_hit
+                        pos.status = "CLOSED"
+                        pos.exit_day = d
+                        pos.exit_price = float(exit_price)
+                        pos.exit_reason = reason
+
+                        g = gain_pct(pos.entry_open, pos.exit_price)
+                        total_realised_gain += g
+                        num_closed_trades += 1
+                        compounded_factor *= (1.0 + g / 100.0)
+
+                        print("\n" + "=" * 80)
+                        print(
+                            f"Sold {pos.symbol}: close={day_candle.c:.8g}, high={day_candle.h:.8g}, low={day_candle.l:.8g}, "
+                            f"exit={pos.exit_price:.8g} ({reason}), gain={g:.2f}%."
+                        )
+                        pos = None  # flat
+
+        # -------------------------
+        # 2) Entries + rotation (SINGLE POSITION)
+        # -------------------------
         entry_signals = sig_by_entry_day.get(d, [])
         if entry_signals:
             if not day_header_printed:
                 print(f"\n----\nDate {fmt_d(d)}")
                 day_header_printed = True
 
+            # print raw blocks for the *source file_date(s)* of signals
             src_file_dates = sorted({s.file_date for s in entry_signals})
             for fd in src_file_dates:
                 blk = raw_blocks.get(fd, [])
@@ -482,151 +576,108 @@ def run_replay(
                     for line in blk:
                         print(line)
 
-            for s in entry_signals:
-                sym = s.symbol
-                if sym in positions and positions[sym].status == "OPEN":
-                    print(
-                        f"\n(skipped) {sym} signal from file={s.file_date.isoformat()} "
-                        f"because position already OPEN since {positions[sym].entry_day.isoformat()}"
-                    )
-                    continue
+            # pick best signal for this day (highest p if present, else first)
+            entry_signals_sorted = sorted(entry_signals, key=lambda s: (s.p, s.symbol), reverse=True)
+            chosen = entry_signals_sorted[0]
+            chosen_sym = chosen.symbol
 
-                c = candles_by_symbol.get(sym, {}).get(d)
-                if c is None:
-                    print(f"\n(buy failed) {sym} entry_day={d.isoformat()} missing 1D candle data.")
-                    continue
+            # ROTATE if currently holding something else:
+            # Exit current at previous day's CLOSE (d-1 close), then buy new at today's OPEN.
+            if pos is not None and pos.status == "OPEN" and pos.symbol != chosen_sym:
+                prev_day = d - timedelta(days=1)
+                prev_candle = candles_by_symbol.get(pos.symbol, {}).get(prev_day)
 
-                pos = Position(
-                    symbol=sym,
-                    entry_day=d,
-                    entry_open=c.o,
-                    status="OPEN",
-                    max_high_so_far=c.h,
-                    last_close=c.c,
-                )
-                positions[sym] = pos
-                trades.append(pos)
-
-                tp_price = pos.entry_open * (1.0 + tp_pct)
-                sl_price = pos.entry_open * (1.0 - sl_pct)
-
-                print(
-                    f"\nBought {sym} on {fmt_d(d)} from file={s.file_date.isoformat()} "
-                    f"at buy price (open={pos.entry_open:.8g}). "
-                    f"Waiting for sell target (>= {tp_price:.8g}) or stop loss (<= {sl_price:.8g})."
-                )
-
-        # Exits/Holds
-        open_syms = [sym for sym, p in positions.items() if p.status == "OPEN"]
-        if open_syms:
-            if not day_header_printed:
-                print(f"\n----\nDate {fmt_d(d)}")
-                day_header_printed = True
-
-            for sym in sorted(open_syms):
-                pos = positions[sym]
-                day_candle = candles_by_symbol.get(sym, {}).get(d)
-                if day_candle is None:
-                    print(f"Holding {sym}: (missing 1D candle for {d.isoformat()})")
-                    continue
-
-                # tracking
-                if pos.max_high_so_far == pos.max_high_so_far:
-                    pos.max_high_so_far = max(pos.max_high_so_far, day_candle.h)
+                if prev_candle is None:
+                    # If we cannot price the rotation exit, fallback to today's open if available.
+                    today_candle_old = candles_by_symbol.get(pos.symbol, {}).get(d)
+                    if today_candle_old is None:
+                        print(f"\n(rotate failed) Cannot price exit for {pos.symbol} on {prev_day.isoformat()} or {d.isoformat()}. Keeping position.")
+                    else:
+                        exit_px = today_candle_old.o
+                        g = gain_pct(pos.entry_open, exit_px)
+                        total_realised_gain += g
+                        num_closed_trades += 1
+                        compounded_factor *= (1.0 + g / 100.0)
+                        pos.status = "CLOSED"
+                        pos.exit_day = d
+                        pos.exit_price = float(exit_px)
+                        pos.exit_reason = "ROTATE_OPEN_FALLBACK"
+                        print(
+                            f"\n[ROTATE] Sold {pos.symbol} at {d.isoformat()} OPEN={exit_px:.8g} "
+                            f"(missing prev close). gain={g:.2f}%."
+                        )
+                        pos = None
                 else:
-                    pos.max_high_so_far = day_candle.h
-                pos.last_close = day_candle.c
-
-                if d < pos.entry_day:
-                    continue
-
-                exit_hit = evaluate_exit_realistic(
-                    pos=pos,
-                    day_candle=day_candle,
-                    tp_pct=tp_pct,
-                    sl_pct=sl_pct,
-                    session=session,
-                    cache=cache,
-                    cache_path=cache_path,
-                    intraday_interval=intraday_interval,
-                    ambiguous_fallback=ambiguous_fallback,
-                )
-
-                if exit_hit is not None:
-                    reason, exit_price = exit_hit
-                    pos.status = "CLOSED"
-                    pos.exit_day = d
-                    pos.exit_price = float(exit_price)
-                    pos.exit_reason = reason
-
-                    gain = (pos.exit_price / max(pos.entry_open, 1e-12) - 1.0) * 100.0
-                    total_realised_gain += gain
+                    exit_px = prev_candle.c
+                    g = gain_pct(pos.entry_open, exit_px)
+                    total_realised_gain += g
                     num_closed_trades += 1
-                    compounded_factor *= (1.0 + gain / 100.0)
-                    # ---- COMPOUND SUMMARY ----
-                    compounded_pct = (compounded_factor - 1.0) * 100.0
-                    print("\n" + "=" * 80)
+                    compounded_factor *= (1.0 + g / 100.0)
+                    pos.status = "CLOSED"
+                    pos.exit_day = prev_day
+                    pos.exit_price = float(exit_px)
+                    pos.exit_reason = "ROTATE_PREV_CLOSE"
                     print(
-                        f"Sold {sym}: close={day_candle.c:.8g}, high={day_candle.h:.8g}, low={day_candle.l:.8g}, "
-                        f"exit={pos.exit_price:.8g} ({reason}), gain={gain:.2f}%. (Position CLOSED)"
+                        f"\n[ROTATE] Sold {pos.symbol} at {prev_day.isoformat()} CLOSE={exit_px:.8g} "
+                        f"to rotate into {chosen_sym}. gain={g:.2f}%."
                     )
+                    pos = None
+
+            # If flat, enter chosen on today's OPEN
+            if pos is None:
+                c_new = candles_by_symbol.get(chosen_sym, {}).get(d)
+                if c_new is None:
+                    print(f"\n(buy failed) {chosen_sym} entry_day={d.isoformat()} missing 1D candle data.")
                 else:
+                    pos = Position(
+                        symbol=chosen_sym,
+                        entry_day=d,
+                        entry_open=c_new.o,
+                        status="OPEN",
+                        peak_close=c_new.c,
+                        last_close=c_new.c,
+                    )
+                    trades.append(pos)
+
                     tp_price = pos.entry_open * (1.0 + tp_pct)
                     sl_price = pos.entry_open * (1.0 - sl_pct)
-                    both_hit = (day_candle.h >= tp_price) and (day_candle.l <= sl_price)
 
-                    gain_so_far = (pos.last_close / max(pos.entry_open, 1e-12) - 1.0) * 100.0
-                    max_gain = (pos.max_high_so_far / max(pos.entry_open, 1e-12) - 1.0) * 100.0
-                    extra = " (AMBIGUOUS: TP+SL both hit; no assumption made)" if both_hit and ambiguous_fallback == "none" else ""
+                    p_txt = f" p={chosen.p:.3f}" if chosen.p > 0 else ""
                     print(
-                        f"Holding {sym}: close={day_candle.c:.8g}, high={day_candle.h:.8g}, "
-                        f"maxHighSoFar={pos.max_high_so_far:.8g}, "
-                        f"gainSoFar={gain_so_far:.2f}%, maxGainSoFar={max_gain:.2f}%. (Position HOLDING){extra}"
+                        f"\nBought {chosen_sym} on {fmt_d(d)} from file={chosen.file_date.isoformat()}{p_txt} "
+                        f"at buy price (open={pos.entry_open:.8g}). "
+                        f"Waiting for TP (>= {tp_price:.8g}) or SL (<= {sl_price:.8g})."
                     )
+            else:
+                # pos is open and same symbol as chosen OR we failed rotation
+                if pos.symbol == chosen_sym:
+                    print(f"\n(note) Signal for {chosen_sym} arrived but already holding it. No action.")
+                else:
+                    print(f"\n(note) Signal for {chosen_sym} arrived but still holding {pos.symbol}. No entry.")
 
         d += timedelta(days=1)
 
+    # -------------------------
     # Final summaries
+    # -------------------------
     print("\n" + "=" * 80)
-    print("FINAL POSITIONS (FULL HISTORY FROM THIS RUN)")
+    print("FINAL POSITIONS / TRADES")
     print("=" * 80)
-
-    def _gain_pct(entry: float, px: float) -> float:
-        return (px / max(entry, 1e-12) - 1.0) * 100.0
 
     for i, p in enumerate(trades, start=1):
         if p.status == "OPEN":
-            last_px = p.last_close if p.last_close == p.last_close else p.entry_open
-            gain = _gain_pct(p.entry_open, last_px)
+            last_px = p.last_close if (p.last_close == p.last_close) else p.entry_open
+            g = gain_pct(p.entry_open, last_px)
             print(
-                f"{i:03d}. {p.symbol}: OPEN  "
-                f"entry_day={p.entry_day.isoformat()} entry_open={p.entry_open:.8g} "
-                f"last_close={last_px:.8g} gain={gain:.2f}% "
-                f"max_high_so_far={p.max_high_so_far:.8g}"
+                f"{i:03d}. {p.symbol}: OPEN  entry_day={p.entry_day.isoformat()} entry_open={p.entry_open:.8g} "
+                f"last_close={last_px:.8g} gain={g:.2f}%"
             )
         else:
             exit_px = float(p.exit_price or p.entry_open)
-            gain = _gain_pct(p.entry_open, exit_px)
+            g = gain_pct(p.entry_open, exit_px)
             print(
-                f"{i:03d}. {p.symbol}: CLOSED "
-                f"entry_day={p.entry_day.isoformat()} exit_day={(p.exit_day.isoformat() if p.exit_day else '')} "
-                f"exit={exit_px:.8g} reason={p.exit_reason} gain={gain:.2f}% "
-                f"max_high_so_far={p.max_high_so_far:.8g}"
-            )
-
-    open_now = [p for p in positions.values() if p.status == "OPEN"]
-    print("\n" + "=" * 80)
-    print("OPEN POSITIONS NOW")
-    print("=" * 80)
-    if not open_now:
-        print("(none)")
-    else:
-        for p in sorted(open_now, key=lambda x: (x.symbol, x.entry_day)):
-            last_px = p.last_close if p.last_close == p.last_close else p.entry_open
-            gain = _gain_pct(p.entry_open, last_px)
-            print(
-                f"{p.symbol}: OPEN entry_day={p.entry_day.isoformat()} entry_open={p.entry_open:.8g} "
-                f"last_close={last_px:.8g} gain={gain:.2f}% max_high_so_far={p.max_high_so_far:.8g}"
+                f"{i:03d}. {p.symbol}: CLOSED entry_day={p.entry_day.isoformat()} exit_day={(p.exit_day.isoformat() if p.exit_day else '')} "
+                f"exit={exit_px:.8g} reason={p.exit_reason} gain={g:.2f}%"
             )
 
     print("\n" + "=" * 80)
@@ -639,11 +690,10 @@ def run_replay(
         print(f"AVG gain per trade:   {avg_gain:.2f}%")
     else:
         print("No closed trades yet — cannot compute average.")
-    print("=" * 80)
+
     compounded_pct = (compounded_factor - 1.0) * 100.0
     print(f"Compounded gain:      {compounded_pct:.2f}%")
-    print("Buy only signals with 0.7+ p-confidence, stop loss -10%, TP +20%")
-
+    print("=" * 80)
 
 
 # ----------------------------
@@ -658,19 +708,32 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--signals-file", required=True)
     ap.add_argument("--entry-lag-days", type=int, default=1)
+
     ap.add_argument("--tp-pct", type=float, default=0.20)
-    ap.add_argument("--sl-pct", type=float, default=0.05)
+    ap.add_argument("--sl-pct", type=float, default=0.10)
+
     ap.add_argument("--start", default="", help="Optional override YYYY-MM-DD")
     ap.add_argument("--end", default="", help="Optional override YYYY-MM-DD")
     ap.add_argument("--cache-path", default="binance_cache.json")
 
-    ap.add_argument("--intraday-interval", default="5m", choices=["1m", "3m", "5m", "15m", "30m", "1h"])
+    ap.add_argument("--intraday-interval", default="1m", choices=["1m", "3m", "5m", "15m", "30m", "1h"])
     ap.add_argument(
         "--ambiguous-fallback",
-        default="none",
+        default="sl-first",  # align to your label (conservative)
         choices=["none", "tp-first", "sl-first"],
-        help="If intraday cannot resolve (missing data or both hit in same intraday candle), what to do.",
+        help="If intraday cannot resolve (or disabled), what to do on TP+SL same day.",
     )
+    ap.add_argument(
+        "--no-intraday-resolve",
+        action="store_true",
+        help="Disable intraday resolution entirely (more like your daily-label world).",
+    )
+
+    # Alignment knobs
+    ap.add_argument("--max-hold-days", type=int, default=21, help="Exit at CLOSE on/after entry_day + max_hold_days.")
+    ap.add_argument("--trail-pct", type=float, default=0.12, help="Trailing stop pct off PEAK CLOSE (0 disables).")
+    ap.add_argument("--time-stop-days", type=int, default=14, help="Time stop days (0 disables).")
+    ap.add_argument("--time-stop-min-gain", type=float, default=0.05, help="Min gain required at time stop.")
 
     args = ap.parse_args()
 
@@ -685,14 +748,14 @@ def main() -> int:
         return 2
 
     file_dates = sorted({s.file_date for s in signals})
-    start_day = _parse_date(args.start) if args.start else min(file_dates)
+    start_day = _parse_date(args.start) if args.start else min(file_dates) + timedelta(days=int(args.entry_lag_days))
     end_day = _parse_date(args.end) if args.end else datetime.utcnow().date()
 
     if end_day < start_day:
         print(f"ERROR: end < start ({end_day} < {start_day})", file=sys.stderr)
         return 2
 
-    run_replay(
+    run_replay_single_position(
         signals=signals,
         raw_blocks=raw_blocks,
         start_day=start_day,
@@ -703,6 +766,11 @@ def main() -> int:
         cache_path=Path(args.cache_path),
         intraday_interval=str(args.intraday_interval),
         ambiguous_fallback=str(args.ambiguous_fallback),
+        resolve_ambiguous_intraday=not bool(args.no_intraday_resolve),
+        max_hold_days=int(args.max_hold_days),
+        trail_pct=float(args.trail_pct),
+        time_stop_days=int(args.time_stop_days),
+        time_stop_min_gain=float(args.time_stop_min_gain),
     )
     return 0
 

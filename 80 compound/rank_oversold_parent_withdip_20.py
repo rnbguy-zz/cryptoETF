@@ -84,9 +84,9 @@ from sklearn import __version__ as sklearn_version
 
 HOLDOUT_DAYS = 5
 ENTRY_LAG_DAYS = 1
-HORIZON_DAYS = 7 #21 change back before using this model
+HORIZON_DAYS = 21 #21 change back before using this model
 DROP_HORIZON_DAYS = 5
-DROP_PCT = 0.12 #0.1 change back before using this model
+DROP_PCT = 0.1 #0.1 change back before using this model
 OFFLINE_CACHE_ONLY = 0
 
 # ============================================================
@@ -1775,12 +1775,13 @@ def _gate_candidate_and_maybe_replace_default(
 # ============================================================
 def _rf_default(seed: int = 42) -> RandomForestClassifier:
     return RandomForestClassifier(
-        n_estimators=500,
+        n_estimators=100,
         random_state=seed,
         n_jobs=-1,
         class_weight="balanced_subsample",
         max_depth=None,
         min_samples_leaf=2,
+        max_features="sqrt",
     )
 
 
@@ -1788,29 +1789,55 @@ def _get_feature_cols(df: pd.DataFrame, label_cols: Tuple[str, ...]) -> List[str
     ban = {"file_date", "symbol"} | set(label_cols)
     return [c for c in df.columns if c not in ban]
 
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import classification_report, roc_auc_score
+    import numpy as np
+    import pandas as pd
 
-def train_and_report(
-    df_train: pd.DataFrame,
-    label_col: str,
-    feature_cols: List[str],
-    seed: int = 42,
-) -> Tuple[RandomForestClassifier, Dict]:
-    df_train = df_train.dropna(subset=[label_col]).copy()
-    y = df_train[label_col].astype(int).values
-    X = df_train[feature_cols].astype(float).values
+    def train_and_report_timesplit_fast(df_train, label_col, feature_cols, seed=42):
+        df_train = df_train.dropna(subset=[label_col]).copy()
+        df_train["file_date_dt"] = pd.to_datetime(df_train["file_date"])
+        df_train = df_train.sort_values("file_date_dt")
 
-    X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.05, random_state=seed, stratify=y)
+        X = df_train[feature_cols].astype(float).values
+        y = df_train[label_col].astype(int).values
 
-    clf = _rf_default(seed=seed)
-    clf.fit(X_tr, y_tr)
+        tscv = TimeSeriesSplit(n_splits=3)  # fewer folds
 
-    p_va = clf.predict_proba(X_va)[:, 1]
-    y_hat = (p_va >= 0.5).astype(int)
+        # only last split (most realistic + fastest)
+        tr_idx, va_idx = list(tscv.split(X))[-1]
 
-    try:
-        auc = roc_auc_score(y_va, p_va)
-    except Exception:
-        auc = float("nan")
+        # cap training to most recent N rows
+        MAX_TRAIN = 30000
+        if len(tr_idx) > MAX_TRAIN:
+            tr_idx = tr_idx[-MAX_TRAIN:]
+
+        X_tr, X_va = X[tr_idx], X[va_idx]
+        y_tr, y_va = y[tr_idx], y[va_idx]
+
+        clf = RandomForestClassifier(
+            n_estimators=150,
+            random_state=seed,
+            n_jobs=-1,
+            class_weight="balanced_subsample",
+            min_samples_leaf=2,
+            max_features="sqrt",
+        )
+        clf.fit(X_tr, y_tr)
+
+        p_va = clf.predict_proba(X_va)[:, 1]
+        y_hat = (p_va >= 0.5).astype(int)
+
+        try:
+            auc = roc_auc_score(y_va, p_va)
+        except Exception:
+            auc = float("nan")
+
+        print(f"\n=== Validation (TimeSeriesSplit LAST fold) [{label_col}] ===")
+        print(f"AUC: {auc:.4f}")
+        print(classification_report(y_va, y_hat, digits=4))
+
+        return clf
 
     rep_dict = classification_report(y_va, y_hat, digits=4, output_dict=True)
     c1 = rep_dict.get("1", {})
