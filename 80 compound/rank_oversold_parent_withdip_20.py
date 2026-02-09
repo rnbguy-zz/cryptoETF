@@ -60,6 +60,12 @@ TIME_STOP_DAYS = 14
 TIME_STOP_MIN_GAIN = 0.05 # +5%
 MIN_HISTORY_HITS = 3
 
+# Parameter grid
+HORIZONS = [14,21]
+DROP_HORIZONS = [21]
+TPS = [0.2,0.25, 0.30,0.4]
+DROPS = [0.11, 0.12]
+
 from itertools import product
 import math
 import traceback
@@ -98,7 +104,7 @@ def train_and_report_custom_rf(
     clf.fit(X_tr, y_tr)
 
     p_va = clf.predict_proba(X_va)[:, 1]
-    y_hat = (p_va >= 0.5).astype(int)
+    y_hat = (p_va >= 0.61).astype(int)
 
     try:
         auc = roc_auc_score(y_va, p_va)
@@ -2100,17 +2106,25 @@ def _rf_default(seed: int = 42) -> RandomForestClassifier:
     )
 
 
-def _get_feature_cols(df: pd.DataFrame, label_cols: Tuple[str, ...]) -> List[str]:
+
+def _get_feature_cols(
+    df: pd.DataFrame,
+    label_cols: Tuple[str, ...],
+    *,
+    max_nan_frac: float = 0.0,   # 0.0 = drop if any NA
+) -> List[str]:
     """
     Return numeric feature columns only.
-    Prevents string/date columns like '2023-09-19' from entering model training.
+    Also drops columns with too many NaNs (default: drop if ANY NaN).
     """
     ban = {"file_date", "symbol"} | set(label_cols)
-
-    # name-based ban (common culprits that are often strings/dates)
     bad_name_substrings = ("date", "day", "time", "timestamp")
 
     cols: List[str] = []
+    n = len(df)
+    if n <= 0:
+        return cols
+
     for c in df.columns:
         if c in ban:
             continue
@@ -2125,8 +2139,13 @@ def _get_feature_cols(df: pd.DataFrame, label_cols: Tuple[str, ...]) -> List[str
         if np.issubdtype(s.dtype, np.datetime64):
             continue
 
-        # drop objects/strings (these caused your crash)
+        # drop objects/strings
         if s.dtype == "object":
+            continue
+
+        # drop columns with NaNs (or too many NaNs)
+        nan_frac = float(pd.isna(s).sum()) / float(n)
+        if nan_frac > float(max_nan_frac):
             continue
 
         cols.append(c)
@@ -2289,8 +2308,9 @@ def train_main_model_with_drop_feature(
         raise RuntimeError("ERROR: training labels have <2 classes (not enough positives/negatives).")
 
     feature_cols = _get_feature_cols(df_train, ("label", "label_down10"))
-    if "feat_prob_drop10" not in feature_cols:
-        feature_cols.append("feat_prob_drop10")
+    if "feat_prob_drop10" in df_train.columns and not df_train["feat_prob_drop10"].isna().any():
+        if "feat_prob_drop10" not in feature_cols:
+            feature_cols.append("feat_prob_drop10")
 
     clf, metrics = train_and_report(df_train, "label", feature_cols, seed=seed)
     return clf, feature_cols, metrics
@@ -2313,6 +2333,21 @@ def predict_dates(
     missing = [c for c in feature_cols if c not in df_pred.columns]
     if missing:
         raise RuntimeError(f"Prediction failed: missing feature columns: {missing}")
+
+    # If a feature is missing or has NaNs, drop it (NO IMPUTATION)
+    safe_cols = []
+    for c in feature_cols:
+        if c not in df_pred.columns:
+            continue
+        if df_pred[c].isna().any():
+            continue
+        safe_cols.append(c)
+
+    missing_after = [c for c in feature_cols if c not in safe_cols]
+    if missing_after:
+        print(f"[PRED] Dropping unusable features (missing/NaN): {missing_after}", flush=True)
+
+    feature_cols = safe_cols
 
     X = df_pred[feature_cols].astype(float).values
     df_pred["prob_up_target_h"] = clf.predict_proba(X)[:, 1]
@@ -2495,7 +2530,7 @@ def relabel_for_combo(
             return np.nan
 
         entry = fday + timedelta(days=int(entry_lag_days))
-        endw = entry + timedelta(days=int(horizon_days))
+        endw = entry + timedelta(days=int(drop_horizon_days))
 
         w = get_klines_window(
             sym,
@@ -2517,7 +2552,7 @@ def relabel_for_combo(
         # --- Original behavior (keep as-is when enforce flag is off) ---
         if not bool(enforce_sl_not_first):
             try:
-                max_close = float(pd.to_numeric(w["close"], errors="coerce").max())
+                max_close = float(pd.to_numeric(w["high"], errors="coerce").max())
                 if not np.isfinite(max_close):
                     return np.nan
                 return float(int(max_close >= entry_open * (1.0 + float(target_pct))))
@@ -2534,7 +2569,7 @@ def relabel_for_combo(
             lows = pd.to_numeric(ww["low"], errors="coerce")
 
             tp_px = entry_open * (1.0 + float(target_pct))
-            sl_px = entry_open * (1.0 - float(sl_pct))
+            sl_px = entry_open * (1.0 - float(drop_pct))
 
             tp_hit = (highs >= tp_px).fillna(False).values
             sl_hit = (lows <= sl_px).fillna(False).values
@@ -2542,12 +2577,18 @@ def relabel_for_combo(
             if not bool(tp_hit.any()):
                 return 0.0
 
-            first_tp_idx = int(np.argmax(tp_hit))
+            first_tp_idx = int(np.argmax(tp_hit))  # valid because tp_hit.any() is true
 
-            # Only treat SL before TP (NOT same day) as failure
-            sl_before_tp = bool(sl_hit[: first_tp_idx].any())
+            # If SL occurs before TP, it's NOT class 1.
+            # If SL occurs on the same day as TP:
+            #   - if sl_same_day_counts_as_first=True -> NOT class 1
+            #   - else -> allow TP (treat as TP-first)
+            if sl_same_day_counts_as_first:
+                sl_before_or_same = bool(sl_hit[: first_tp_idx + 1].any())
+            else:
+                sl_before_or_same = bool(sl_hit[: first_tp_idx].any())
 
-            return 0.0 if sl_before_tp else 1.0
+            return 0.0 if sl_before_or_same else 1.0
         except Exception:
             return np.nan
 
@@ -2763,13 +2804,6 @@ def main() -> int:
         print("\n=== PROGRESSIVE REALISTIC SWEEP (FORWARD TIME-SERIES) ===")
 
         sweep_file_counts = [int(x) for x in args.sweep_files.split(",") if x.strip().isdigit()]
-
-        # Parameter grid
-        HORIZONS = [3, 5, 7, 14, 21]
-        DROP_HORIZONS = [3, 5, 7, 14, 21]
-        TPS = [0.10, 0.15, 0.20, 0.25]
-        DROPS = [0.12, 0.05, 0.10]
-
         all_results = []
 
         for n_files in sweep_file_counts:
