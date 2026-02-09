@@ -51,9 +51,7 @@ SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
 import json
-
 POSITIONS_PATH = Path("positions_etf.json")
-
 TRAIL_PCT = 0.12          # 12% off peak
 TP_PCT = 0.20             # +20%
 TP_FRACTION = 0.1        # sell half
@@ -199,11 +197,6 @@ def run_progressive_sweep(
 ) -> int:
     # Parameter grids requested
 
-    HORIZONS = [5]
-    DROP_HORIZONS = [3, 5, 7, 14, 21]
-    TARGET_PCTS = [0.25]  # TP
-    DROP_PCTS = [0.05, 0.10, 0.12]  # DP
-
     combos = list(product(HORIZONS, DROP_HORIZONS, TARGET_PCTS, DROP_PCTS))
     if max_combos and max_combos > 0:
         combos = combos[:max_combos]
@@ -310,9 +303,9 @@ def run_progressive_sweep(
 
                 # Train main model (custom RF for sweep speed if requested)
                 feat_cols_main = _get_feature_cols(df_train_with_feat, ("label", "label_down10"))
-                if "feat_prob_drop10" not in feat_cols_main:
-                    feat_cols_main.append("feat_prob_drop10")
-                df_train_with_feat["feat_prob_drop10"] = pd.to_numeric(df_train_with_feat["feat_prob_drop10"], errors="coerce").fillna(0.5)
+                #if "feat_prob_drop10" not in feat_cols_main:
+                #    feat_cols_main.append("feat_prob_drop10")
+                #df_train_with_feat["feat_prob_drop10"] = pd.to_numeric(df_train_with_feat["feat_prob_drop10"], errors="coerce").fillna(0.5)
 
                 clf_main, m = train_and_report_custom_rf(
                     df_train_with_feat,
@@ -323,10 +316,11 @@ def run_progressive_sweep(
                 )
 
                 # Ensure df_all has feat_prob_drop10 for predict window
-                df_all2 = df_all.copy()
-                if "feat_prob_drop10" not in df_all2.columns:
-                    df_all2["feat_prob_drop10"] = 0.5
-                df_all2["feat_prob_drop10"] = pd.to_numeric(df_all2["feat_prob_drop10"], errors="coerce").fillna(0.5)
+                #df_all2 = df_all.copy()
+                #edited
+                #if "feat_prob_drop10" not in df_all2.columns:
+                #    df_all2["feat_prob_drop10"] = 0.5
+                #df_all2["feat_prob_drop10"] = pd.to_numeric(df_all2["feat_prob_drop10"], errors="coerce").fillna(0.5)
 
                 df_pred_base = df_all2[df_all2["file_date"].isin([d.isoformat() for d in predict_dates_list])].copy()
                 if clf_down is not None and feat_cols_down is not None and not df_pred_base.empty:
@@ -466,55 +460,6 @@ def open_new_positions_from_predictions(
 
     return events
 
-def print_etf_report(*, state: dict, new_events: List[dict], df_pred_today: pd.DataFrame) -> None:
-    asof = state.get("asof_day")
-    print("\n=== ETF MODE (UTC close) ===")
-    print(f"asof_last_closed_day={asof}")
-
-    print("\n--- FULL EVENT HISTORY ---")
-    for ev in state.get("events", []):
-        print(ev)
-
-    print("\n--- TODAY INSTRUCTIONS ---")
-    positions = state.get("positions", {})
-    open_syms = [s for s, p in positions.items() if p.get("status") == "OPEN"]
-
-    print("OPEN POSITIONS (manage):")
-    if not open_syms:
-        print("  (none)")
-    else:
-        for sym in sorted(open_syms):
-            p = positions[sym]
-            entry = float(p["entry_price"])
-            rem = float(p["remaining_frac"])
-            peak_close = float(p.get("peak_close", entry))
-            trail_px = float(p.get("trail_px", peak_close * (1.0 - TRAIL_PCT)))
-
-            tp_px = entry * (1.0 + TP_PCT)
-            hard_px = entry * (1.0 - HARD_STOP_PCT)
-
-            print(
-                f"  {sym:10s} entry_day={p['entry_day']} entry_px={entry:.6g} rem={rem:.2f} "
-                f"peak_close={peak_close:.6g} trail_px={trail_px:.6g} "
-                f"(TP={tp_px:.6g}, HARD_STOP={hard_px:.6g})"
-            )
-
-    print("\nTODAY'S ACTION RULES (place/monitor):")
-    if not open_syms:
-        print("  (none)")
-    else:
-        for sym in sorted(open_syms):
-            p = positions[sym]
-            entry = float(p["entry_price"])
-            peak_close = float(p.get("peak_close", entry))
-            trail_px = float(p.get("trail_px", peak_close * (1.0 - TRAIL_PCT)))
-            tp_px = entry * (1.0 + TP_PCT)
-            hard_px = entry * (1.0 - HARD_STOP_PCT)
-
-            # NOTE: you're running after UTC close; so these are instructions for the *current* UTC day.
-            print(f"  {sym:10s} IF high >= {tp_px:.6g}  -> SELL (TP +{TP_PCT * 100:.0f}%)")
-            print(f"             IF low  <= {hard_px:.6g} -> SELL (HARD STOP -{HARD_STOP_PCT * 100:.0f}%)")
-            print(f"             IF close<= {trail_px:.6g} -> SELL (TRAIL {TRAIL_PCT * 100:.0f}% off peak close)")
 
 
 def update_positions_until_last_closed(
@@ -710,7 +655,11 @@ def filter_df_day_by_entry_rule(
     allowed_syms = set()
     for _, r in best_today.iterrows():
         sym = str(r["symbol"])
-        p_today = float(r["p_today"]) if pd.notna(r["p_today"]) else 0.0
+        p_today_raw = r["p_today"]
+        if pd.isna(p_today_raw):
+            # Unknown stays unknown: don't allow, and don't update memory for this symbol
+            continue
+        p_today = float(p_today_raw)
         prev_p = last_p_by_symbol.get(sym)
 
         if (p_today > float(p_threshold)) or (prev_p is not None and p_today > prev_p):
@@ -720,8 +669,10 @@ def filter_df_day_by_entry_rule(
     # so tomorrow can compare.
     for _, r in best_today.iterrows():
         sym = str(r["symbol"])
-        p_today = float(r["p_today"]) if pd.notna(r["p_today"]) else 0.0
-        last_p_by_symbol[sym] = p_today
+        p_today_raw = r["p_today"]
+        if pd.isna(p_today_raw):
+            continue  # don't update memory with unknown
+        last_p_by_symbol[sym] = float(p_today_raw)
 
     if not allowed_syms:
         return df_day.iloc[0:0].copy()
@@ -996,7 +947,9 @@ def _normalize_store_df(df: pd.DataFrame) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = 0 if c == "no_data" else np.nan
 
-    df["no_data"] = pd.to_numeric(df["no_data"], errors="coerce").fillna(0).astype("int8").astype(bool)
+    df["no_data"] = pd.to_numeric(df["no_data"], errors="coerce")
+    # keep NaN as NaN for now; when writing, coerce safely:
+    df["no_data"] = df["no_data"].fillna(0).astype(bool)
     return df
 
 
@@ -1162,7 +1115,7 @@ def ensure_symbol_days(
 
         if df.empty:
             fetched = _binance_fetch_1d_range(symbol, need_start, need_end, session)
-            fetched = _fill_tombstones(need_start, need_end, fetched)
+            #fetched = _fill_tombstones(need_start, need_end, fetched)
             if not fetched.empty:
                 _write_symbol_store(store_dir, symbol, fetched)
             with _SYMBOL_MEMO_LOCK:
@@ -1176,18 +1129,18 @@ def ensure_symbol_days(
 
         if need_start < have_min:
             back = _binance_fetch_1d_range(symbol, need_start, have_min - timedelta(days=1), session)
-            back = _fill_tombstones(need_start, have_min - timedelta(days=1), back)
+            #back = _fill_tombstones(need_start, have_min - timedelta(days=1), back)
             if not back.empty:
                 parts.append(back)
 
         if need_end > have_max:
             fwd = _binance_fetch_1d_range(symbol, have_max + timedelta(days=1), need_end, session)
-            fwd = _fill_tombstones(have_max + timedelta(days=1), need_end, fwd)
+            #fwd = _fill_tombstones(have_max + timedelta(days=1), need_end, fwd)
             if not fwd.empty:
                 parts.append(fwd)
 
         merged = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
-        merged = _fill_tombstones(need_start, need_end, merged)
+        #merged = _fill_tombstones(need_start, need_end, merged)
 
         if not merged.empty:
             _write_symbol_store(store_dir, symbol, merged)
@@ -1866,8 +1819,17 @@ def build_ml_table(
                 w2["day"] = pd.to_datetime(w2["day"], errors="coerce").dt.date
                 w2 = w2.sort_values("day").reset_index(drop=True)
 
-                tp_hit2 = (pd.to_numeric(w2["high"], errors="coerce") >= tp_px).fillna(False).values
-                sl_hit2 = (pd.to_numeric(w2["low"], errors="coerce") <= sl_px).fillna(False).values
+                highs = pd.to_numeric(w2["high"], errors="coerce")
+                lows = pd.to_numeric(w2["low"], errors="coerce")
+
+                # strict: if any missing, we cannot know if TP/SL happened
+                if highs.isna().any() or lows.isna().any():
+                    r["label"] = np.nan
+                    out.append(r)
+                    continue
+
+                tp_hit2 = (highs.values >= tp_px)
+                sl_hit2 = (lows.values <= sl_px)
 
                 first_tp = int(np.argmax(tp_hit2))  # safe because tp_hit2.any() is true
 
@@ -2135,7 +2097,6 @@ def _rf_default(seed: int = 42) -> RandomForestClassifier:
         class_weight="balanced_subsample",
         max_depth=None,
         min_samples_leaf=2,
-        max_features="sqrt"
     )
 
 
@@ -2187,7 +2148,7 @@ def train_and_report(
     df_train["file_date_dt"] = pd.to_datetime(df_train["file_date"])
     df_train = df_train.sort_values("file_date_dt")
 
-    X = df_train[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
+    X = df_train[feature_cols].apply(pd.to_numeric, errors="coerce").dropna()#.fillna(0.0).values
     y = df_train[label_col].astype(int).values
 
     tscv = TimeSeriesSplit(n_splits=3)
@@ -2202,7 +2163,7 @@ def train_and_report(
     clf.fit(X_tr, y_tr)
 
     p_va = clf.predict_proba(X_va)[:, 1]
-    y_hat = (p_va >= 0.5).astype(int)
+    y_hat = (p_va >= 0.61).astype(int)
 
     try:
         auc = roc_auc_score(y_va, p_va)
@@ -2291,10 +2252,10 @@ def build_downside_prob_feature_skip_oof(
     df_train["feat_prob_drop10"] = np.nan
 
     # Fallback: if can't train downside model, fill 0.5
-    if usable.empty or usable["label_down10"].nunique() < 2:
-        print("\nNOTE: Downside model not trainable (label_down10 has <2 classes). Using feat_prob_drop10=0.5 fallback.")
-        df_train["feat_prob_drop10"] = 0.5
-        return df_train, None, None
+    #if usable.empty or usable["label_down10"].nunique() < 2:
+    #    print("\nNOTE: Downside model not trainable (label_down10 has <2 classes). Using feat_prob_drop10=0.5 fallback.")
+    #    df_train["feat_prob_drop10"] = 0.5
+    #    return df_train, None, None
 
     feat_cols_down = list(base_feature_cols)
     clf_down, _m = train_and_report(usable, "label_down10", feat_cols_down, seed=seed)
@@ -2304,7 +2265,7 @@ def build_downside_prob_feature_skip_oof(
     df_train.loc[usable.index, "feat_prob_drop10"] = probs
 
     # Any unlabeled rows get 0.5 fallback (keeps main model stable)
-    df_train["feat_prob_drop10"] = df_train["feat_prob_drop10"].fillna(0.5)
+    #df_train["feat_prob_drop10"] = df_train["feat_prob_drop10"].fillna(0.5)
 
     return df_train, clf_down, feat_cols_down
 
@@ -2317,9 +2278,9 @@ def train_main_model_with_drop_feature(
     df_train = df_train.dropna(subset=["label"]).copy()
 
     # ensure feature exists and has no NaN
-    if "feat_prob_drop10" not in df_train.columns:
-        df_train["feat_prob_drop10"] = 0.5
-    df_train["feat_prob_drop10"] = df_train["feat_prob_drop10"].fillna(0.5)
+    #if "feat_prob_drop10" not in df_train.columns:
+    #    df_train["feat_prob_drop10"] = 0.5
+    #df_train["feat_prob_drop10"] = df_train["feat_prob_drop10"].fillna(0.5)
 
     if df_train.empty:
         raise RuntimeError("ERROR: df_train empty after labeling/features.")
@@ -2346,8 +2307,8 @@ def predict_dates(
     if df_pred.empty:
         return df_pred
 
-    if "feat_prob_drop10" in feature_cols:
-        df_pred["feat_prob_drop10"] = pd.to_numeric(df_pred.get("feat_prob_drop10", 0.5), errors="coerce").fillna(0.5)
+    #if "feat_prob_drop10" in feature_cols:
+    #    df_pred["feat_prob_drop10"] = pd.to_numeric(df_pred.get("feat_prob_drop10", 0.5), errors="coerce").fillna(0.5)
 
     missing = [c for c in feature_cols if c not in df_pred.columns]
     if missing:
@@ -2500,114 +2461,114 @@ def relabel_for_combo(
     entry_lag_days: int,
     store_dir: Path,
     dl_workers: int,
-    offline_cache_only: bool,
+    # ---------------- NEW (optional) ----------------
+    enforce_sl_not_first: bool = False,
+    sl_pct: float = HARD_STOP_PCT,
+    sl_same_day_counts_as_first: bool = True,
 ) -> pd.DataFrame:
     """
     Take df_base (features only) and add:
-      - label (upside, REALISTIC, includes SL-first dip-before-TP rule)
-      - label_down10 (downside label for DP/DH)
+      - label (upside)
+      - label_down10 (downside)
+    for a specific combo of (TP, H, DP, DH)
 
-    label rule (REALISTIC):
-      entry_day = file_date + entry_lag_days
-      tp_px = entry_open*(1+target_pct)
-      sl_px = entry_open*(1-drop_pct)
+    NEW (optional):
+      enforce_sl_not_first=True makes label=1 only if TP is hit AND SL did NOT happen
+      before TP (and optionally not on the same day if sl_same_day_counts_as_first=True).
 
-      Look at daily candles from entry_day .. entry_day + max(horizon_days, drop_horizon_days)
-      BUT:
-        - TP only counts within horizon_days
-        - SL only counts within drop_horizon_days
-      If TP never hits => label=0
-      Else find first TP day; if SL occurs on/before that TP day => label=0 else label=1
-      (includes "same day TP+SL" => label=0)
+    If enforce_sl_not_first=False, behavior is exactly as before (label uses max close >= TP).
     """
+
     df = df_base.copy()
+
+    # ---- Main label (upside) ----
     df["label"] = np.nan
 
-    last_closed = datetime.utcnow().date() - timedelta(days=1)
-    max_window = int(max(horizon_days, drop_horizon_days))
+    def _label_up_row(row: pd.Series, *, session: requests.Session) -> float:
+        """
+        Returns 0/1 or np.nan if candles missing.
+        """
+        try:
+            fday = datetime.strptime(str(row["file_date"]), "%Y-%m-%d").date()
+            sym = str(row["symbol"])
+        except Exception:
+            return np.nan
 
-    # parallelize by symbol
-    by_sym: Dict[str, List[int]] = defaultdict(list)
-    for idx, sym in df["symbol"].items():
-        by_sym[str(sym)].append(int(idx))
+        entry = fday + timedelta(days=int(entry_lag_days))
+        endw = entry + timedelta(days=int(horizon_days))
 
-    def _label_one_symbol(sym: str, idxs: List[int]) -> List[Tuple[int, int]]:
-        s = get_thread_session()
-        out: List[Tuple[int, int]] = []
+        w = get_klines_window(
+            sym,
+            entry,
+            endw,
+            session=session,
+            store_dir=store_dir,
+        )
+        if w is None or w.empty:
+            return np.nan
 
-        for idx in idxs:
-            try:
-                fday = datetime.strptime(df.at[idx, "file_date"], "%Y-%m-%d").date()
-            except Exception:
-                continue
-
-            entry_day = fday + timedelta(days=int(entry_lag_days))
-            if entry_day > last_closed:
-                continue
-
-            end_day = min(entry_day + timedelta(days=max_window), last_closed)
-
-            w = get_klines_window_maybe_offline(
-                sym,
-                entry_day,
-                end_day,
-                session=s,
-                store_dir=store_dir,
-                offline_cache_only=bool(offline_cache_only),
-            )
-            if w is None or w.empty:
-                continue
-
-            w = w.copy()
-            w["day"] = pd.to_datetime(w["day"], errors="coerce").dt.date
-            w = w[w["day"].notna()].sort_values("day").reset_index(drop=True)
-            if w.empty:
-                continue
-
-            # entry open must exist
-            try:
-                entry_open = float(pd.to_numeric(w.iloc[0]["open"], errors="coerce"))
-            except Exception:
-                continue
+        try:
+            entry_open = float(w.iloc[0]["open"])
             if not np.isfinite(entry_open) or abs(entry_open) < 1e-12:
-                continue
+                return np.nan
+        except Exception:
+            return np.nan
+
+        # --- Original behavior (keep as-is when enforce flag is off) ---
+        if not bool(enforce_sl_not_first):
+            try:
+                max_close = float(pd.to_numeric(w["close"], errors="coerce").max())
+                if not np.isfinite(max_close):
+                    return np.nan
+                return float(int(max_close >= entry_open * (1.0 + float(target_pct))))
+            except Exception:
+                return np.nan
+
+        # --- Enforced SL-before-TP logic (label=1 only if TP happens first) ---
+        try:
+            ww = w.copy()
+            ww["day"] = pd.to_datetime(ww["day"], errors="coerce").dt.date
+            ww = ww.sort_values("day").reset_index(drop=True)
+
+            highs = pd.to_numeric(ww["high"], errors="coerce")
+            lows = pd.to_numeric(ww["low"], errors="coerce")
 
             tp_px = entry_open * (1.0 + float(target_pct))
-            sl_px = entry_open * (1.0 - float(drop_pct))
+            sl_px = entry_open * (1.0 - float(sl_pct))
 
-            # horizons
-            tp_deadline = entry_day + timedelta(days=int(horizon_days))
-            sl_deadline = entry_day + timedelta(days=int(drop_horizon_days))
+            tp_hit = (highs >= tp_px).fillna(False).values
+            sl_hit = (lows <= sl_px).fillna(False).values
 
-            days = w["day"].values
-            highs = pd.to_numeric(w["high"], errors="coerce").values
-            lows  = pd.to_numeric(w["low"],  errors="coerce").values
+            if not bool(tp_hit.any()):
+                return 0.0
 
-            tp_allowed = np.array([d <= tp_deadline for d in days], dtype=bool)
-            sl_allowed = np.array([d <= sl_deadline for d in days], dtype=bool)
+            first_tp_idx = int(np.argmax(tp_hit))
 
-            tp_hit = tp_allowed & np.isfinite(highs) & (highs >= tp_px)
-            if not tp_hit.any():
-                out.append((idx, 0))
-                continue
+            # Only treat SL before TP (NOT same day) as failure
+            sl_before_tp = bool(sl_hit[: first_tp_idx].any())
 
-            first_tp_idx = int(np.argmax(tp_hit))  # safe because any() true
+            return 0.0 if sl_before_tp else 1.0
+        except Exception:
+            return np.nan
 
-            sl_hit = sl_allowed & np.isfinite(lows) & (lows <= sl_px)
+    # parallelize by symbol (keeps your prior structure)
+    by_sym = {sym: df[df["symbol"] == sym].index.tolist() for sym in df["symbol"].unique()}
 
-            # SL on/before TP day => NOT class 1
-            sl_before_or_same = bool(sl_hit[: first_tp_idx + 1].any())
-            out.append((idx, 0 if sl_before_or_same else 1))
-
+    def _task(sym: str, idxs: List[int]) -> Dict[int, float]:
+        s = get_thread_session()
+        out: Dict[int, float] = {}
+        for i in idxs:
+            out[i] = _label_up_row(df.loc[i], session=s)
         return out
 
     with ThreadPoolExecutor(max_workers=max(1, int(dl_workers))) as ex:
-        futs = [ex.submit(_label_one_symbol, sym, idxs) for sym, idxs in by_sym.items()]
+        futs = [ex.submit(_task, sym, idxs) for sym, idxs in by_sym.items()]
         for fut in futs:
-            for idx, y in fut.result():
-                df.at[idx, "label"] = y
+            res = fut.result()
+            for i, v in res.items():
+                df.at[i, "label"] = v
 
-    # ---- Downside label still useful as separate column ----
+    # ---- Downside label (unchanged) ----
     df = build_downside_labels_inplace(
         df,
         store_dir=store_dir,
@@ -2615,7 +2576,7 @@ def relabel_for_combo(
         drop_horizon_days=drop_horizon_days,
         entry_lag_days=entry_lag_days,
         dl_workers=dl_workers,
-        offline_cache_only=bool(offline_cache_only),
+        offline_cache_only=False,
     )
 
     return df
@@ -2728,6 +2689,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
 
     # ---------- SWEEP ARGS (unchanged) ----------
+    ap.add_argument("--sweep-enforce-sl-not-first", action="store_true",
+                    help="In sweep: label=1 only if TP hit and SL did NOT happen before (or same day as) TP.")
+
     ap.add_argument("--sweep", action="store_true",
                     help="Run progressive parameter sweep on a small subset of files.")
     ap.add_argument("--sweep-files", default="10,20,40,80",
@@ -2801,10 +2765,10 @@ def main() -> int:
         sweep_file_counts = [int(x) for x in args.sweep_files.split(",") if x.strip().isdigit()]
 
         # Parameter grid
-        HORIZONS = [21]
-        DROP_HORIZONS = [3]
-        TPS = [0.20, 0.25, 0.3]
-        DROPS = [0.10]
+        HORIZONS = [3, 5, 7, 14, 21]
+        DROP_HORIZONS = [3, 5, 7, 14, 21]
+        TPS = [0.10, 0.15, 0.20, 0.25]
+        DROPS = [0.12, 0.05, 0.10]
 
         all_results = []
 
@@ -2814,7 +2778,7 @@ def main() -> int:
             # Select most recent N files
             stage_hits = [h for h in hits if h.file_date >= file_dates[-n_files]]
 
-            # Build BASE table once (features only).
+            # Build BASE table once (features only)
             df_base = build_base_feature_table(
                 stage_hits,
                 entry_lag_days=ENTRY_LAG_DAYS,
@@ -2824,7 +2788,7 @@ def main() -> int:
 
             # Determine realistic time split (not random!)
             stage_dates = sorted({h.file_date for h in stage_hits})
-            holdout_days = max(7, int(len(stage_dates) * 0.25))  # ~25% forward holdout
+            holdout_days = max(3, int(len(stage_dates) * 0.25))  # ~25% forward holdout
             train_dates = stage_dates[:-holdout_days]
             valid_dates = stage_dates[-holdout_days:]
 
@@ -2858,7 +2822,7 @@ def main() -> int:
                                 entry_lag_days=ENTRY_LAG_DAYS,
                                 store_dir=store_dir,
                                 dl_workers=args.dl_workers,
-                                offline_cache_only=bool(args.offline_cache_only),
+                                enforce_sl_not_first=bool(args.sweep_enforce_sl_not_first),
                             )
 
                             # Split by TIME (not random)
@@ -2906,7 +2870,7 @@ def main() -> int:
                             y_va = df_valid["label"].astype(int).values
 
                             p_va = clf.predict_proba(X_va)[:, 1]
-                            y_hat = (p_va >= 0.5).astype(int)
+                            y_hat = (p_va >= 0.61).astype(int)
 
                             # Forward (realistic) metrics
                             tp = int(((y_hat == 1) & (y_va == 1)).sum())
@@ -3059,10 +3023,10 @@ def main() -> int:
     )
 
     # ---- Downside feature for predict window ----
-    df_all = df_all.copy()
-    df_all["feat_prob_drop10"] = pd.to_numeric(
-        df_all.get("feat_prob_drop10", 0.5), errors="coerce"
-    ).fillna(0.5)
+    #df_all = df_all.copy()
+    #df_all["feat_prob_drop10"] = pd.to_numeric(
+    #    df_all.get("feat_prob_drop10", 0.5), errors="coerce"
+    #).fillna(0.5)
 
     df_pred_base = df_all[
         df_all["file_date"].isin([d.isoformat() for d in predict_dates_list])
