@@ -68,10 +68,10 @@ TIME_STOP_MIN_GAIN = 0.05 # +5%
 MIN_HISTORY_HITS = 3
 
 # Parameter grid
-HORIZONS = [14,21]
+HORIZONS = [21]
 DROP_HORIZONS = [21]
-TPS = [0.2,0.25, 0.30,0.4]
-DROPS = [0.11, 0.12,18]
+TPS = [0.2]
+DROPS = [0.11]
 
 from itertools import product
 import math
@@ -638,6 +638,132 @@ def update_positions_until_last_closed(
     state["asof_day"] = _iso(last_closed)
     return new_events
 
+def _binance_fetch_intraday_day(
+    symbol: str,
+    day: date,
+    *,
+    interval: str,
+    session: requests.Session,
+) -> pd.DataFrame:
+    """
+    Fetch intraday klines for a single UTC day.
+    Supports 1m/5m/15m/1h etc. Paginates as needed.
+    """
+    start_dt = datetime.combine(day, datetime.min.time())
+    end_dt = start_dt + timedelta(days=1)
+
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    rows = []
+    cur = start_ms
+    limit = 1000
+
+    while cur < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cur,
+            "endTime": end_ms,
+            "limit": limit,
+        }
+        r = _binance_get_with_cooldown(session, BINANCE_BASE + KLINES_ENDPOINT, params=params, timeout=30)
+        if r is None or r.status_code != 200:
+            break
+
+        try:
+            data = r.json()
+        except Exception:
+            break
+
+        if not isinstance(data, list) or not data:
+            break
+
+        for k in data:
+            try:
+                rows.append(
+                    {
+                        "open_time": int(k[0]),
+                        "open": float(k[1]),
+                        "high": float(k[2]),
+                        "low": float(k[3]),
+                        "close": float(k[4]),
+                        "close_time": int(k[6]),
+                    }
+                )
+            except Exception:
+                continue
+
+        last_open_time = int(data[-1][0])
+        # advance by 1 ms to avoid repeating last candle
+        nxt = last_open_time + 1
+        if nxt <= cur:
+            break
+        cur = nxt
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).sort_values("open_time").reset_index(drop=True)
+    return df
+
+
+def _tp_sl_order_intraday(
+    symbol: str,
+    day: date,
+    *,
+    tp_px: float,
+    sl_px: float,
+    interval: str,
+    session: requests.Session,
+    ambiguous_fallback: str = "sl-first",  # "sl-first"|"tp-first"|"none"
+) -> Optional[str]:
+    """
+    Returns "TP" or "SL" if order can be determined.
+    If ambiguous or missing, returns according to ambiguous_fallback:
+      - "sl-first" -> "SL"
+      - "tp-first" -> "TP"
+      - "none" -> None
+    """
+    df = _binance_fetch_intraday_day(symbol, day, interval=interval, session=session)
+    if df is None or df.empty:
+        if ambiguous_fallback == "sl-first":
+            return "SL"
+        if ambiguous_fallback == "tp-first":
+            return "TP"
+        return None
+
+    highs = pd.to_numeric(df["high"], errors="coerce").values
+    lows  = pd.to_numeric(df["low"], errors="coerce").values
+
+    for h, l in zip(highs, lows):
+        if not np.isfinite(h) or not np.isfinite(l):
+            continue
+
+        hit_tp = (h >= tp_px)
+        hit_sl = (l <= sl_px)
+
+        if hit_tp and not hit_sl:
+            return "TP"
+        if hit_sl and not hit_tp:
+            return "SL"
+
+        # both within same intraday candle -> still ambiguous at this resolution
+        if hit_tp and hit_sl:
+            if ambiguous_fallback == "sl-first":
+                return "SL"
+            if ambiguous_fallback == "tp-first":
+                return "TP"
+            return None
+
+    # neither hit in intraday (shouldn't happen if daily said both), fallback
+    if ambiguous_fallback == "sl-first":
+        return "SL"
+    if ambiguous_fallback == "tp-first":
+        return "TP"
+    return None
+
+
 def filter_df_day_by_entry_rule(
     df_day: pd.DataFrame,
     *,
@@ -675,7 +801,11 @@ def filter_df_day_by_entry_rule(
         p_today = float(p_today_raw)
         prev_p = last_p_by_symbol.get(sym)
 
-        if (p_today > float(p_threshold)) or (prev_p is not None and p_today > prev_p):
+        # allow if rising vs yesterday
+        if (prev_p is not None and p_today > prev_p):
+            allowed_syms.add(sym)
+        # otherwise only allow if it clears the hard threshold
+        elif p_today >= float(p_threshold):
             allowed_syms.add(sym)
 
     # IMPORTANT: update memory for all symbols that appeared today (even if not allowed),
@@ -2568,21 +2698,41 @@ def relabel_for_combo(
             tp_hit = (highs >= tp_px).fillna(False).values
             sl_hit = (lows <= sl_px).fillna(False).values
 
-            if not bool(tp_hit.any()):
+            if not tp_hit.any():
                 return 0.0
 
-            first_tp_idx = int(np.argmax(tp_hit))  # valid because tp_hit.any() is true
+            # first day TP happens
+            first_tp_idx = int(np.argmax(tp_hit))
 
-            # If SL occurs before TP, it's NOT class 1.
-            # If SL occurs on the same day as TP:
-            #   - if sl_same_day_counts_as_first=True -> NOT class 1
-            #   - else -> allow TP (treat as TP-first)
-            if sl_same_day_counts_as_first:
-                sl_before_or_same = bool(sl_hit[: first_tp_idx + 1].any())
-            else:
-                sl_before_or_same = bool(sl_hit[: first_tp_idx].any())
+            # first day SL happens (if any)
+            first_sl_idx = int(np.argmax(sl_hit)) if sl_hit.any() else None
 
-            return 0.0 if sl_before_or_same else 1.0
+            # If SL never happens -> TP happened -> class 1
+            if first_sl_idx is None:
+                return 1.0
+
+            # If TP day strictly before SL day -> TP-first -> class 1
+            if first_tp_idx < first_sl_idx:
+                return 1.0
+
+            # If SL day strictly before TP day -> SL-first -> class 0
+            if first_sl_idx < first_tp_idx:
+                return 0.0
+
+            # Same day (TP and SL first hit day are the same) -> dig deeper intraday
+            same_day = ww.loc[first_tp_idx, "day"]
+            order = _tp_sl_order_intraday(
+                sym,
+                same_day,
+                tp_px=tp_px,
+                sl_px=sl_px,
+                interval="1m",  # or make this an arg
+                session=session,
+                ambiguous_fallback="sl-first",  # conservative
+            )
+
+            return 1.0 if order == "TP" else 0.0
+
         except Exception:
             return np.nan
 
