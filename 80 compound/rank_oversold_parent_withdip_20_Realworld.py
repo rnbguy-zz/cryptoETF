@@ -162,6 +162,45 @@ def _forward_metrics_on_holdout(
         "p_max": float(np.max(p)),
     }
 
+def build_ml_table_sweep_style(
+    hits: List[OversoldHit],
+    *,
+    store_dir: Path,
+    dl_workers: int,
+    target_pct: float,
+    horizon_days: int,
+    drop_pct: float,
+    drop_horizon_days: int,
+    entry_lag_days: int,
+    min_history_hits: int,
+    enforce_sl_not_first: bool,
+) -> pd.DataFrame:
+    """
+    EXACTLY the same table sweep uses:
+      - base features only
+      - labels via relabel_for_combo (includes intraday ambiguity check)
+      - downside label via build_downside_labels_inplace (same call path as sweep)
+    """
+    df_base = build_base_feature_table(
+        hits,
+        entry_lag_days=entry_lag_days,
+        min_history_hits=min_history_hits,
+    )
+
+    df_labeled = relabel_for_combo(
+        df_base,
+        target_pct=target_pct,
+        horizon_days=horizon_days,
+        drop_pct=drop_pct,
+        drop_horizon_days=drop_horizon_days,
+        entry_lag_days=entry_lag_days,
+        store_dir=store_dir,
+        dl_workers=dl_workers,
+        enforce_sl_not_first=bool(enforce_sl_not_first),
+    )
+    return df_labeled
+
+
 def run_progressive_sweep(
     *,
     folder: Path,
@@ -287,12 +326,11 @@ def run_progressive_sweep(
                 #    feat_cols_main.append("feat_prob_drop10")
                 #df_train_with_feat["feat_prob_drop10"] = pd.to_numeric(df_train_with_feat["feat_prob_drop10"], errors="coerce").fillna(0.5)
 
-                clf_main, m = train_and_report_custom_rf(
+                clf_main, feat_cols_main = train_main_model_sweep_style(
                     df_train_with_feat,
-                    "label",
-                    feat_cols_main,
-                    seed=42,
+                    label_col="label",
                     fast=fast,
+                    seed=42,
                 )
 
                 # Ensure df_all has feat_prob_drop10 for predict window
@@ -378,28 +416,6 @@ def run_progressive_sweep(
             )
 
     print("\n[SWEEP] Done.")
-    # ---- OPTIONAL: train and save one final model from the LAST sweep stage ----
-    if args.sweep_save_model:
-        final_n = sweep_file_counts[-1]  # <-- USE THE LAST STAGE YOU ACTUALLY RAN
-
-        if final_n <= 0:
-            raise RuntimeError("sweep_file_counts empty; cannot sweep-save-model")
-
-        print("\n" + "=" * 80)
-        print(
-            f"[SWEEP-SAVE] Training final model from last stage: n_files={final_n}  (train on all-but-{HOLDOUT_DAYS} days)")
-        print("=" * 80)
-
-        sweep_train_and_save_final_model(
-            hits=hits,
-            store_dir=store_dir,
-            dl_workers=args.dl_workers,
-            threshold=args.threshold,
-            n_files=final_n,
-            enforce_sl_not_first=bool(args.sweep_enforce_sl_not_first),
-            sweep_fast=bool(args.sweep_fast),
-        )
-
     return 0
 
 
@@ -1586,187 +1602,97 @@ def add_btc_mood_columns_and_filter_dates_bullish_only(
     keep_dates = [d for d in unique_file_dates if results.get(d, {}).get("mood") == "BULLISH"]
     return out[out["file_date"].isin(keep_dates)].copy()
 
-def get_or_train_model_bundle_for_run(
+def get_or_train_model_bundle_for_run_sweep_identical(
     *,
     args,
     df_train: pd.DataFrame,
     train_end_date: date,
     predict_start_date: date,
-    store_dir: Path,
+    holdout_days: int,
+    horizon_days: int,
     drop_pct: float,
     drop_horizon_days: int,
     entry_lag_days: int,
-    holdout_days: int,
-    horizon_days: int,
     min_history_hits: int,
-) -> Tuple[Dict, Dict, RandomForestClassifier, List[str], Optional[RandomForestClassifier], Optional[List[str]]]:
+) -> Tuple[Dict, Dict, RandomForestClassifier, List[str]]:
     """
-    FIX: If you do NOT pass --retrain, this will NOT retrain every run.
+    Sweep-identical NON-SWEEP model handling:
 
-    Behavior:
-      - If --retrain:
-          Train candidate -> gate -> maybe use default -> save rolling (only if candidate used)
-      - Else (no --retrain):
-          1) If rolling bundle exists: load & use it (even if meta doesn't match; prints warning, NO retrain)
-          2) Else if default bundle exists: load & use it (NO retrain)
-          3) Else: train ONCE (because you have nothing), save rolling bundle, then reuse on future runs
+    - If NOT --retrain:
+        1) Load rolling bundle if exists
+        2) Else load default bundle if exists
+        3) Else train once and save rolling+default
 
-    Returns:
-      bundle, model_meta, clf_main, feat_cols_main, clf_down, feat_cols_down
+    - If --retrain:
+        Train a new model using sweep-style training and save rolling+default
+
+    Note: downside model is NOT used (same as your sweep).
     """
-    # 1) Try load pre-existing bundles if not retraining
+
     if not bool(args.retrain):
         rolling = load_model_bundle(ROLLING_BUNDLE_PATH)
         if rolling is not None:
             meta = rolling.get("meta", {}) or {}
-            saved_train_end = meta.get("train_end_date")
-            saved_drop_cfg = meta.get("drop_cfg", {}) or {}
-
-            # If mismatch, warn but DO NOT retrain (your requirement)
-            mismatch_bits = []
-            if saved_train_end and saved_train_end != train_end_date.isoformat():
-                mismatch_bits.append(f"train_end_date(saved={saved_train_end} != now={train_end_date.isoformat()})")
-            if saved_drop_cfg.get("DROP_PCT") != float(drop_pct):
-                mismatch_bits.append(f"DROP_PCT(saved={saved_drop_cfg.get('DROP_PCT')} != now={float(drop_pct)})")
-            if saved_drop_cfg.get("DROP_HORIZON_DAYS") != int(drop_horizon_days):
-                mismatch_bits.append(
-                    f"DROP_HORIZON_DAYS(saved={saved_drop_cfg.get('DROP_HORIZON_DAYS')} != now={int(drop_horizon_days)})"
-                )
-
-            if mismatch_bits:
-                print(
-                    "\n[MODEL] Loaded rolling bundle WITHOUT retrain (meta mismatch ignored): "
-                    + "; ".join(mismatch_bits),
-                    flush=True,
-                )
-            else:
-                print(
-                    f"\n[MODEL] Loaded rolling bundle: {ROLLING_BUNDLE_PATH} "
-                    f"(trained_through={meta.get('train_end_date')} sklearn={meta.get('sklearn_version')})",
-                    flush=True,
-                )
-
-            bundle = rolling
-            model_meta = bundle.get("meta", {}) or {}
-            clf_main = bundle["main_model"]
-            feat_cols_main = bundle["main_feature_cols"]
-            clf_down = bundle.get("down_model")
-            feat_cols_down = bundle.get("down_feature_cols")
-            return bundle, model_meta, clf_main, feat_cols_main, clf_down, feat_cols_down
+            clf = rolling["main_model"]
+            feat_cols = rolling["main_feature_cols"]
+            print(f"\n[MODEL] Loaded rolling bundle: {ROLLING_BUNDLE_PATH} (trained_through={meta.get('train_end_date')})", flush=True)
+            return rolling, meta, clf, feat_cols
 
         default_bundle = load_model_bundle(DEFAULT_MODEL_BUNDLE_PATH)
         if default_bundle is not None:
             meta = default_bundle.get("meta", {}) or {}
-            print(
-                f"\n[MODEL] Loaded DEFAULT bundle (no retrain): {DEFAULT_MODEL_BUNDLE_PATH} "
-                f"(trained_through={meta.get('train_end_date')} sklearn={meta.get('sklearn_version')})",
-                flush=True,
-            )
-            bundle = default_bundle
-            model_meta = bundle.get("meta", {}) or {}
-            clf_main = bundle["main_model"]
-            feat_cols_main = bundle["main_feature_cols"]
-            clf_down = bundle.get("down_model")
-            feat_cols_down = bundle.get("down_feature_cols")
-            return bundle, model_meta, clf_main, feat_cols_main, clf_down, feat_cols_down
+            clf = default_bundle["main_model"]
+            feat_cols = default_bundle["main_feature_cols"]
+            print(f"\n[MODEL] Loaded default bundle: {DEFAULT_MODEL_BUNDLE_PATH} (trained_through={meta.get('train_end_date')})", flush=True)
+            return default_bundle, meta, clf, feat_cols
 
-        print(
-            "\n[MODEL] No rolling/default bundle found. Training ONCE and saving rolling bundle (future runs won't retrain).",
-            flush=True,
-        )
+        print("\n[MODEL] No rolling/default bundle found. Training ONCE and saving.", flush=True)
 
-    # 2) Train path (either --retrain OR no bundle available)
-    df_train = df_train.copy()
-
-    df_train_labeled = build_downside_labels_inplace(
+    # --- Train sweep-style ---
+    df_train = df_train.copy().dropna(subset=["label"]).copy()
+    clf_main, feat_cols_main = train_main_model_sweep_style(
         df_train,
-        store_dir=store_dir,
-        drop_pct=DROP_PCT,
-        drop_horizon_days=DROP_HORIZON_DAYS,
-        entry_lag_days=ENTRY_LAG_DAYS,
-        dl_workers=args.dl_workers,
-        offline_cache_only=OFFLINE_CACHE_ONLY,
-    )
-
-    base_feature_cols = _get_feature_cols(df_train_labeled, ("label", "label_down10"))
-
-    df_train_with_feat, clf_down, feat_cols_down = build_downside_prob_feature_skip_oof(
-        df_train_labeled,
-        base_feature_cols=base_feature_cols,
+        label_col="label",
+        fast=bool(getattr(args, "sweep_fast", False)),  # if you run normal mode, this defaults False
         seed=42,
     )
 
-    clf_main, feat_cols_main, main_metrics = train_main_model_with_drop_feature(df_train_with_feat, seed=42)
-    cand_prec1 = float(main_metrics.get("class1_precision", float("nan")))
-    cand_sup1 = int(main_metrics.get("class1_support", 0))
-
-    model_meta = {
+    meta = {
+        "mode": "non-sweep (sweep-identical)",
         "train_end_date": train_end_date.isoformat(),
         "predict_start_date": predict_start_date.isoformat(),
         "holdout_days": int(holdout_days),
+        "threshold": float(args.threshold),
         "target_pct": float(args.target_pct),
         "horizon_days": int(horizon_days),
+        "drop_pct": float(drop_pct),
+        "drop_horizon_days": int(drop_horizon_days),
         "entry_lag_days": int(entry_lag_days),
         "min_history_hits": int(min_history_hits),
-        "threshold": float(args.threshold),
-        "sklearn_version": sklearn_version,
+        "enforce_sl_not_first": True,
+        "intraday_disambiguation": "1m sl-first fallback",
         "created_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "drop_cfg": {"DROP_PCT": float(drop_pct), "DROP_HORIZON_DAYS": int(drop_horizon_days)},
+        "sklearn_version": sklearn_version,
+        "train_rows": int(len(df_train)),
+        "n_features": int(len(feat_cols_main)),
+        "rf_n_estimators": int(clf_main.n_estimators),
     }
 
-    candidate_bundle = {
+    bundle = {
         "main_model": clf_main,
         "main_feature_cols": feat_cols_main,
-        "down_model": clf_down,
-        "down_feature_cols": feat_cols_down,
-        "meta": model_meta,
+        "down_model": None,
+        "down_feature_cols": None,
+        "meta": meta,
     }
 
-    used_default = False
-    gate_msg = ""
-    passed = False
+    save_model_bundle(ROLLING_BUNDLE_PATH, bundle)
+    save_model_bundle(DEFAULT_MODEL_BUNDLE_PATH, bundle)
+    print(f"\n[MODEL] Saved rolling: {ROLLING_BUNDLE_PATH}", flush=True)
+    print(f"[MODEL] Saved default: {DEFAULT_MODEL_BUNDLE_PATH}", flush=True)
 
-    if bool(args.retrain):
-        bundle, used_default, gate_msg = _gate_candidate_and_maybe_replace_default(
-            candidate_bundle=candidate_bundle,
-            candidate_prec1=cand_prec1,
-            candidate_sup1=cand_sup1,
-        )
-        print(gate_msg, flush=True)
+    return bundle, meta, clf_main, feat_cols_main
 
-        # Save rolling only if we are actually using the candidate (not default)
-        if not used_default:
-            save_model_bundle(ROLLING_BUNDLE_PATH, candidate_bundle)
-            print(f"\nSaved rolling bundle: {ROLLING_BUNDLE_PATH}", flush=True)
-        else:
-            print("\nSkipped saving rolling bundle (using default).", flush=True)
-
-
-    else:
-        # no --retrain: train once (only when no bundles exist) and save rolling to prevent retrain next time
-        bundle = candidate_bundle
-        save_model_bundle(ROLLING_BUNDLE_PATH, candidate_bundle)
-        print(f"\n[MODEL] Saved rolling bundle (no --retrain): {ROLLING_BUNDLE_PATH}", flush=True)
-        passed = True
-
-    model_meta = bundle.get("meta", model_meta) or model_meta
-    model_meta["gate"] = {
-        "candidate_prec1": cand_prec1,
-        "candidate_sup1": cand_sup1,
-        "min_prec1": GATE_MIN_PREC1,
-        "min_sup1": GATE_MIN_SUP1,
-        "passed": bool(passed) and (cand_prec1 > GATE_MIN_PREC1) and (cand_sup1 >= GATE_MIN_SUP1),
-        "used_default": bool(used_default),
-        "default_path": str(DEFAULT_MODEL_BUNDLE_PATH),
-        "message": gate_msg,
-    }
-    bundle["meta"] = model_meta
-
-    clf_main = bundle["main_model"]
-    feat_cols_main = bundle["main_feature_cols"]
-    clf_down = bundle.get("down_model")
-    feat_cols_down = bundle.get("down_feature_cols")
-    return bundle, model_meta, clf_main, feat_cols_main, clf_down, feat_cols_down
 
 def build_df_train_for_models(
     df_all: pd.DataFrame,
@@ -2136,17 +2062,23 @@ def get_or_build_ml_table_cached(
     if verbose:
         print(f"[CACHE] ML table miss: building...  key={key}", flush=True)
 
-    df_all, train_dates, predict_dates_list = build_ml_table(
+    df_all = build_ml_table_sweep_style(
         hits,
-        train_end_date=train_end_date,
-        predict_start_date=predict_start_date,
+        store_dir=store_dir,
+        dl_workers=dl_workers,
         target_pct=target_pct,
         horizon_days=horizon_days,
+        drop_pct=drop_pct,
+        drop_horizon_days=drop_horizon_days,
         entry_lag_days=entry_lag_days,
-        store_dir=store_dir,
         min_history_hits=min_history_hits,
-        dl_workers=dl_workers,
+        enforce_sl_not_first=True,  # IMPORTANT: match sweep behavior by default
     )
+
+    # train_dates / predict_dates_list should be derived the same way everywhere:
+    file_dates = sorted({h.file_date for h in hits})
+    predict_dates_list = file_dates[-holdout_days:]
+    train_dates = file_dates[:-holdout_days]
 
     try:
         _save_cached_ml_table(cache_root, key, df_all, train_dates, predict_dates_list)
@@ -2175,9 +2107,97 @@ GATE_MIN_PREC1 = 0.7799
 GATE_MIN_SUP1 = 410
 
 
+def predict_dates_sweep_style(
+    clf: RandomForestClassifier,
+    feature_cols: List[str],
+    df_all: pd.DataFrame,
+    predict_dates_list: List[date],
+    *,
+    threshold: float,
+) -> pd.DataFrame:
+    """
+    EXACT sweep behavior:
+      - use SAME feature_cols as training
+      - drop rows missing any required feature (NO IMPUTATION)
+      - do not silently drop features
+    """
+    df_pred = df_all[df_all["file_date"].isin([d.isoformat() for d in predict_dates_list])].copy()
+    if df_pred.empty:
+        return df_pred
+
+    missing = [c for c in feature_cols if c not in df_pred.columns]
+    if missing:
+        raise RuntimeError(f"Prediction failed: missing feature columns: {missing}")
+
+    df_pred = df_pred.dropna(subset=feature_cols).copy()
+    if df_pred.empty:
+        return df_pred
+
+    X = df_pred[feature_cols].astype(float).values
+    df_pred["prob_up_target_h"] = clf.predict_proba(X)[:, 1]
+    df_pred["pred_buy"] = (df_pred["prob_up_target_h"] >= float(threshold)).astype(int)
+
+    return df_pred.sort_values(["file_date", "prob_up_target_h"], ascending=[True, False])
+
+
 def save_model_bundle(path: Path, bundle: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, path)
+
+def train_main_model_sweep_style(
+    df_train: pd.DataFrame,
+    *,
+    label_col: str = "label",
+    fast: bool = False,
+    seed: int = 42,
+) -> Tuple[RandomForestClassifier, List[str]]:
+    """
+    EXACT sweep behavior:
+      - feature_cols from _get_feature_cols (drops any column with any NaN)
+      - drop rows missing required feature values (NO IMPUTATION)
+      - RF hyperparams match sweep (120 if fast else 300)
+    """
+    df_train = df_train.copy()
+    df_train = df_train.dropna(subset=[label_col]).copy()
+    if df_train.empty or df_train[label_col].nunique() < 2:
+        raise RuntimeError("Training set invalid (empty or <2 classes).")
+
+    feature_cols = _get_feature_cols(df_train, (label_col, "label_down10"))
+
+    if not feature_cols:
+        raise RuntimeError("No usable feature columns found (after NaN/ban rules).")
+
+    # STRICT: drop rows missing any required feature (no imputation)
+    df_train = df_train.dropna(subset=feature_cols).copy()
+    if df_train.empty or df_train[label_col].nunique() < 2:
+        raise RuntimeError("Training set invalid after dropping missing-feature rows.")
+
+    X_tr = df_train[feature_cols].astype(float).values
+    y_tr = df_train[label_col].astype(int).values
+
+    clf = RandomForestClassifier(
+        n_estimators=120 if fast else 300,
+        random_state=seed,
+        n_jobs=-1,
+        class_weight="balanced_subsample",
+    )
+    clf.fit(X_tr, y_tr)
+    return clf, feature_cols
+
+
+
+def split_train_predict_non_sweep_like_sweep(
+    file_dates: List[date],
+    holdout_days: int,
+) -> Tuple[date, date, List[date], List[date]]:
+    """
+    Non-sweep split MUST match sweep's meaning of holdout:
+      - predict_dates_list = last N *file_dates* (not calendar days)
+      - train_dates = everything before those
+      - train_end_date = last train file_date
+      - predict_start_date = first predict file_date
+    """
+    return _split_train_predict_by_file_dates(sorted(file_dates), int(holdout_days))
 
 
 def load_model_bundle(path: Path) -> Optional[Dict]:
@@ -2198,7 +2218,7 @@ def _gate_candidate_and_maybe_replace_default(
     candidate_sup1: int,
 ) -> Tuple[Dict, bool, str]:
     passed = (candidate_prec1 > GATE_MIN_PREC1) and (candidate_sup1 >= GATE_MIN_SUP1)
-    if 1:
+    if passed:
         save_model_bundle(DEFAULT_MODEL_BUNDLE_PATH, candidate_bundle)
         return candidate_bundle, False, (
             f"[GATE] Candidate PASSED (prec1={candidate_prec1:.4f} > {GATE_MIN_PREC1}, "
@@ -2979,6 +2999,45 @@ def sweep_train_and_save_final_model(
     print(f"\n[SWEEP-SAVE] Saved final model to: {DEFAULT_MODEL_BUNDLE_PATH}", flush=True)
     print(f"[SWEEP-SAVE] Trained rows: {len(df_train)}  Features: {len(feature_cols)}  train_end={meta['train_end_date']}", flush=True)
 
+def maybe_sweep_save_model_after_sweep(
+    *,
+    args,
+    hits: List[OversoldHit],
+    store_dir: Path,
+    threshold: float,
+    sweep_file_counts: List[int],
+) -> None:
+    """
+    Run AFTER sweep finishes.
+    Trains ONE final model from the LAST sweep stage and saves it to DEFAULT_MODEL_BUNDLE_PATH.
+
+    Uses your global HOLDOUT_DAYS/HORIZON_DAYS/DROP_PCT/DROP_HORIZON_DAYS/ENTRY_LAG_DAYS, etc.
+    """
+    if not bool(getattr(args, "sweep_save_model", False)):
+        return
+
+    if not sweep_file_counts:
+        raise RuntimeError("sweep_file_counts is empty; cannot --sweep-save-model")
+
+    final_n = int(sweep_file_counts[-1])
+    if final_n <= 0:
+        raise RuntimeError("final_n invalid for --sweep-save-model")
+
+    print("\n" + "=" * 80)
+    print(f"[SWEEP-SAVE] Training final model from last stage: n_files={final_n} (train on all-but-{HOLDOUT_DAYS} days)")
+    print("=" * 80)
+
+    sweep_train_and_save_final_model(
+        hits=hits,
+        store_dir=store_dir,
+        dl_workers=int(args.dl_workers),
+        threshold=float(threshold),
+        n_files=final_n,
+        enforce_sl_not_first=bool(args.sweep_enforce_sl_not_first),
+        sweep_fast=bool(args.sweep_fast),
+    )
+
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -3211,6 +3270,15 @@ def main() -> int:
         df_all.to_csv(out, index=False)
         print(f"\nSaved realistic sweep results to: {out}")
 
+        # After sweep finishes, optionally train and save ONE final model (last stage)
+        maybe_sweep_save_model_after_sweep(
+            args=args,
+            hits=hits,
+            store_dir=store_dir,
+            threshold=args.threshold,
+            sweep_file_counts=sweep_file_counts,
+        )
+
         return 0
 
     # ============================================================
@@ -3244,8 +3312,14 @@ def main() -> int:
                     print(f"[CLEAN] Failed to remove {f}: {e}", file=sys.stderr)
 
     # ---- Train/predict split anchored to data (not today) ----
-    predict_start_date = latest_file_date - timedelta(days=HOLDOUT_DAYS)
-    train_end_date = predict_start_date - timedelta(days=1)
+    train_end_date, predict_start_date, train_dates, predict_dates_list = split_train_predict_non_sweep_like_sweep(
+        file_dates,
+        HOLDOUT_DAYS,
+    )
+    print(
+        f"Non-sweep split (sweep-style): train_end_date={train_end_date} "
+        f"predict_start_date={predict_start_date} holdout_days={HOLDOUT_DAYS}"
+    )
 
     if train_end_date < file_dates[0]:
         print(
@@ -3300,41 +3374,22 @@ def main() -> int:
         return 2
 
     # ---- Train or load model ----
-    bundle, model_meta, clf_main, feat_cols_main, clf_down, feat_cols_down = (
-        get_or_train_model_bundle_for_run(
-            args=args,
-            df_train=df_train,
-            train_end_date=train_end_date,
-            predict_start_date=predict_start_date,
-            store_dir=store_dir,
-            drop_pct=DROP_PCT,
-            drop_horizon_days=DROP_HORIZON_DAYS,
-            entry_lag_days=ENTRY_LAG_DAYS,
-            holdout_days=HOLDOUT_DAYS,
-            horizon_days=HORIZON_DAYS,
-            min_history_hits=MIN_HISTORY_HITS,
-        )
+    bundle, model_meta, clf_main, feat_cols_main = get_or_train_model_bundle_for_run_sweep_identical(
+        args=args,
+        df_train=df_train,
+        train_end_date=train_end_date,
+        predict_start_date=predict_start_date,
+        holdout_days=HOLDOUT_DAYS,
+        horizon_days=HORIZON_DAYS,
+        drop_pct=DROP_PCT,
+        drop_horizon_days=DROP_HORIZON_DAYS,
+        entry_lag_days=ENTRY_LAG_DAYS,
+        min_history_hits=MIN_HISTORY_HITS,
     )
 
-    # ---- Downside feature for predict window ----
-    #df_all = df_all.copy()
-    #df_all["feat_prob_drop10"] = pd.to_numeric(
-    #    df_all.get("feat_prob_drop10", 0.5), errors="coerce"
-    #).fillna(0.5)
-
-    df_pred_base = df_all[
-        df_all["file_date"].isin([d.isoformat() for d in predict_dates_list])
-    ].copy()
-
-    if clf_down is not None and feat_cols_down is not None and not df_pred_base.empty:
-        missing2 = [c for c in feat_cols_down if c not in df_pred_base.columns]
-        if not missing2:
-            X2 = df_pred_base[feat_cols_down].astype(float).values
-            probs2 = clf_down.predict_proba(X2)[:, 1]
-            df_all.loc[df_pred_base.index, "feat_prob_drop10"] = probs2
 
     # ---- Predict buys ----
-    df_pred = predict_dates(
+    df_pred = predict_dates_sweep_style(
         clf_main,
         feat_cols_main,
         df_all,
