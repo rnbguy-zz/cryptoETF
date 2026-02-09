@@ -2500,58 +2500,114 @@ def relabel_for_combo(
     entry_lag_days: int,
     store_dir: Path,
     dl_workers: int,
+    offline_cache_only: bool,
 ) -> pd.DataFrame:
     """
     Take df_base (features only) and add:
-      - label (upside)
-      - label_down10 (downside)
-    for a specific combo of (TP, H, DP, DH)
+      - label (upside, REALISTIC, includes SL-first dip-before-TP rule)
+      - label_down10 (downside label for DP/DH)
+
+    label rule (REALISTIC):
+      entry_day = file_date + entry_lag_days
+      tp_px = entry_open*(1+target_pct)
+      sl_px = entry_open*(1-drop_pct)
+
+      Look at daily candles from entry_day .. entry_day + max(horizon_days, drop_horizon_days)
+      BUT:
+        - TP only counts within horizon_days
+        - SL only counts within drop_horizon_days
+      If TP never hits => label=0
+      Else find first TP day; if SL occurs on/before that TP day => label=0 else label=1
+      (includes "same day TP+SL" => label=0)
     """
-
     df = df_base.copy()
-
-    # ---- Main label (upside) ----
     df["label"] = np.nan
 
-    def _label_up(row):
-        fday = datetime.strptime(row["file_date"], "%Y-%m-%d").date()
-        entry = fday + timedelta(days=entry_lag_days)
-        endw = entry + timedelta(days=horizon_days)
-
-        s = get_thread_session()
-        w = get_klines_window(
-            row["symbol"],
-            entry,
-            endw,
-            session=s,
-            store_dir=store_dir,
-        )
-
-        if w is None or w.empty:
-            return np.nan
-
-        entry_open = float(w.iloc[0]["open"])
-        max_close = float(w["close"].max())
-        return int(max_close >= entry_open * (1.0 + target_pct))
+    last_closed = datetime.utcnow().date() - timedelta(days=1)
+    max_window = int(max(horizon_days, drop_horizon_days))
 
     # parallelize by symbol
-    by_sym = {sym: df[df["symbol"] == sym].index.tolist()
-              for sym in df["symbol"].unique()}
+    by_sym: Dict[str, List[int]] = defaultdict(list)
+    for idx, sym in df["symbol"].items():
+        by_sym[str(sym)].append(int(idx))
 
-    def _task(sym, idxs):
+    def _label_one_symbol(sym: str, idxs: List[int]) -> List[Tuple[int, int]]:
         s = get_thread_session()
-        out = {}
-        for i in idxs:
-            out[i] = _label_up(df.loc[i])
+        out: List[Tuple[int, int]] = []
+
+        for idx in idxs:
+            try:
+                fday = datetime.strptime(df.at[idx, "file_date"], "%Y-%m-%d").date()
+            except Exception:
+                continue
+
+            entry_day = fday + timedelta(days=int(entry_lag_days))
+            if entry_day > last_closed:
+                continue
+
+            end_day = min(entry_day + timedelta(days=max_window), last_closed)
+
+            w = get_klines_window_maybe_offline(
+                sym,
+                entry_day,
+                end_day,
+                session=s,
+                store_dir=store_dir,
+                offline_cache_only=bool(offline_cache_only),
+            )
+            if w is None or w.empty:
+                continue
+
+            w = w.copy()
+            w["day"] = pd.to_datetime(w["day"], errors="coerce").dt.date
+            w = w[w["day"].notna()].sort_values("day").reset_index(drop=True)
+            if w.empty:
+                continue
+
+            # entry open must exist
+            try:
+                entry_open = float(pd.to_numeric(w.iloc[0]["open"], errors="coerce"))
+            except Exception:
+                continue
+            if not np.isfinite(entry_open) or abs(entry_open) < 1e-12:
+                continue
+
+            tp_px = entry_open * (1.0 + float(target_pct))
+            sl_px = entry_open * (1.0 - float(drop_pct))
+
+            # horizons
+            tp_deadline = entry_day + timedelta(days=int(horizon_days))
+            sl_deadline = entry_day + timedelta(days=int(drop_horizon_days))
+
+            days = w["day"].values
+            highs = pd.to_numeric(w["high"], errors="coerce").values
+            lows  = pd.to_numeric(w["low"],  errors="coerce").values
+
+            tp_allowed = np.array([d <= tp_deadline for d in days], dtype=bool)
+            sl_allowed = np.array([d <= sl_deadline for d in days], dtype=bool)
+
+            tp_hit = tp_allowed & np.isfinite(highs) & (highs >= tp_px)
+            if not tp_hit.any():
+                out.append((idx, 0))
+                continue
+
+            first_tp_idx = int(np.argmax(tp_hit))  # safe because any() true
+
+            sl_hit = sl_allowed & np.isfinite(lows) & (lows <= sl_px)
+
+            # SL on/before TP day => NOT class 1
+            sl_before_or_same = bool(sl_hit[: first_tp_idx + 1].any())
+            out.append((idx, 0 if sl_before_or_same else 1))
+
         return out
 
-    with ThreadPoolExecutor(max_workers=dl_workers) as ex:
-        futs = [ex.submit(_task, sym, idxs) for sym, idxs in by_sym.items()]
+    with ThreadPoolExecutor(max_workers=max(1, int(dl_workers))) as ex:
+        futs = [ex.submit(_label_one_symbol, sym, idxs) for sym, idxs in by_sym.items()]
         for fut in futs:
-            for i, v in fut.result().items():
-                df.at[i, "label"] = v
+            for idx, y in fut.result():
+                df.at[idx, "label"] = y
 
-    # ---- Downside label ----
+    # ---- Downside label still useful as separate column ----
     df = build_downside_labels_inplace(
         df,
         store_dir=store_dir,
@@ -2559,10 +2615,11 @@ def relabel_for_combo(
         drop_horizon_days=drop_horizon_days,
         entry_lag_days=entry_lag_days,
         dl_workers=dl_workers,
-        offline_cache_only=False,
+        offline_cache_only=bool(offline_cache_only),
     )
 
     return df
+
 
 
 def build_base_feature_table(
@@ -2744,10 +2801,10 @@ def main() -> int:
         sweep_file_counts = [int(x) for x in args.sweep_files.split(",") if x.strip().isdigit()]
 
         # Parameter grid
-        HORIZONS = [3, 5, 7, 14, 21]
-        DROP_HORIZONS = [3, 5, 7, 14, 21]
-        TPS = [0.10, 0.15, 0.20, 0.25]
-        DROPS = [0.12, 0.05, 0.10]
+        HORIZONS = [21]
+        DROP_HORIZONS = [3]
+        TPS = [0.20, 0.25, 0.3]
+        DROPS = [0.10]
 
         all_results = []
 
@@ -2757,7 +2814,7 @@ def main() -> int:
             # Select most recent N files
             stage_hits = [h for h in hits if h.file_date >= file_dates[-n_files]]
 
-            # Build BASE table once (features only)
+            # Build BASE table once (features only).
             df_base = build_base_feature_table(
                 stage_hits,
                 entry_lag_days=ENTRY_LAG_DAYS,
@@ -2767,7 +2824,7 @@ def main() -> int:
 
             # Determine realistic time split (not random!)
             stage_dates = sorted({h.file_date for h in stage_hits})
-            holdout_days = max(3, int(len(stage_dates) * 0.25))  # ~25% forward holdout
+            holdout_days = max(7, int(len(stage_dates) * 0.25))  # ~25% forward holdout
             train_dates = stage_dates[:-holdout_days]
             valid_dates = stage_dates[-holdout_days:]
 
@@ -2801,6 +2858,7 @@ def main() -> int:
                                 entry_lag_days=ENTRY_LAG_DAYS,
                                 store_dir=store_dir,
                                 dl_workers=args.dl_workers,
+                                offline_cache_only=bool(args.offline_cache_only),
                             )
 
                             # Split by TIME (not random)
