@@ -383,14 +383,71 @@ def update_positions_until_last_closed(
     state["asof_day"] = _iso(last_closed)
     return new_events
 
+def filter_df_day_by_entry_rule(
+    df_day: pd.DataFrame,
+    *,
+    state: dict,
+    p_threshold: float = 0.61,
+    p_col: str = "prob_up_target_h",
+) -> pd.DataFrame:
+    """
+    Keep a row if:
+      - p > 0.61 OR
+      - previous day's p for that symbol is lower than today's p
+
+    Uses state["last_p_by_symbol"] as memory across days/runs.
+    Updates last_p_by_symbol for symbols present today (using the best p today).
+    """
+    if df_day is None or df_day.empty:
+        return df_day
+
+    last_p_by_symbol = state.setdefault("last_p_by_symbol", {})
+
+    # Best p today per symbol (if multiple rows exist)
+    best_today = (
+        df_day.groupby("symbol", as_index=False)[p_col]
+        .max()
+        .rename(columns={p_col: "p_today"})
+    )
+
+    allowed_syms = set()
+    for _, r in best_today.iterrows():
+        sym = str(r["symbol"])
+        p_today = float(r["p_today"]) if pd.notna(r["p_today"]) else 0.0
+        prev_p = last_p_by_symbol.get(sym)
+
+        if (p_today > float(p_threshold)) or (prev_p is not None and p_today > prev_p):
+            allowed_syms.add(sym)
+
+    # IMPORTANT: update memory for all symbols that appeared today (even if not allowed),
+    # so tomorrow can compare.
+    for _, r in best_today.iterrows():
+        sym = str(r["symbol"])
+        p_today = float(r["p_today"]) if pd.notna(r["p_today"]) else 0.0
+        last_p_by_symbol[sym] = p_today
+
+    if not allowed_syms:
+        return df_day.iloc[0:0].copy()
+
+    return df_day[df_day["symbol"].astype(str).isin(allowed_syms)].copy()
+
 
 def _load_positions(path: Path = POSITIONS_PATH) -> dict:
+    base = {"asof_day": None, "positions": {}, "events": [], "last_p_by_symbol": {}, "last_entry_file_date": None}
     if not path.exists():
-        return {"asof_day": None, "positions": {}, "events": []}
+        return base
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            return base
+        for k, v in base.items():
+            obj.setdefault(k, v)
+        if not isinstance(obj.get("last_p_by_symbol"), dict):
+            obj["last_p_by_symbol"] = {}
+        return obj
     except Exception:
-        return {"asof_day": None, "positions": {}, "events": []}
+        return base
+
 
 
 def _save_positions(state: dict, path: Path = POSITIONS_PATH) -> None:
@@ -1786,8 +1843,38 @@ def _rf_default(seed: int = 42) -> RandomForestClassifier:
 
 
 def _get_feature_cols(df: pd.DataFrame, label_cols: Tuple[str, ...]) -> List[str]:
+    """
+    Return numeric feature columns only.
+    Prevents string/date columns like '2023-09-19' from entering model training.
+    """
     ban = {"file_date", "symbol"} | set(label_cols)
-    return [c for c in df.columns if c not in ban]
+
+    # name-based ban (common culprits that are often strings/dates)
+    bad_name_substrings = ("date", "day", "time", "timestamp")
+
+    cols: List[str] = []
+    for c in df.columns:
+        if c in ban:
+            continue
+
+        lc = str(c).lower()
+        if any(s in lc for s in bad_name_substrings):
+            continue
+
+        s = df[c]
+
+        # drop datetime dtype
+        if np.issubdtype(s.dtype, np.datetime64):
+            continue
+
+        # drop objects/strings (these caused your crash)
+        if s.dtype == "object":
+            continue
+
+        cols.append(c)
+
+    return cols
+
 
 
 def train_and_report(
@@ -1797,16 +1884,13 @@ def train_and_report(
     seed: int = 42,
 ) -> Tuple[RandomForestClassifier, Dict]:
     df_train = df_train.dropna(subset=[label_col]).copy()
-    y = df_train[label_col].astype(int).values
-    X = df_train[feature_cols].astype(float).values
-
     from sklearn.model_selection import TimeSeriesSplit
 
     df_train = df_train.dropna(subset=[label_col]).copy()
     df_train["file_date_dt"] = pd.to_datetime(df_train["file_date"])
     df_train = df_train.sort_values("file_date_dt")
 
-    X = df_train[feature_cols].astype(float).values
+    X = df_train[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
     y = df_train[label_col].astype(int).values
 
     tscv = TimeSeriesSplit(n_splits=3)
@@ -2432,14 +2516,26 @@ def main() -> int:
     entry_events: List[dict] = []
     for d_str in pred_days:
         df_day = df_pred[df_pred["file_date"] == d_str].copy()
-        entry_events.extend(
-            open_new_positions_from_predictions(
+        entry_events: List[dict] = []
+        for d_str in pred_days:
+            df_day = df_pred[df_pred["file_date"] == d_str].copy()
+
+            # APPLY: p>0.61 OR prev_p < today_p (per symbol)
+            df_day = filter_df_day_by_entry_rule(
+                df_day,
                 state=state,
-                df_pred_today=df_day,
-                store_dir=store_dir,
-                offline_cache_only=OFFLINE_CACHE_ONLY,
+                p_threshold=0.61,
+                p_col="prob_up_target_h",
             )
-        )
+
+            entry_events.extend(
+                open_new_positions_from_predictions(
+                    state=state,
+                    df_pred_today=df_day,
+                    store_dir=store_dir,
+                    offline_cache_only=OFFLINE_CACHE_ONLY,
+                )
+            )
 
     if pred_days:
         state["last_entry_file_date"] = pred_days[-1]
