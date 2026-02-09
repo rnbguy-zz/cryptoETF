@@ -1,53 +1,4 @@
 #!/usr/bin/env python3
-"""
-rank_oversold.py (AI-ready-to-buy classifier + MODEL PERSISTENCE + BTC MOOD OUTPUT FILTER)
-
-Fixes applied:
-- ALWAYS build df_all/train_dates/predict_dates_list (not only on prefetch failure)
-- Gate logic uses `passed` (removes `if 1:` bug)
-- Removes debug `if 600==1` blocks
-- Adds robust fallback when downside model can't train (fills feat_prob_drop10 with 0.5)
-- Removes hard-coded sender password; env var only
-
-Oversold Analysis Alert
-============================================================
-Loaded hits: 82243
-Total samples (train + predict): 80578
-Train dates: 2023-09-14 .. 2026-02-01  (872 days)
-Predict file dates (entry is 1 plus): 2026-02-02 .. 2026-02-07  (6 days)
-
-Model trained_through: 2026-02-01
-Model predict_from:   2026-02-02
-horizon days:         21
-threshold:            0.5
-target_pct:           0.2
-drop_hor:              5
-sklearn:              1.6.1
-created_utc:          2026-02-08T11:15:07Z
-drop_feature:         feat_prob_drop10 (from downside model or fallback)
-gate_used_default:    False
-gate_prec1:           0.8268551236749117
-gate_sup1:            1162
-gate_passed:          False
-
-=== TOP CANDIDATES (predict window; BTC mood=BULLISH ONLY) ===
-
-file=2026-02-02  (top 3)  threshold=0.5  BTC(2026-02-02)=BULLISH +2.30%
-BUY  AWEUSDT       p=0.781  hits30d=11  runupToHigh=39.73%  maxHighDate=2026-02-07  featDropP=0.125
-BUY  BBUSDT        p=0.584  hits30d=7  runupToHigh=1.84%  maxHighDate=2026-02-03  featDropP=0.308
-BUY  AEVOUSDT      p=0.527  hits30d=5  runupToHigh=8.50%  maxHighDate=2026-02-05  featDropP=0.316
-
-file=2026-02-03  (top 1)  threshold=0.5  BTC(2026-02-03)=BULLISH -3.77%
-BUY  AWEUSDT       p=0.624  hits30d=12  runupToHigh=34.57%  maxHighDate=2026-02-07  featDropP=0.238
-
-file=2026-02-04  (top 1)  threshold=0.5  BTC(2026-02-04)=BULLISH -3.44%
-BUY  BANKUSDT      p=0.576  hits30d=2  runupToHigh=4.88%  maxHighDate=2026-02-05  featDropP=0.301
-
-file=2026-02-06  (top 2)  threshold=0.5  BTC(2026-02-06)=BULLISH +12.19%
-BUY  NILUSDT       p=0.521  hits30d=9  runupToHigh=2.04%  maxHighDate=2026-02-07  featDropP=0.311
-BUY  KAITOUSDT     p=0.516  hits30d=9  runupToHigh=1.69%  maxHighDate=2026-02-07  featDropP=0.118
-
-"""
 
 from __future__ import annotations
 
@@ -84,9 +35,9 @@ from sklearn import __version__ as sklearn_version
 
 HOLDOUT_DAYS = 5
 ENTRY_LAG_DAYS = 1
-HORIZON_DAYS = 21 #21 change back before using this model
+HORIZON_DAYS = 7 #21 change back before using this model
 DROP_HORIZON_DAYS = 5
-DROP_PCT = 0.1 #0.1 change back before using this model
+DROP_PCT = 0.12 #0.1 change back before using this model
 OFFLINE_CACHE_ONLY = 0
 
 # ============================================================
@@ -109,6 +60,351 @@ TP_FRACTION = 0.1        # sell half
 HARD_STOP_PCT = 0.1
 TIME_STOP_DAYS = 14
 TIME_STOP_MIN_GAIN = 0.05 # +5%
+MIN_HISTORY_HITS = 3
+
+from itertools import product
+import math
+import traceback
+
+def _parse_int_list(s: str) -> List[int]:
+    return [int(x.strip()) for x in str(s).split(",") if x.strip()]
+
+def _stable_pct(n: int, d: int) -> float:
+    return float(n) / float(d) if d else 0.0
+
+def _rf_fast(seed: int = 42) -> RandomForestClassifier:
+    # Faster for sweeps; keeps behavior similar but saves time.
+    return RandomForestClassifier(
+        n_estimators=200,
+        random_state=seed,
+        n_jobs=-1,
+        class_weight="balanced_subsample",
+        max_depth=None,
+        min_samples_leaf=2,
+    )
+
+def train_and_report_custom_rf(
+    df_train: pd.DataFrame,
+    label_col: str,
+    feature_cols: List[str],
+    seed: int = 42,
+    fast: bool = False,
+) -> Tuple[RandomForestClassifier, Dict]:
+    df_train = df_train.dropna(subset=[label_col]).copy()
+    y = df_train[label_col].astype(int).values
+    X = df_train[feature_cols].astype(float).values
+
+    X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y)
+
+    clf = (_rf_fast(seed) if fast else _rf_default(seed))
+    clf.fit(X_tr, y_tr)
+
+    p_va = clf.predict_proba(X_va)[:, 1]
+    y_hat = (p_va >= 0.5).astype(int)
+
+    try:
+        auc = roc_auc_score(y_va, p_va)
+    except Exception:
+        auc = float("nan")
+
+    rep_dict = classification_report(y_va, y_hat, digits=4, output_dict=True)
+    c1 = rep_dict.get("1", {})
+    metrics = {
+        "auc": float(auc),
+        "class1_precision": float(c1.get("precision", float("nan"))),
+        "class1_recall": float(c1.get("recall", float("nan"))),
+        "class1_support": int(c1.get("support", 0)),
+        "report_dict": rep_dict,
+    }
+    return clf, metrics
+
+def _select_latest_file_dates(folder: Path, n_files: int) -> List[date]:
+    # Use filenames *_oversold.txt to pick the newest N files deterministically
+    fps = sorted(folder.glob("*_oversold.txt"))
+    if not fps:
+        raise RuntimeError(f"No *_oversold.txt files found in {folder}")
+    # each file begins YYYY-MM-DD
+    fdays = [parse_file_date(fp) for fp in fps]
+    fdays = sorted(set(fdays))
+    return fdays[-min(n_files, len(fdays)) :]
+
+def _filter_hits_to_file_dates(hits: List[OversoldHit], allowed_dates: set) -> List[OversoldHit]:
+    return [h for h in hits if h.file_date in allowed_dates]
+
+def _split_train_predict_by_file_dates(file_dates: List[date], holdout_days: int) -> Tuple[date, date, List[date], List[date]]:
+    # Deterministic split based on available file_dates (NOT date.today()).
+    # holdout_days means: last holdout_days file_dates are predict window.
+    file_dates = sorted(file_dates)
+    if len(file_dates) < (holdout_days + 2):
+        raise RuntimeError(f"Not enough file dates for holdout_days={holdout_days}. Have {len(file_dates)}.")
+    predict_dates_list = file_dates[-holdout_days:]
+    train_dates = file_dates[:-holdout_days]
+    train_end_date = train_dates[-1]
+    predict_start_date = predict_dates_list[0]
+    return train_end_date, predict_start_date, train_dates, predict_dates_list
+
+def _forward_metrics_on_holdout(
+    *,
+    clf: RandomForestClassifier,
+    feat_cols: List[str],
+    df_all: pd.DataFrame,
+    predict_dates_list: List[date],
+    threshold: float,
+) -> Dict[str, float]:
+    df_hold = df_all[df_all["file_date"].isin([d.isoformat() for d in predict_dates_list])].copy()
+    df_hold = df_hold.dropna(subset=["label"]).copy()
+    if df_hold.empty:
+        return {
+            "fwd_pos": 0, "fwd_rows": 0, "fwd_pred_buy": 0,
+            "fwd_prec": float("nan"), "fwd_rec": float("nan"),
+            "fwd_f1": float("nan"), "p_mean": float("nan"), "p_max": float("nan"),
+        }
+
+    X = df_hold[feat_cols].astype(float).values
+    p = clf.predict_proba(X)[:, 1]
+    y = df_hold["label"].astype(int).values
+    yhat = (p >= threshold).astype(int)
+
+    tp = int(((yhat == 1) & (y == 1)).sum())
+    fp = int(((yhat == 1) & (y == 0)).sum())
+    fn = int(((yhat == 0) & (y == 1)).sum())
+
+    prec = (tp / (tp + fp)) if (tp + fp) else float("nan")
+    rec = (tp / (tp + fn)) if (tp + fn) else float("nan")
+    f1 = (2 * prec * rec / (prec + rec)) if (math.isfinite(prec) and math.isfinite(rec) and (prec + rec) > 0) else float("nan")
+
+    return {
+        "fwd_rows": int(len(df_hold)),
+        "fwd_pos": int((y == 1).sum()),
+        "fwd_pred_buy": int((yhat == 1).sum()),
+        "fwd_prec": float(prec),
+        "fwd_rec": float(rec),
+        "fwd_f1": float(f1),
+        "p_mean": float(np.mean(p)),
+        "p_max": float(np.max(p)),
+    }
+
+def run_progressive_sweep(
+    *,
+    folder: Path,
+    store_dir: Path,
+    cache_root_base: Path,
+    dl_workers: int,
+    offline_cache_only: bool,
+    threshold: float,
+    sweep_file_counts: List[int],
+    topk: int,
+    max_combos: int,
+    fast: bool,
+) -> int:
+    # Parameter grids requested
+    HORIZONS = [5]
+    DROP_HORIZONS = [3, 5, 7, 14, 21]
+    TARGET_PCTS = [0.25]  # TP
+    DROP_PCTS = [0.05, 0.10, 0.12]  # DP
+
+    combos = list(product(HORIZONS, DROP_HORIZONS, TARGET_PCTS, DROP_PCTS))
+    if max_combos and max_combos > 0:
+        combos = combos[:max_combos]
+
+    print("\n" + "=" * 80)
+    print("PROGRESSIVE SWEEP")
+    print(f"Combos: {len(combos)}  File counts: {sweep_file_counts}")
+    print("Metrics shown are FORWARD (holdout) + quick random-split sanity AUC.")
+    print("=" * 80 + "\n")
+
+    # Load all hits once, then filter per stage
+    all_hits = load_oversold_hits(folder)
+    print(f"[SWEEP] Loaded hits total: {len(all_hits)}")
+
+    # Progressively increase number of files
+    for n_files in sweep_file_counts:
+        file_dates_stage = _select_latest_file_dates(folder, n_files)
+        allowed = set(file_dates_stage)
+        hits = _filter_hits_to_file_dates(all_hits, allowed)
+
+        stage_file_dates = sorted({h.file_date for h in hits})
+        if len(stage_file_dates) < 12:
+            print(f"[SWEEP] n_files={n_files}: too few usable file_dates ({len(stage_file_dates)}). Skipping.")
+            continue
+
+        # holdout: keep small but meaningful for tiny stages
+        # e.g., for 10 files -> holdout 3; for 20 -> 5; for 40 -> 8; for 80 -> 12
+        holdout_days = max(3, min(12, int(round(len(stage_file_dates) * 0.25))))
+        if len(stage_file_dates) < holdout_days + 2:
+            holdout_days = max(2, len(stage_file_dates) // 4)
+
+        train_end_date, predict_start_date, train_dates, predict_dates_list = _split_train_predict_by_file_dates(
+            stage_file_dates, holdout_days
+        )
+
+        print("\n" + "-" * 80)
+        print(f"[SWEEP] Stage n_files={n_files}  file_dates={stage_file_dates[0]}..{stage_file_dates[-1]} ({len(stage_file_dates)})")
+        print(f"[SWEEP] Split train_end={train_end_date}  predict_start={predict_start_date}  holdout_days={holdout_days} (predict_days={len(predict_dates_list)})")
+
+        # Optional: prefetch for this stage (small)
+        if not offline_cache_only:
+            try:
+                print(f"[SWEEP] Prefetching klines for stage into {store_dir} ...")
+                prefetch_symbol_windows(
+                    hits,
+                    entry_lag_days=ENTRY_LAG_DAYS,
+                    horizon_days=max(max(HORIZONS), max(DROP_HORIZONS)),
+                    store_dir=store_dir,
+                    dl_workers=dl_workers,
+                )
+                print("[SWEEP] Prefetch done.")
+            except Exception as e:
+                print(f"[SWEEP] Prefetch failed (continuing): {e}", file=sys.stderr)
+
+        results = []
+        best_seen = None
+
+        for i, (H, DH, TP, DP) in enumerate(combos, 1):
+            try:
+                # IMPORTANT: use a separate cache root per combo+stage to avoid collisions and keep things consistent
+                cache_root = cache_root_base / f"sweep_n{n_files}" / f"H{H}_DH{DH}_TP{TP}_DP{DP}"
+
+                df_all, _train_dates_cached, _predict_dates_cached = get_or_build_ml_table_cached(
+                    hits,
+                    folder=folder,
+                    cache_root=cache_root,
+                    latest_file_date=stage_file_dates[-1],
+                    holdout_days=holdout_days,
+                    train_end_date=train_end_date,
+                    predict_start_date=predict_start_date,
+                    target_pct=TP,
+                    horizon_days=H,
+                    entry_lag_days=ENTRY_LAG_DAYS,
+                    store_dir=store_dir,
+                    min_history_hits=MIN_HISTORY_HITS,
+                    dl_workers=dl_workers,
+                    drop_pct=DP,
+                    drop_horizon_days=DH,
+                    feature_schema_version="v1",
+                    verbose=False,
+                )
+
+                df_train = build_df_train_for_models(df_all, train_dates)
+                if df_train.empty or df_train["label"].nunique() < 2:
+                    continue
+
+                # Build downside labels + downside prob feature with DP/DH
+                df_train_labeled = build_downside_labels_inplace(
+                    df_train,
+                    store_dir=store_dir,
+                    drop_pct=DP,
+                    drop_horizon_days=DH,
+                    entry_lag_days=ENTRY_LAG_DAYS,
+                    dl_workers=dl_workers,
+                    offline_cache_only=offline_cache_only,
+                )
+
+                base_feature_cols = _get_feature_cols(df_train_labeled, ("label", "label_down10"))
+                df_train_with_feat, clf_down, feat_cols_down = build_downside_prob_feature_skip_oof(
+                    df_train_labeled,
+                    base_feature_cols=base_feature_cols,
+                    seed=42,
+                )
+
+                # Train main model (custom RF for sweep speed if requested)
+                feat_cols_main = _get_feature_cols(df_train_with_feat, ("label", "label_down10"))
+                if "feat_prob_drop10" not in feat_cols_main:
+                    feat_cols_main.append("feat_prob_drop10")
+                df_train_with_feat["feat_prob_drop10"] = pd.to_numeric(df_train_with_feat["feat_prob_drop10"], errors="coerce").fillna(0.5)
+
+                clf_main, m = train_and_report_custom_rf(
+                    df_train_with_feat,
+                    "label",
+                    feat_cols_main,
+                    seed=42,
+                    fast=fast,
+                )
+
+                # Ensure df_all has feat_prob_drop10 for predict window
+                df_all2 = df_all.copy()
+                if "feat_prob_drop10" not in df_all2.columns:
+                    df_all2["feat_prob_drop10"] = 0.5
+                df_all2["feat_prob_drop10"] = pd.to_numeric(df_all2["feat_prob_drop10"], errors="coerce").fillna(0.5)
+
+                df_pred_base = df_all2[df_all2["file_date"].isin([d.isoformat() for d in predict_dates_list])].copy()
+                if clf_down is not None and feat_cols_down is not None and not df_pred_base.empty:
+                    missing2 = [c for c in feat_cols_down if c not in df_pred_base.columns]
+                    if not missing2:
+                        X2 = df_pred_base[feat_cols_down].astype(float).values
+                        probs2 = clf_down.predict_proba(X2)[:, 1]
+                        df_all2.loc[df_pred_base.index, "feat_prob_drop10"] = probs2
+
+                # Forward metrics on holdout
+                fwd = _forward_metrics_on_holdout(
+                    clf=clf_main,
+                    feat_cols=feat_cols_main,
+                    df_all=df_all2,
+                    predict_dates_list=predict_dates_list,
+                    threshold=threshold,
+                )
+
+                row = {
+                    "H": H, "DH": DH, "TP": TP, "DP": DP,
+                    "auc": float(m.get("auc", float("nan"))),
+                    "va_prec": float(m.get("class1_precision", float("nan"))),
+                    "va_rec": float(m.get("class1_recall", float("nan"))),
+                    "va_sup": int(m.get("class1_support", 0)),
+                    **fwd,
+                }
+                results.append(row)
+
+                # Occasionally print progress + best-so-far
+                if i % 25 == 0 or i == len(combos):
+                    best_seen = max(results, key=lambda r: (r.get("fwd_f1", float("-inf")) if math.isfinite(r.get("fwd_f1", float("nan"))) else -1.0,
+                                                           r.get("fwd_prec", float("-inf")) if math.isfinite(r.get("fwd_prec", float("nan"))) else -1.0,
+                                                           r.get("fwd_pred_buy", 0)))
+                    print(
+                        f"[SWEEP] {i}/{len(combos)} done. Best so far: "
+                        f"H={best_seen['H']} DH={best_seen['DH']} TP={best_seen['TP']} DP={best_seen['DP']} "
+                        f"fwd_f1={best_seen['fwd_f1']:.3f} fwd_prec={best_seen['fwd_prec']:.3f} "
+                        f"fwd_rec={best_seen['fwd_rec']:.3f} buys={best_seen['fwd_pred_buy']}/{best_seen['fwd_rows']} "
+                        f"(pmax={best_seen['p_max']:.3f})"
+                    )
+
+            except Exception as e:
+                # keep sweep robust
+                print(f"[SWEEP] combo failed H={H} DH={DH} TP={TP} DP={DP}: {e}", file=sys.stderr)
+                # uncomment if you want full traceback
+                # traceback.print_exc()
+                continue
+
+        if not results:
+            print("[SWEEP] No valid results for this stage (likely not enough labels/candles).")
+            continue
+
+        # Rank configs by forward F1 then precision then predicted buys
+        def _rank_key(r):
+            f1 = r.get("fwd_f1", float("nan"))
+            prec = r.get("fwd_prec", float("nan"))
+            rec = r.get("fwd_rec", float("nan"))
+            # treat NaNs as -1
+            f1v = f1 if math.isfinite(f1) else -1.0
+            pv = prec if math.isfinite(prec) else -1.0
+            rv = rec if math.isfinite(rec) else -1.0
+            return (f1v, pv, rv, r.get("fwd_pred_buy", 0), r.get("auc", float("nan")))
+
+        results_sorted = sorted(results, key=_rank_key, reverse=True)[:max(1, int(topk))]
+
+        print("\n[SWEEP] TOP CONFIGS THIS STAGE (ranked by forward f1/prec/rec):")
+        for r in results_sorted:
+            print(
+                f"  H={r['H']:>2} DH={r['DH']:>2} TP={r['TP']:.2f} DP={r['DP']:.2f} | "
+                f"FWD: f1={r['fwd_f1'] if math.isfinite(r['fwd_f1']) else float('nan'):.3f} "
+                f"prec={r['fwd_prec'] if math.isfinite(r['fwd_prec']) else float('nan'):.3f} "
+                f"rec={r['fwd_rec'] if math.isfinite(r['fwd_rec']) else float('nan'):.3f} "
+                f"buys={r['fwd_pred_buy']}/{r['fwd_rows']} pos={r['fwd_pos']} pmax={r['p_max']:.3f} | "
+                f"VAL: auc={r['auc']:.3f} prec={r['va_prec']:.3f} rec={r['va_rec']:.3f} sup={r['va_sup']}"
+            )
+
+    print("\n[SWEEP] Done.")
+    return 0
+
 
 def open_new_positions_from_predictions(
     *,
@@ -2193,6 +2489,124 @@ def get_klines_window_cached_only(
     out["day"] = out["day"].astype(str)
     return out.sort_values("day").reset_index(drop=True)
 
+def relabel_for_combo(
+    df_base: pd.DataFrame,
+    *,
+    target_pct: float,
+    horizon_days: int,
+    drop_pct: float,
+    drop_horizon_days: int,
+    entry_lag_days: int,
+    store_dir: Path,
+    dl_workers: int,
+) -> pd.DataFrame:
+    """
+    Take df_base (features only) and add:
+      - label (upside)
+      - label_down10 (downside)
+    for a specific combo of (TP, H, DP, DH)
+    """
+
+    df = df_base.copy()
+
+    # ---- Main label (upside) ----
+    df["label"] = np.nan
+
+    def _label_up(row):
+        fday = datetime.strptime(row["file_date"], "%Y-%m-%d").date()
+        entry = fday + timedelta(days=entry_lag_days)
+        endw = entry + timedelta(days=horizon_days)
+
+        s = get_thread_session()
+        w = get_klines_window(
+            row["symbol"],
+            entry,
+            endw,
+            session=s,
+            store_dir=store_dir,
+        )
+
+        if w is None or w.empty:
+            return np.nan
+
+        entry_open = float(w.iloc[0]["open"])
+        max_close = float(w["close"].max())
+        return int(max_close >= entry_open * (1.0 + target_pct))
+
+    # parallelize by symbol
+    by_sym = {sym: df[df["symbol"] == sym].index.tolist()
+              for sym in df["symbol"].unique()}
+
+    def _task(sym, idxs):
+        s = get_thread_session()
+        out = {}
+        for i in idxs:
+            out[i] = _label_up(df.loc[i])
+        return out
+
+    with ThreadPoolExecutor(max_workers=dl_workers) as ex:
+        futs = [ex.submit(_task, sym, idxs) for sym, idxs in by_sym.items()]
+        for fut in futs:
+            for i, v in fut.result().items():
+                df.at[i, "label"] = v
+
+    # ---- Downside label ----
+    df = build_downside_labels_inplace(
+        df,
+        store_dir=store_dir,
+        drop_pct=drop_pct,
+        drop_horizon_days=drop_horizon_days,
+        entry_lag_days=entry_lag_days,
+        dl_workers=dl_workers,
+        offline_cache_only=False,
+    )
+
+    return df
+
+
+def build_base_feature_table(
+    hits: List[OversoldHit],
+    *,
+    entry_lag_days: int,
+    min_history_hits: int,
+) -> pd.DataFrame:
+    """
+    Build DF with:
+      file_date, symbol, and ALL features
+    BUT NO labels (label, label_down10).
+    This is built ONCE per stage (e.g. first 10 files).
+    """
+
+    by_symbol: Dict[str, List[OversoldHit]] = defaultdict(list)
+    symbols_in_file: Dict[date, set] = defaultdict(set)
+
+    for h in hits:
+        by_symbol[h.symbol].append(h)
+        symbols_in_file[h.file_date].add(h.symbol)
+
+    file_dates = sorted({h.file_date for h in hits})
+    rows = []
+
+    for fday in file_dates:
+        syms = symbols_in_file.get(fday, set())
+        for sym in sorted(syms):
+            hist = by_symbol.get(sym, [])
+            hist_up_to = [x for x in hist if x.file_date <= fday]
+
+            if len(hist_up_to) < min_history_hits:
+                continue
+
+            feats = build_features_for_symbol(hist, fday)
+            if not feats:
+                continue
+
+            row = {"file_date": fday.isoformat(), "symbol": sym}
+            row.update(feats)
+            rows.append(row)
+
+    df_base = pd.DataFrame(rows).sort_values(["file_date", "symbol"]).reset_index(drop=True)
+    return df_base
+
 
 def ensure_symbol_days_maybe_offline(
     symbol: str,
@@ -2255,25 +2669,199 @@ def _missing_days_in_window(df_window: pd.DataFrame, start_day: date, end_day: d
 def main() -> int:
     ap = argparse.ArgumentParser()
 
+    # ---------- SWEEP ARGS (unchanged) ----------
+    ap.add_argument("--sweep", action="store_true",
+                    help="Run progressive parameter sweep on a small subset of files.")
+    ap.add_argument("--sweep-files", default="10,20,40,80",
+                    help="Comma-separated progressive file counts to test.")
+    ap.add_argument("--sweep-topk", type=int, default=10,
+                    help="Show top-K configs each stage.")
+    ap.add_argument("--sweep-max-combos", type=int, default=0,
+                    help="Optional cap on number of parameter combos (0=all).")
+    ap.add_argument("--sweep-fast", action="store_true",
+                    help="Use faster RF settings during sweep (recommended).")
+
+    # ---------- NORMAL ARGS ----------
     ap.add_argument("--threshold", type=float, default=0.50)
     ap.add_argument("--cache-dir", default="kline_store")
     ap.add_argument("--target-pct", type=float, default=0.20)
     ap.add_argument("--dl-workers", type=int, default=16)
     ap.add_argument("--retrain", action="store_true")
-    ap.add_argument("--skip-oof", action="store_true", help="Kept for compatibility; script always uses skip-oof path.")
-    ap.add_argument("--dir", default="oversold_analysis", help="Folder containing *_oversold.txt")
+    ap.add_argument("--skip-oof", action="store_true")
+    ap.add_argument("--dir", default="oversold_analysis")
     ap.add_argument(
         "--offline-cache-only",
         action="store_true",
-        help="Never fetch klines from Binance; use cached parquet only. Missing days will be reported.",
+        help="Never fetch klines from Binance; use cached parquet only.",
     )
 
     args = ap.parse_args()
-    # --------------------------------------------------
-    # CLEAN MODEL + CACHE ONLY WHEN --retrain IS SET
-    # --------------------------------------------------
+    OFFLINE_CACHE_ONLY = bool(args.offline_cache_only)
+
+    folder = Path(args.dir)
+    store_dir = Path(args.cache_dir)
+
+    # ============================================================
+    # LOAD HITS (common for sweep + normal)
+    # ============================================================
+    hits = load_oversold_hits(folder)
+    print(f"Loaded hits: {len(hits)}")
+
+    file_dates = sorted({h.file_date for h in hits})
+    if not file_dates:
+        print("ERROR: No file dates found.", file=sys.stderr)
+        return 2
+
+    latest_file_date = file_dates[-1]
+    print(f"Latest file date: {latest_file_date}")
+
+    # ============================================================
+    # OPTIONAL PREFETCH (common)
+    # ============================================================
+    if OFFLINE_CACHE_ONLY:
+        print("\nPrefetch skipped: --offline-cache-only enabled.")
+    else:
+        try:
+            print(f"\nPrefetching klines into: {store_dir} ...")
+            prefetch_symbol_windows(
+                hits,
+                entry_lag_days=ENTRY_LAG_DAYS,
+                horizon_days=max(HORIZON_DAYS, DROP_HORIZON_DAYS),
+                store_dir=store_dir,
+                dl_workers=args.dl_workers,
+            )
+            print("Prefetch done.")
+        except Exception as e:
+            print(f"NOTE: Prefetch failed (continuing anyway): {e}", file=sys.stderr)
+
+    # ============================================================
+    # ===================== SWEEP MODE ===========================
+    # ============================================================
+    if args.sweep:
+        print("\n=== PROGRESSIVE FAST SWEEP (BASE TABLE + RELABEL) ===")
+
+        # Parse file counts like "10,20,40"
+        sweep_file_counts = [int(x) for x in args.sweep_files.split(",") if x.strip().isdigit()]
+
+        # Parameter grid
+        HORIZONS = [3, 5, 7, 14, 21]
+        DROP_HORIZONS = [3, 5, 7, 14, 21]
+        TPS = [0.10, 0.15, 0.20, 0.25]
+        DROPS = [0.12, 0.05, 0.10]
+
+        all_results = []
+
+        for n_files in sweep_file_counts:
+            print(f"\n=== SWEEP STAGE: last {n_files} files ===")
+
+            stage_hits = [h for h in hits if h.file_date >= file_dates[-n_files]]
+
+            # -------- BUILD BASE TABLE ONCE PER STAGE --------
+            df_base = build_base_feature_table(
+                stage_hits,
+                entry_lag_days=ENTRY_LAG_DAYS,
+                min_history_hits=MIN_HISTORY_HITS,
+            )
+            print(f"[SWEEP] Base table rows: {len(df_base)}")
+
+            stage_results = []
+
+            combo_count = 0
+
+            for H in HORIZONS:
+                for DH in DROP_HORIZONS:
+                    for TP in TPS:
+                        for DP in DROPS:
+
+                            combo_count += 1
+                            if args.sweep_max_combos and combo_count > args.sweep_max_combos:
+                                break
+
+                            print(f"\n[SWEEP] H={H} DH={DH} TP={TP} DP={DP}")
+
+                            df_labeled = relabel_for_combo(
+                                df_base,
+                                target_pct=TP,
+                                horizon_days=H,
+                                drop_pct=DP,
+                                drop_horizon_days=DH,
+                                entry_lag_days=ENTRY_LAG_DAYS,
+                                store_dir=store_dir,
+                                dl_workers=args.dl_workers,
+                            )
+
+                            df_train = df_labeled.dropna(subset=["label"]).copy()
+
+                            if df_train.empty or df_train["label"].nunique() < 2:
+                                print("  -> Skipping (not enough classes)")
+                                continue
+
+                            feature_cols = _get_feature_cols(df_train, ("label", "label_down10"))
+
+                            X = df_train[feature_cols].astype(float).values
+                            y = df_train["label"].astype(int).values
+
+                            X_tr, X_va, y_tr, y_va = train_test_split(
+                                X, y, test_size=0.2, stratify=y, random_state=42
+                            )
+
+                            # Fast or full RF
+                            if args.sweep_fast:
+                                clf = RandomForestClassifier(
+                                    n_estimators=100,
+                                    random_state=42,
+                                    n_jobs=-1,
+                                    class_weight="balanced_subsample",
+                                )
+                            else:
+                                clf = RandomForestClassifier(
+                                    n_estimators=300,
+                                    random_state=42,
+                                    n_jobs=-1,
+                                    class_weight="balanced_subsample",
+                                )
+
+                            clf.fit(X_tr, y_tr)
+                            p_va = clf.predict_proba(X_va)[:, 1]
+                            y_hat = (p_va >= 0.5).astype(int)
+
+                            rep = classification_report(y_va, y_hat, output_dict=True)
+                            prec1 = float(rep["1"]["precision"])
+                            rec1 = float(rep["1"]["recall"])
+                            f1 = float(rep["1"]["f1-score"])
+
+                            print(f"  prec1={prec1:.3f}  rec1={rec1:.3f}  f1={f1:.3f}")
+
+                            stage_results.append({
+                                "n_files": n_files,
+                                "H": H,
+                                "DH": DH,
+                                "TP": TP,
+                                "DP": DP,
+                                "prec1": prec1,
+                                "rec1": rec1,
+                                "f1": f1,
+                            })
+
+            df_stage = pd.DataFrame(stage_results).sort_values("f1", ascending=False)
+            print(f"\n=== TOP {args.sweep_topk} for {n_files} files ===")
+            print(df_stage.head(args.sweep_topk).to_string(index=False))
+
+            all_results.extend(stage_results)
+
+        df_all = pd.DataFrame(all_results).sort_values("f1", ascending=False)
+        out = Path("sweep_results_progressive.csv")
+        df_all.to_csv(out, index=False)
+        print(f"\nSaved full sweep results to: {out}")
+
+        return 0  # EXIT after sweep
+
+    # ============================================================
+    # ================ NORMAL (NON-SWEEP) PATH ===================
+    # ============================================================
+
+    # ---- Clean model/cache if --retrain ----
     if args.retrain:
-        # Paths to your model bundles
         rolling_path = BASE_DIR / "models" / "rolling_bundle.joblib"
         default_path = BASE_DIR / "models" / "default_model_76.joblib"
 
@@ -2285,8 +2873,7 @@ def main() -> int:
             except Exception as e:
                 print(f"[CLEAN] Failed to delete {p}: {e}", file=sys.stderr)
 
-        # Empty the kline_store directory (but keep the folder)
-        store_dir = Path(args.cache_dir)
+        # Clear kline_store
         if store_dir.exists() and store_dir.is_dir():
             print(f"[CLEAN] Clearing contents of {store_dir}")
             for f in store_dir.iterdir():
@@ -2294,32 +2881,12 @@ def main() -> int:
                     if f.is_file():
                         f.unlink()
                     elif f.is_dir():
-                        # remove subdirectories recursively
                         import shutil
                         shutil.rmtree(f)
                 except Exception as e:
                     print(f"[CLEAN] Failed to remove {f}: {e}", file=sys.stderr)
 
-    OFFLINE_CACHE_ONLY = bool(args.offline_cache_only)
-
-    MIN_HISTORY_HITS = 3
-    TOPK = 40
-    OUT_PATH = Path("ai_predictions.csv")
-
-    DROP_PCT = 0.10
-
-    folder = Path(args.dir)
-    store_dir = Path(args.cache_dir)
-
-    hits = load_oversold_hits(folder)
-    print(f"Loaded hits: {len(hits)}")
-
-    file_dates = sorted({h.file_date for h in hits})
-    if not file_dates:
-        print("ERROR: No file dates found.", file=sys.stderr)
-        return 2
-
-    latest_file_date = file_dates[-1]
+    # ---- Train/predict split anchored to data (not today) ----
     predict_start_date = latest_file_date - timedelta(days=HOLDOUT_DAYS)
     train_end_date = predict_start_date - timedelta(days=1)
 
@@ -2337,24 +2904,7 @@ def main() -> int:
         f"(holdout_days={HOLDOUT_DAYS})"
     )
 
-    # Prefetch (non-fatal). If offline, skip prefetch to avoid any fetch attempts.
-    if OFFLINE_CACHE_ONLY:
-        print("\nPrefetch skipped: --offline-cache-only enabled.")
-    else:
-        try:
-            print(f"\nPrefetching per-symbol kline windows into store: {store_dir} ...")
-            prefetch_symbol_windows(
-                hits,
-                entry_lag_days=ENTRY_LAG_DAYS,
-                horizon_days=max(HORIZON_DAYS, DROP_HORIZON_DAYS),
-                store_dir=store_dir,
-                dl_workers=args.dl_workers,
-            )
-            print("Prefetch done.")
-        except Exception as e:
-            print(f"NOTE: Prefetch failed (continuing anyway): {e}", file=sys.stderr)
-
-    # ALWAYS build/load ML table
+    # ---- Build or load ML table (same as before) ----
     cache_root = Path(args.cache_dir) / "_ml_table_cache"
     df_all, train_dates, predict_dates_list = get_or_build_ml_table_cached(
         hits,
@@ -2378,67 +2928,67 @@ def main() -> int:
 
     print(f"\nTotal samples (train + predict): {len(df_all)}")
     print(f"Train dates: {train_dates[0]} .. {train_dates[-1]}  ({len(train_dates)} days)")
-    if predict_dates_list:
-        print(
-            f"Predict dates (classify only): {predict_dates_list[0]} .. {predict_dates_list[-1]}  ({len(predict_dates_list)} days)"
-        )
-    else:
-        print("Predict dates (classify only): (none found yet)")
+    print(
+        f"Predict dates (classify only): "
+        f"{predict_dates_list[0]} .. {predict_dates_list[-1]}  "
+        f"({len(predict_dates_list)} days)"
+    )
 
     df_train = build_df_train_for_models(df_all, train_dates)
 
-    if df_train.empty:
-        msg = "Oversold Analysis Alert\n\nERROR: df_train is empty after labeling.\n"
+    if df_train.empty or df_train["label"].nunique() < 2:
+        msg = "Oversold Analysis Alert\n\nERROR: training set invalid.\n"
         print(msg, file=sys.stderr)
         send_email_with_analysis(msg, df=None, directory=str(folder))
         return 2
 
-    if df_train["label"].nunique() < 2:
-        msg = "Oversold Analysis Alert\n\nERROR: training labels have <2 classes.\n"
-        print(msg, file=sys.stderr)
-        send_email_with_analysis(msg, df=None, directory=str(folder))
-        return 2
-
-    # ============================
-    # MODEL: DO NOT RETRAIN unless --retrain OR no bundle exists
-    # ============================
-    bundle, model_meta, clf_main, feat_cols_main, clf_down, feat_cols_down = get_or_train_model_bundle_for_run(
-        args=args,
-        df_train=df_train,
-        train_end_date=train_end_date,
-        predict_start_date=predict_start_date,
-        store_dir=store_dir,
-        drop_pct=DROP_PCT,
-        drop_horizon_days=DROP_HORIZON_DAYS,
-        entry_lag_days=ENTRY_LAG_DAYS,
-        holdout_days=HOLDOUT_DAYS,
-        horizon_days=HORIZON_DAYS,
-        min_history_hits=MIN_HISTORY_HITS,
+    # ---- Train or load model ----
+    bundle, model_meta, clf_main, feat_cols_main, clf_down, feat_cols_down = (
+        get_or_train_model_bundle_for_run(
+            args=args,
+            df_train=df_train,
+            train_end_date=train_end_date,
+            predict_start_date=predict_start_date,
+            store_dir=store_dir,
+            drop_pct=DROP_PCT,
+            drop_horizon_days=DROP_HORIZON_DAYS,
+            entry_lag_days=ENTRY_LAG_DAYS,
+            holdout_days=HOLDOUT_DAYS,
+            horizon_days=HORIZON_DAYS,
+            min_history_hits=MIN_HISTORY_HITS,
+        )
     )
 
-    # Build feat_prob_drop10 for predict window
+    # ---- Downside feature for predict window ----
     df_all = df_all.copy()
-    if "feat_prob_drop10" not in df_all.columns:
-        df_all["feat_prob_drop10"] = 0.5
-    else:
-        df_all["feat_prob_drop10"] = pd.to_numeric(df_all["feat_prob_drop10"], errors="coerce").fillna(0.5)
+    df_all["feat_prob_drop10"] = pd.to_numeric(
+        df_all.get("feat_prob_drop10", 0.5), errors="coerce"
+    ).fillna(0.5)
 
-    df_pred_base = df_all[df_all["file_date"].isin([d.isoformat() for d in predict_dates_list])].copy()
+    df_pred_base = df_all[
+        df_all["file_date"].isin([d.isoformat() for d in predict_dates_list])
+    ].copy()
+
     if clf_down is not None and feat_cols_down is not None and not df_pred_base.empty:
         missing2 = [c for c in feat_cols_down if c not in df_pred_base.columns]
-        if missing2:
-            print(f"\nNOTE: Downside feature skipped; missing feature columns: {missing2}")
-        else:
+        if not missing2:
             X2 = df_pred_base[feat_cols_down].astype(float).values
             probs2 = clf_down.predict_proba(X2)[:, 1]
             df_all.loc[df_pred_base.index, "feat_prob_drop10"] = probs2
 
-    # Predict
-    df_pred = predict_dates(clf_main, feat_cols_main, df_all, predict_dates_list, threshold=args.threshold)
-    df_pred = df_pred[df_pred["pred_buy"] == 1].copy()
-    df_pred = df_pred[df_pred["prob_up_target_h"] >= 0.50].copy()
+    # ---- Predict buys ----
+    df_pred = predict_dates(
+        clf_main,
+        feat_cols_main,
+        df_all,
+        predict_dates_list,
+        threshold=args.threshold,
+    )
 
-    # BTC mood output-only (thread offline flag through)
+    df_pred = df_pred[df_pred["pred_buy"] == 1].copy()
+    df_pred = df_pred[df_pred["prob_up_target_h"] >= args.threshold].copy()
+
+    # ---- BTC mood filter ----
     df_pred = add_btc_mood_columns_and_filter_dates_bullish_only(
         df_pred,
         store_dir=store_dir,
@@ -2446,122 +2996,44 @@ def main() -> int:
         dl_workers=args.dl_workers,
     )
 
-    # Add entry_date
+    # ---- Entry date ----
     if not df_pred.empty:
         df_pred["entry_date"] = df_pred["file_date"].apply(
-            lambda s: (datetime.strptime(s, "%Y-%m-%d").date() + timedelta(days=ENTRY_LAG_DAYS)).isoformat()
+            lambda s: (
+                datetime.strptime(s, "%Y-%m-%d").date()
+                + timedelta(days=ENTRY_LAG_DAYS)
+            ).isoformat()
         )
 
-    # Runup calc
+    # ---- Runup stats (reporting only) ----
     if not df_pred.empty:
-        df_pred["entry_open"] = np.nan
-        df_pred["max_high_to_today"] = np.nan
-        df_pred["max_high_date"] = ""
-        df_pred["runup_to_high_pct"] = np.nan
-        df_pred["last_close_to_now"] = np.nan
-        df_pred["last_close_date"] = ""
-        df_pred["gain_to_now_pct"] = np.nan
-        df_pred["sold_at_target"] = False
-        df_pred["sell_price"] = np.nan
-        df_pred["sell_date"] = ""
-
-        def _runup_task(sym: str, entry_day: date) -> Optional[Dict[str, float]]:
-            s = get_thread_session()
-            return runup_to_high_until_today(
-                sym,
-                entry_day,
-                session=s,
-                store_dir=store_dir,
-                include_today=True,
-                target_pct=args.target_pct,
-                offline_cache_only=OFFLINE_CACHE_ONLY,
-            )
-
-        with ThreadPoolExecutor(max_workers=max(1, int(args.dl_workers))) as ex:
+        with ThreadPoolExecutor(max_workers=args.dl_workers) as ex:
             futures = {}
             for idx, r in df_pred.iterrows():
                 sym = r["symbol"]
                 entry_day = datetime.strptime(r["entry_date"], "%Y-%m-%d").date()
-                futures[ex.submit(_runup_task, sym, entry_day)] = idx
+                futures[ex.submit(
+                    runup_to_high_until_today,
+                    sym,
+                    entry_day,
+                    session=get_thread_session(),
+                    store_dir=store_dir,
+                    include_today=True,
+                    target_pct=args.target_pct,
+                    offline_cache_only=OFFLINE_CACHE_ONLY,
+                )] = idx
 
-            for fut, idx in list(futures.items()):
+            for fut, idx in futures.items():
                 info = fut.result()
-                if info is None:
-                    continue
-                df_pred.at[idx, "entry_open"] = info["entry_open"]
-                df_pred.at[idx, "max_high_to_today"] = info["max_high_to_today"]
-                df_pred.at[idx, "max_high_date"] = info["max_high_date"]
-                df_pred.at[idx, "runup_to_high_pct"] = info["runup_to_high_pct"]
-                df_pred.at[idx, "last_close_to_now"] = info.get("last_close_to_now", np.nan)
-                df_pred.at[idx, "last_close_date"] = info.get("last_close_date", "")
-                df_pred.at[idx, "gain_to_now_pct"] = info.get("gain_to_now_pct", np.nan)
-                df_pred.at[idx, "sold_at_target"] = bool(info.get("sold_at_target", False))
-                df_pred.at[idx, "sell_price"] = info.get("sell_price", np.nan)
-                df_pred.at[idx, "sell_date"] = info.get("sell_date", "")
+                if info:
+                    for k, v in info.items():
+                        df_pred.at[idx, k] = v
 
+    OUT_PATH = Path("ai_predictions.csv")
     df_pred.to_csv(OUT_PATH, index=False)
     print(f"\nWrote: {OUT_PATH}")
 
-    # ============================================================
-    # ETF MODE: open entries for each prediction day, then replay to last closed
-    # ============================================================
-    state = _load_positions()
-
-    pred_days = sorted(df_pred["file_date"].unique().tolist()) if not df_pred.empty else []
-
-    last_entry_file_date = state.get("last_entry_file_date")
-    if last_entry_file_date:
-        pred_days = [d for d in pred_days if d > last_entry_file_date]
-
-    entry_events: List[dict] = []
-    for d_str in pred_days:
-        df_day = df_pred[df_pred["file_date"] == d_str].copy()
-        entry_events: List[dict] = []
-        for d_str in pred_days:
-            df_day = df_pred[df_pred["file_date"] == d_str].copy()
-
-            # APPLY: p>0.61 OR prev_p < today_p (per symbol)
-            df_day = filter_df_day_by_entry_rule(
-                df_day,
-                state=state,
-                p_threshold=0.61,
-                p_col="prob_up_target_h",
-            )
-
-            entry_events.extend(
-                open_new_positions_from_predictions(
-                    state=state,
-                    df_pred_today=df_day,
-                    store_dir=store_dir,
-                    offline_cache_only=OFFLINE_CACHE_ONLY,
-                )
-            )
-
-    if pred_days:
-        state["last_entry_file_date"] = pred_days[-1]
-
-    symbols_needed = (
-        sorted(set(state.get("positions", {}).keys()) | set(df_pred["symbol"].tolist()))
-        if not df_pred.empty
-        else sorted(state.get("positions", {}).keys())
-    )
-
-    replay_events = update_positions_until_last_closed(
-        state=state,
-        symbols_needed=symbols_needed,
-        store_dir=store_dir,
-        entry_lag_days=ENTRY_LAG_DAYS,
-        offline_cache_only=OFFLINE_CACHE_ONLY,
-        progress=True,
-    )
-
-    new_events = entry_events + replay_events
-
-    df_pred_today = df_pred[df_pred["file_date"] == pred_days[-1]].copy() if pred_days else pd.DataFrame()
-
-    print_etf_report(state=state, new_events=new_events, df_pred_today=df_pred_today)
-    _save_positions(state)
-
+    # ---- Send email (no ETF logic anymore) ----
     body = build_email_body(
         loaded_hits=len(hits),
         df_all_len=len(df_all),
@@ -2570,14 +3042,14 @@ def main() -> int:
         df_pred=df_pred,
         threshold=args.threshold,
         target_pct=args.target_pct,
-        horizon_days=HORIZON_DAYS,
-        drop_hor=DROP_HORIZON_DAYS,
+        holdout_days=HOLDOUT_DAYS,
         model_meta=model_meta,
-        topk=TOPK,
-        stop_loss=HARD_STOP_PCT,
+        topk=40,
     )
+
     send_email_with_analysis(body, df=df_pred, directory=str(folder))
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
