@@ -198,6 +198,7 @@ def run_progressive_sweep(
     fast: bool,
 ) -> int:
     # Parameter grids requested
+
     HORIZONS = [5]
     DROP_HORIZONS = [3, 5, 7, 14, 21]
     TARGET_PCTS = [0.25]  # TP
@@ -2738,9 +2739,8 @@ def main() -> int:
     # ===================== SWEEP MODE ===========================
     # ============================================================
     if args.sweep:
-        print("\n=== PROGRESSIVE FAST SWEEP (BASE TABLE + RELABEL) ===")
+        print("\n=== PROGRESSIVE REALISTIC SWEEP (FORWARD TIME-SERIES) ===")
 
-        # Parse file counts like "10,20,40"
         sweep_file_counts = [int(x) for x in args.sweep_files.split(",") if x.strip().isdigit()]
 
         # Parameter grid
@@ -2754,9 +2754,10 @@ def main() -> int:
         for n_files in sweep_file_counts:
             print(f"\n=== SWEEP STAGE: last {n_files} files ===")
 
+            # Select most recent N files
             stage_hits = [h for h in hits if h.file_date >= file_dates[-n_files]]
 
-            # -------- BUILD BASE TABLE ONCE PER STAGE --------
+            # Build BASE table once (features only)
             df_base = build_base_feature_table(
                 stage_hits,
                 entry_lag_days=ENTRY_LAG_DAYS,
@@ -2764,8 +2765,19 @@ def main() -> int:
             )
             print(f"[SWEEP] Base table rows: {len(df_base)}")
 
-            stage_results = []
+            # Determine realistic time split (not random!)
+            stage_dates = sorted({h.file_date for h in stage_hits})
+            holdout_days = max(3, int(len(stage_dates) * 0.25))  # ~25% forward holdout
+            train_dates = stage_dates[:-holdout_days]
+            valid_dates = stage_dates[-holdout_days:]
 
+            print(
+                f"[SWEEP] Time split: "
+                f"train={train_dates[0]}..{train_dates[-1]} "
+                f"valid={valid_dates[0]}..{valid_dates[-1]}"
+            )
+
+            stage_results = []
             combo_count = 0
 
             for H in HORIZONS:
@@ -2779,6 +2791,7 @@ def main() -> int:
 
                             print(f"\n[SWEEP] H={H} DH={DH} TP={TP} DP={DP}")
 
+                            # ---- RELABEL BASE TABLE FOR THIS COMBO ----
                             df_labeled = relabel_for_combo(
                                 df_base,
                                 target_pct=TP,
@@ -2790,25 +2803,32 @@ def main() -> int:
                                 dl_workers=args.dl_workers,
                             )
 
-                            df_train = df_labeled.dropna(subset=["label"]).copy()
+                            # Split by TIME (not random)
+                            df_train = df_labeled[
+                                df_labeled["file_date"].isin([d.isoformat() for d in train_dates])
+                            ].dropna(subset=["label"]).copy()
+
+                            df_valid = df_labeled[
+                                df_labeled["file_date"].isin([d.isoformat() for d in valid_dates])
+                            ].dropna(subset=["label"]).copy()
 
                             if df_train.empty or df_train["label"].nunique() < 2:
-                                print("  -> Skipping (not enough classes)")
+                                print("  -> Skipping (not enough training classes)")
+                                continue
+
+                            if df_valid.empty:
+                                print("  -> Skipping (no forward validation rows)")
                                 continue
 
                             feature_cols = _get_feature_cols(df_train, ("label", "label_down10"))
 
-                            X = df_train[feature_cols].astype(float).values
-                            y = df_train["label"].astype(int).values
+                            # Train on PAST only
+                            X_tr = df_train[feature_cols].astype(float).values
+                            y_tr = df_train["label"].astype(int).values
 
-                            X_tr, X_va, y_tr, y_va = train_test_split(
-                                X, y, test_size=0.2, stratify=y, random_state=42
-                            )
-
-                            # Fast or full RF
                             if args.sweep_fast:
                                 clf = RandomForestClassifier(
-                                    n_estimators=100,
+                                    n_estimators=120,
                                     random_state=42,
                                     n_jobs=-1,
                                     class_weight="balanced_subsample",
@@ -2822,15 +2842,31 @@ def main() -> int:
                                 )
 
                             clf.fit(X_tr, y_tr)
+
+                            # Validate on FUTURE only
+                            X_va = df_valid[feature_cols].astype(float).values
+                            y_va = df_valid["label"].astype(int).values
+
                             p_va = clf.predict_proba(X_va)[:, 1]
                             y_hat = (p_va >= 0.5).astype(int)
 
-                            rep = classification_report(y_va, y_hat, output_dict=True)
-                            prec1 = float(rep["1"]["precision"])
-                            rec1 = float(rep["1"]["recall"])
-                            f1 = float(rep["1"]["f1-score"])
+                            # Forward (realistic) metrics
+                            tp = int(((y_hat == 1) & (y_va == 1)).sum())
+                            fp = int(((y_hat == 1) & (y_va == 0)).sum())
+                            fn = int(((y_hat == 0) & (y_va == 1)).sum())
 
-                            print(f"  prec1={prec1:.3f}  rec1={rec1:.3f}  f1={f1:.3f}")
+                            prec1 = tp / (tp + fp) if (tp + fp) else float("nan")
+                            rec1 = tp / (tp + fn) if (tp + fn) else float("nan")
+                            f1 = (
+                                2 * prec1 * rec1 / (prec1 + rec1)
+                                if (prec1 + rec1) and not math.isnan(prec1)
+                                else float("nan")
+                            )
+
+                            print(
+                                f"  REALISTIC -> prec1={prec1:.3f}  rec1={rec1:.3f}  "
+                                f"f1={f1:.3f}  buys={tp + fp}  winners={tp}"
+                            )
 
                             stage_results.append({
                                 "n_files": n_files,
@@ -2841,20 +2877,25 @@ def main() -> int:
                                 "prec1": prec1,
                                 "rec1": rec1,
                                 "f1": f1,
+                                "tp": tp,
+                                "fp": fp,
+                                "fn": fn,
+                                "train_rows": len(df_train),
+                                "valid_rows": len(df_valid),
                             })
 
             df_stage = pd.DataFrame(stage_results).sort_values("f1", ascending=False)
-            print(f"\n=== TOP {args.sweep_topk} for {n_files} files ===")
+            print(f"\n=== TOP {args.sweep_topk} FOR {n_files} FILES ===")
             print(df_stage.head(args.sweep_topk).to_string(index=False))
 
             all_results.extend(stage_results)
 
         df_all = pd.DataFrame(all_results).sort_values("f1", ascending=False)
-        out = Path("sweep_results_progressive.csv")
+        out = Path("sweep_results_realistic.csv")
         df_all.to_csv(out, index=False)
-        print(f"\nSaved full sweep results to: {out}")
+        print(f"\nSaved realistic sweep results to: {out}")
 
-        return 0  # EXIT after sweep
+        return 0
 
     # ============================================================
     # ================ NORMAL (NON-SWEEP) PATH ===================
