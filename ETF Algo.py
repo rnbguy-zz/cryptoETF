@@ -437,6 +437,7 @@ def run_replay_single_position(
 ) -> None:
     session = requests.Session()
     cache = load_cache(cache_path)
+    last_p_by_symbol: Dict[str, float] = {}
 
     # Build signals by ENTRY day (file_date + lag)
     sig_by_entry_day: Dict[date, List[Signal]] = {}
@@ -577,8 +578,37 @@ def run_replay_single_position(
                         print(line)
 
             # pick best signal for this day (highest p if present, else first)
-            entry_signals_sorted = sorted(entry_signals, key=lambda s: (s.p, s.symbol), reverse=True)
-            chosen = entry_signals_sorted[0]
+            # Build best-p-per-symbol for TODAY (entry day d)
+            best_today_by_symbol: Dict[str, Signal] = {}
+            for s in entry_signals:
+                cur = best_today_by_symbol.get(s.symbol)
+                if cur is None or s.p > cur.p:
+                    best_today_by_symbol[s.symbol] = s
+
+            # Eligibility rule:
+            # Buy only if p > 0.61 OR previous p for same symbol is lower than today's p
+            eligible: List[Signal] = []
+            for sym, s in best_today_by_symbol.items():
+                prev_p = last_p_by_symbol.get(sym)
+
+                p_ok = (s.p > 0.61)
+                trend_ok = (prev_p is not None and s.p > 0.0 and prev_p < s.p)
+
+                if p_ok or trend_ok:
+                    eligible.append(s)
+
+            if not eligible:
+                # Still update last_p_by_symbol so tomorrow can compare against today's p
+                for sym, s in best_today_by_symbol.items():
+                    last_p_by_symbol[sym] = s.p
+
+                print("\n(note) Signals present but none passed entry filter: require p>0.61 OR prev_p < today_p.")
+                d += timedelta(days=1)
+                continue
+
+            # pick best eligible signal for this day (highest p, then symbol)
+            eligible.sort(key=lambda s: (s.p, s.symbol), reverse=True)
+            chosen = eligible[0]
             chosen_sym = chosen.symbol
 
             # ROTATE if currently holding something else:
@@ -654,6 +684,10 @@ def run_replay_single_position(
                     print(f"\n(note) Signal for {chosen_sym} arrived but already holding it. No action.")
                 else:
                     print(f"\n(note) Signal for {chosen_sym} arrived but still holding {pos.symbol}. No entry.")
+
+            # Update last seen p for all symbols that had signals today (entry day)
+            for sym, s in best_today_by_symbol.items():
+                last_p_by_symbol[sym] = s.p
 
         d += timedelta(days=1)
 
