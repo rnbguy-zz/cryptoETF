@@ -1,33 +1,5 @@
 #!/usr/bin/env python3
 """
-etf_replay_from_signals_single_position.py
-
-ALIGNMENT + REALISM + SINGLE-POSITION ROTATION
-
-What’s different vs your current replay:
-1) Ambiguous TP+SL same day:
-   - Default fallback is SL-first (matches your label logic).
-   - Still can resolve via intraday candles if enabled.
-
-2) Horizon-bounded exits (aligns with labeling):
-   - --max-hold-days (default 21): if still OPEN on/after entry_day+max_hold_days => exit at that day's CLOSE.
-
-3) Optional strategy exits (same knobs you were using elsewhere):
-   - --trail-pct (default 0.12): exit if CLOSE <= peak_close*(1-trail_pct)
-   - --time-stop-days (default 14) and --time-stop-min-gain (default 0.05):
-        if age>=days and CLOSE < entry*(1+min_gain) => exit at CLOSE
-
-4) SINGLE POSITION at a time (your new requirement):
-   - If a new entry signal arrives while holding something, we ROTATE:
-       - Exit current at PREVIOUS DAY close (d-1 close) right before buying the new coin on day d open.
-       - Then enter the chosen new coin on day d open.
-   - If multiple signals arrive for the same entry day, we pick the one with the highest parsed p=... if present,
-     otherwise first encountered.
-
-Signals format supported:
-  file=YYYY-MM-DD
-  BUY SYMBOL ... (optional: p=0.781)
-
 Usage:
   python etf_replay_from_signals_single_position.py --signals-file signals.txt
 
