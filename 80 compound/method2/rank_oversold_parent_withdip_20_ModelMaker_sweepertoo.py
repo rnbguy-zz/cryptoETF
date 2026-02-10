@@ -8,6 +8,7 @@ Allow smaller leaves (more sensitivity): min_samples_leaf=1 (can raise recall, m
 '''
 
 from __future__ import annotations
+
 import argparse
 import os
 import re
@@ -25,33 +26,26 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import requests
 import joblib
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn import __version__ as sklearn_version
-from itertools import product
-import math
-import traceback
 
+
+#20% gains but only works on symbols p> 61%!!!!!!!!!!!!!! (or trial if it went up slightly from previous day)
 
 HOLDOUT_DAYS = 5
 ENTRY_LAG_DAYS = 1
-
+HORIZON_DAYS = 7 #21 change back before using this model
+DROP_HORIZON_DAYS = 5
 DROP_PCT = 0.12 #0.1 change back before using this model
 OFFLINE_CACHE_ONLY = 0
-
-# Sweep config
-HORIZONS = [21]
-DROP_HORIZONS = [21]
-TPS = [0.2]
-DROPS = [0.11]
-HARD_STOP_PCT = 0.1
-MIN_HISTORY_HITS = 3
-
 
 # ============================================================
 # EMAIL CONFIG (ENV VARS ONLY FOR PASSWORD)
@@ -63,8 +57,25 @@ SENDER_PASSWORD = os.getenv("OVERSOLD_SENDER_PASSWORD", "qhvi syra bbad gylu")  
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
+import json
+POSITIONS_PATH = Path("positions_etf.json")
+TRAIL_PCT = 0.12          # 12% off peak
+TP_PCT = 0.20             # +20%
+TP_FRACTION = 0.1        # sell half
+HARD_STOP_PCT = 0.1
+TIME_STOP_DAYS = 14
+TIME_STOP_MIN_GAIN = 0.05 # +5%
+MIN_HISTORY_HITS = 3
 
+# Parameter grid
+HORIZONS = [21]
+DROP_HORIZONS = [21]
+TPS = [0.2]
+DROPS = [0.12]
 
+from itertools import product
+import math
+import traceback
 
 def _parse_int_list(s: str) -> List[int]:
     return [int(x.strip()) for x in str(s).split(",") if x.strip()]
@@ -110,11 +121,7 @@ def filter_df_day_by_entry_rule(
         p_today = float(p_today_raw)
         prev_p = last_p_by_symbol.get(sym)
 
-        # allow if rising vs yesterday
-        if (prev_p is not None and p_today > prev_p):
-            allowed_syms.add(sym)
-        # otherwise only allow if it clears the hard threshold
-        elif p_today >= float(p_threshold):
+        if (p_today > float(p_threshold)) or (prev_p is not None and p_today > prev_p):
             allowed_syms.add(sym)
 
     # IMPORTANT: update memory for all symbols that appeared today (even if not allowed),
@@ -131,15 +138,6 @@ def filter_df_day_by_entry_rule(
 
     return df_day[df_day["symbol"].astype(str).isin(allowed_syms)].copy()
 
-
-
-
-def _pct(x: float) -> float:
-    return float(x) * 100.0
-
-
-def _iso(d: date) -> str:
-    return d.isoformat()
 
 
 # ============================================================
@@ -656,6 +654,9 @@ def label_drop_pct_within_horizon(
 
 
 
+
+
+
 def build_df_train_for_models(
     df_all: pd.DataFrame,
     train_dates: List[date],
@@ -749,7 +750,6 @@ def _stable_int(x) -> int:
 
 
 
-
 # ============================================================
 # MODEL PERSISTENCE + GATING
 # ============================================================
@@ -765,6 +765,8 @@ print("Default exists:", DEFAULT_MODEL_BUNDLE_PATH, DEFAULT_MODEL_BUNDLE_PATH.ex
 GATE_MIN_PREC1 = 0.7799
 GATE_MIN_SUP1 = 410
 
+
+
 # ============================================================
 # TRAINING HELPERS
 # ============================================================
@@ -777,8 +779,6 @@ def _rf_default(seed: int = 42) -> RandomForestClassifier:
         max_depth=None,
         min_samples_leaf=2,
     )
-
-
 
 def _get_feature_cols(
     df: pd.DataFrame,
@@ -1096,41 +1096,21 @@ def relabel_for_combo(
             tp_hit = (highs >= tp_px).fillna(False).values
             sl_hit = (lows <= sl_px).fillna(False).values
 
-            if not tp_hit.any():
+            if not bool(tp_hit.any()):
                 return 0.0
 
-            # first day TP happens
-            first_tp_idx = int(np.argmax(tp_hit))
+            first_tp_idx = int(np.argmax(tp_hit))  # valid because tp_hit.any() is true
 
-            # first day SL happens (if any)
-            first_sl_idx = int(np.argmax(sl_hit)) if sl_hit.any() else None
+            # If SL occurs before TP, it's NOT class 1.
+            # If SL occurs on the same day as TP:
+            #   - if sl_same_day_counts_as_first=True -> NOT class 1
+            #   - else -> allow TP (treat as TP-first)
+            if sl_same_day_counts_as_first:
+                sl_before_or_same = bool(sl_hit[: first_tp_idx + 1].any())
+            else:
+                sl_before_or_same = bool(sl_hit[: first_tp_idx].any())
 
-            # If SL never happens -> TP happened -> class 1
-            if first_sl_idx is None:
-                return 1.0
-
-            # If TP day strictly before SL day -> TP-first -> class 1
-            if first_tp_idx < first_sl_idx:
-                return 1.0
-
-            # If SL day strictly before TP day -> SL-first -> class 0
-            if first_sl_idx < first_tp_idx:
-                return 0.0
-
-            # Same day (TP and SL first hit day are the same) -> dig deeper intraday
-            same_day = ww.loc[first_tp_idx, "day"]
-            order = _tp_sl_order_intraday(
-                sym,
-                same_day,
-                tp_px=tp_px,
-                sl_px=sl_px,
-                interval="1m",  # or make this an arg
-                session=session,
-                ambiguous_fallback="sl-first",  # conservative
-            )
-
-            return 1.0 if order == "TP" else 0.0
-
+            return 0.0 if sl_before_or_same else 1.0
         except Exception:
             return np.nan
 
@@ -1364,7 +1344,7 @@ def main() -> int:
 
             # Determine realistic time split (not random!)
             stage_dates = sorted({h.file_date for h in stage_hits})
-            holdout_days = HOLDOUT_DAYS #max(3, int(len(stage_dates) * 0.25))  # ~25% forward holdout
+            holdout_days = max(3, int(len(stage_dates) * 0.25))  # ~25% forward holdout
             train_dates = stage_dates[:-holdout_days]
             valid_dates = stage_dates[-holdout_days:]
 
@@ -1448,38 +1428,8 @@ def main() -> int:
                             p_va = clf.predict_proba(X_va)[:, 1]
                             y_hat = (p_va >= 0.61).astype(int)
 
-                            # ---- PRINT / SAVE HOLDOUT PREDICTIONS ----
                             df_pred_hold = df_valid[["file_date", "symbol"]].copy()
-                            df_pred_hold["p"] = p_va
-                            df_pred_hold["pred_buy"] = (df_pred_hold["p"] >= float(args.threshold)).astype(int)
-
-                            # keep only buys (optional)
-                            df_buys = df_pred_hold[df_pred_hold["pred_buy"] == 1].copy()
-
-                            TOPN_PER_DAY = 20  # change as you like
-
-                            if df_buys.empty:
-                                print("  [HOLDOUT PRED] No buys in holdout window.")
-                            else:
-                                print(f"  [HOLDOUT PRED] Showing top {TOPN_PER_DAY} per day (p>={args.threshold})")
-                                for d in sorted(df_buys["file_date"].unique()):
-                                    dd = df_buys[df_buys["file_date"] == d].sort_values("p", ascending=False).head(
-                                        TOPN_PER_DAY)
-                                    print(f"\n  HOLDOUT day={d}  buys={len(dd)}")
-                                    for _, r in dd.iterrows():
-                                        print(f"    BUY {r['symbol']:<12s} p={r['p']:.3f}")
-
-                            # optional: write a CSV per combo
-                            out_dir = Path("sweep_holdout_preds")
-                            out_dir.mkdir(parents=True, exist_ok=True)
-                            out_path = out_dir / f"holdout_preds_n{n_files}_H{H}_DH{DH}_TP{TP}_DP{DP}.csv"
-                            df_pred_hold.sort_values(["file_date", "p"], ascending=[True, False]).to_csv(out_path,
-                                                                                                         index=False)
-                            df_pred_hold["entry_date"] = (
-                                    pd.to_datetime(df_pred_hold["file_date"]) + pd.to_timedelta(ENTRY_LAG_DAYS,
-                                                                                                unit="D")
-                            ).dt.strftime("%Y-%m-%d")
-                            print(f"  [HOLDOUT PRED] Wrote: {out_path}")
+                            print('Predictions!!!',df_pred_hold)
 
                             # Forward (realistic) metrics
                             tp = int(((y_hat == 1) & (y_va == 1)).sum())
@@ -1526,24 +1476,7 @@ def main() -> int:
         df_all.to_csv(out, index=False)
         print(f"\nSaved realistic sweep results to: {out}")
 
-        # ---- Send email (no ETF logic anymore) ----
-        topk = min(20, len(df_all))
-        body_lines = []
-        body_lines.append("SWEEP RESULTS (realistic forward holdout)")
-        body_lines.append("=" * 60)
-        body_lines.append(f"Folder: {folder}")
-        body_lines.append(f"Latest file date: {latest_file_date}")
-        body_lines.append(f"Stages tested: {sweep_file_counts}")
-        body_lines.append(f"Total combos evaluated: {len(df_all)}")
-        body_lines.append("")
-        body_lines.append(f"TOP {topk} rows from sweep_results_realistic.csv:")
-        body_lines.append(df_all.head(topk).to_string(index=False))
-        body = "\n".join(body_lines)
-
-        # attach df_all as filtered_output.csv (send_email_with_analysis already does that)
-        #send_email_with_analysis(body, df=df_all, directory=str(folder))
-
-        return 0
+    return 0
 
 
 if __name__ == "__main__":
