@@ -71,8 +71,8 @@ MIN_HISTORY_HITS = 3
 HORIZONS       = [21]
 DROP_HORIZONS  = [21]
 TARGET_PCTS    = [0.20]
-SL_PCTS        = [0.10, 0.12]    # stop-loss used ONLY for SL-not-first labeling (UP label)
-DROP_PCTS      = [0.10, 0.12]    # drop used ONLY for downside label (label_down10) + drop feature
+SL_PCTS        = [0.12]    # stop-loss used ONLY for SL-not-first labeling (UP label)
+DROP_PCTS      = [0.12]    # drop used ONLY for downside label (label_down10) + drop feature
 
 # -------------------------
 # PROD/ETF (SINGLE) VALUES
@@ -99,8 +99,7 @@ SENDER_PASSWORD = os.getenv("OVERSOLD_SENDER_PASSWORD", "qhvi syra bbad gylu")  
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
-
-
+POSITIONS_PATH = Path(__file__).parent / "positions_etf.json"
 
 def _parse_int_list(s: str) -> List[int]:
     return [int(x.strip()) for x in str(s).split(",") if x.strip()]
@@ -828,29 +827,43 @@ def filter_df_day_by_entry_rule(
 
 
 def _load_positions(path: Path = POSITIONS_PATH) -> dict:
-    base = {"asof_day": None, "positions": {}, "events": [], "last_p_by_symbol": {}, "last_entry_file_date": None}
-    if not path.exists():
-        return base
+    """
+    Load the ETF positions ledger from JSON.
+    Returns {} if file does not exist or is empty/corrupt.
+    """
     try:
-        obj = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(obj, dict):
-            return base
-        for k, v in base.items():
-            obj.setdefault(k, v)
-        if not isinstance(obj.get("last_p_by_symbol"), dict):
-            obj["last_p_by_symbol"] = {}
-        return obj
-    except Exception:
-        return base
+        path = Path(path)
+        if not path.exists():
+            return {}
+
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return {}
+
+        return data
+
+    except Exception as e:
+        print(f"[POSITIONS] Failed to load {path}: {e}", file=sys.stderr)
+        return {}
 
 
 
-def _save_positions(state: dict, path: Path = POSITIONS_PATH) -> None:
+
+def _save_positions(positions: dict, path: Path = POSITIONS_PATH) -> None:
+    """
+    Atomically save positions ledger to JSON.
+    """
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
 
+    tmp = path.with_suffix(".tmp")
+
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(positions, f, indent=2, sort_keys=True)
+
+    tmp.replace(path)
 
 def _pct(x: float) -> float:
     return float(x) * 100.0
