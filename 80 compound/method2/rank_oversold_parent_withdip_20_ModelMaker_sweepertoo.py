@@ -8,7 +8,6 @@ Allow smaller leaves (more sensitivity): min_samples_leaf=1 (can raise recall, m
 '''
 
 from __future__ import annotations
-
 import argparse
 import os
 import re
@@ -26,24 +25,20 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 import requests
 import joblib
-
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn import __version__ as sklearn_version
-
-
-#20% gains but only works on symbols p> 61%!!!!!!!!!!!!!! (or trial if it went up slightly from previous day)
+from itertools import product
+import math
+import traceback
 
 HOLDOUT_DAYS = 5
 ENTRY_LAG_DAYS = 1
-HORIZON_DAYS = 7 #21 change back before using this model
-DROP_HORIZON_DAYS = 5
 DROP_PCT = 0.12 #0.1 change back before using this model
 OFFLINE_CACHE_ONLY = 0
 
@@ -57,14 +52,6 @@ SENDER_PASSWORD = os.getenv("OVERSOLD_SENDER_PASSWORD", "qhvi syra bbad gylu")  
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
-import json
-POSITIONS_PATH = Path("positions_etf.json")
-TRAIL_PCT = 0.12          # 12% off peak
-TP_PCT = 0.20             # +20%
-TP_FRACTION = 0.1        # sell half
-HARD_STOP_PCT = 0.1
-TIME_STOP_DAYS = 14
-TIME_STOP_MIN_GAIN = 0.05 # +5%
 MIN_HISTORY_HITS = 3
 
 # Parameter grid
@@ -73,9 +60,6 @@ DROP_HORIZONS = [21]
 TPS = [0.2]
 DROPS = [0.12]
 
-from itertools import product
-import math
-import traceback
 
 def _parse_int_list(s: str) -> List[int]:
     return [int(x.strip()) for x in str(s).split(",") if x.strip()]
@@ -1243,6 +1227,49 @@ def _missing_days_in_window(df_window: pd.DataFrame, start_day: date, end_day: d
         d += timedelta(days=1)
     return missing
 
+def send_email_with_attachments(
+    subject: str,
+    body: str,
+    attachments: List[Path],
+    *,
+    sender: str = SENDER_EMAIL,
+    recipient: str = RECIPIENT_EMAIL,
+    password: Optional[str] = SENDER_PASSWORD,
+) -> None:
+    if not password:
+        print("NOTE: OVERSOLD_SENDER_PASSWORD not set; skipping email.")
+        return
+
+    msg = MIMEMultipart()
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    for p in attachments:
+        try:
+            p = Path(p)
+            if not p.exists():
+                print(f"NOTE: attachment missing, skipping: {p}")
+                continue
+
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(p.read_bytes())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{p.name}"')
+            msg.attach(part)
+        except Exception as e:
+            print(f"NOTE: failed attaching {p}: {e}")
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.sendmail(sender, recipient, msg.as_string())
+        print(f"Email sent to {recipient} with {len(attachments)} attachment(s).")
+    except Exception as e:
+        print(f"ERROR: email send failed: {e}")
+
 
 # ============================================================
 # MAIN
@@ -1429,7 +1456,23 @@ def main() -> int:
                             y_hat = (p_va >= 0.61).astype(int)
 
                             df_pred_hold = df_valid[["file_date", "symbol"]].copy()
-                            print('Predictions!!!',df_pred_hold)
+                            df_preds = df_valid[["file_date", "symbol"]].copy()
+                            df_preds["prob"] = p_va
+                            df_preds["pred"] = y_hat
+                            df_preds["true"] = y_va
+
+                            # Print predictions by day (sorted by prob desc)
+                            print("\n=== PREDICTIONS BY DAY (HOLDOUT) ===")
+                            for day, g in df_preds.groupby("file_date", sort=True):
+                                gg = g.sort_values("prob", ascending=False)
+                                print(f"\n--- {day} (rows={len(gg)}) ---")
+                                print(gg[["symbol", "prob", "pred", "true"]].to_string(index=False))
+
+                            # Save predictions to CSV (overwrite each stage/combo; your lists are single-value anyway)
+                            pred_out = Path("sweep_predictions_by_day.csv")
+                            df_preds.sort_values(["file_date", "prob"], ascending=[True, False]).to_csv(pred_out,
+                                                                                                        index=False)
+                            print(f"\nSaved predictions to: {pred_out}")
 
                             # Forward (realistic) metrics
                             tp = int(((y_hat == 1) & (y_va == 1)).sum())
