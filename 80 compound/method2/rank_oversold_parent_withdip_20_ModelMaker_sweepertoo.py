@@ -41,7 +41,9 @@ HOLDOUT_DAYS = 5
 ENTRY_LAG_DAYS = 1
 DROP_PCT = 0.12 #0.1 change back before using this model
 OFFLINE_CACHE_ONLY = 0
-
+HARD_STOP_PCT = 0.1
+HORIZON_DAYS = 21
+DROP_HORIZON_DAYS= 21
 # ============================================================
 # EMAIL CONFIG (ENV VARS ONLY FOR PASSWORD)
 # ============================================================
