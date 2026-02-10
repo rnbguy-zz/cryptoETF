@@ -74,12 +74,12 @@ def filter_df_day_by_entry_rule(
     df_day: pd.DataFrame,
     *,
     state: dict,
-    p_threshold: float = 0.61,
+    p_threshold: float = 0.55,
     p_col: str = "prob_up_target_h",
 ) -> pd.DataFrame:
     """
     Keep a row if:
-      - p > 0.61 OR
+      - p > 0.55 OR
       - previous day's p for that symbol is lower than today's p
 
     Uses state["last_p_by_symbol"] as memory across days/runs.
@@ -841,7 +841,7 @@ def train_and_report(
     clf.fit(X_tr, y_tr)
 
     p_va = clf.predict_proba(X_va)[:, 1]
-    y_hat = (p_va >= 0.61).astype(int)
+    y_hat = (p_va >= 0.55).astype(int)
 
     try:
         auc = roc_auc_score(y_va, p_va)
@@ -1455,26 +1455,61 @@ def main() -> int:
                             y_va = df_valid["label"].astype(int).values
 
                             p_va = clf.predict_proba(X_va)[:, 1]
-                            y_hat = (p_va >= 0.61).astype(int)
+                            y_hat = (p_va >= 0.55).astype(int)
 
-                            df_pred_hold = df_valid[["file_date", "symbol"]].copy()
                             df_preds = df_valid[["file_date", "symbol"]].copy()
                             df_preds["prob"] = p_va
                             df_preds["pred"] = y_hat
                             df_preds["true"] = y_va
 
-                            # Print predictions by day (sorted by prob desc)
-                            print("\n=== PREDICTIONS BY DAY (HOLDOUT) ===")
-                            for day, g in df_preds.groupby("file_date", sort=True):
-                                gg = g.sort_values("prob", ascending=False)
-                                print(f"\n--- {day} (rows={len(gg)}) ---")
-                                print(gg[["symbol", "prob", "pred", "true"]].to_string(index=False))
+                            # keep ONLY 1s
+                            df_ones = df_preds[df_preds["pred"] == 1].copy()
 
-                            # Save predictions to CSV (overwrite each stage/combo; your lists are single-value anyway)
-                            pred_out = Path("sweep_predictions_by_day.csv")
-                            df_preds.sort_values(["file_date", "prob"], ascending=[True, False]).to_csv(pred_out,
-                                                                                                        index=False)
-                            print(f"\nSaved predictions to: {pred_out}")
+                            print("\n=== PREDICTIONS BY DAY (HOLDOUT) - ONLY 1s ===")
+                            if df_ones.empty:
+                                print("No predicted 1s in holdout.")
+                            else:
+                                for day, g in df_ones.groupby("file_date", sort=True):
+                                    gg = g.sort_values("prob", ascending=False)
+                                    print(f"\n--- {day} (rows={len(gg)}) ---")
+                                    print(gg[["symbol", "prob", "pred", "true"]].to_string(index=False))
+
+                            pred_out = Path("sweep_predictions_by_day_ONLY_1s.csv")
+                            df_ones.sort_values(["file_date", "prob"], ascending=[True, False]).to_csv(pred_out,
+                                                                                                       index=False)
+                            print(f"\nSaved ONLY-1s predictions to: {pred_out}")
+
+                            # ===== ALSO WRITE TO signals.txt (LAST 5 DAYS, TOP 5 PER DAY) =====
+                            signals_path = Path("signals.txt")
+
+                            if df_ones.empty:
+                                print("No 1s to write to signals.txt")
+                            else:
+                                # get last 5 unique days (sorted)
+                                last_5_days = sorted(df_ones["file_date"].unique())[-5:]
+
+                                lines = []
+                                for day in last_5_days:
+                                    day_rows = (
+                                        df_ones[df_ones["file_date"] == day]
+                                        .sort_values("prob", ascending=False)
+                                        .head(5)
+                                    )
+
+                                    lines.append(f"file={day}  (top 5)")
+
+                                    if day_rows.empty:
+                                        lines.append("NO SIGNALS")
+                                    else:
+                                        for _, r in day_rows.iterrows():
+                                            lines.append(f"BUY  {r['symbol']:<12} p={r['prob']:.3f}")
+
+                                    lines.append("")  # blank line between days
+
+                                signals_text = "\n".join(lines).strip() + "\n"
+                                signals_path.write_text(signals_text)
+
+                                print(f"Saved signals to: {signals_path}")
 
                             # Forward (realistic) metrics
                             tp = int(((y_hat == 1) & (y_va == 1)).sum())
