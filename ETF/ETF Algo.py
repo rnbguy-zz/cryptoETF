@@ -1097,20 +1097,25 @@ def run_replay_single_position(
                     best_today_by_symbol[s.symbol] = s
 
             # Entry filter: p > 0.61 OR prev_p < today_p (and today_p>0)
+            # Entry filter (new rule):
+            # - If symbol seen before: require today's p > last time's p (and still >= 0.60)
             eligible: List[Signal] = []
             for sym, s in best_today_by_symbol.items():
                 prev_p = last_p_by_symbol.get(sym)
-                p_ok = (s.p >= 0.61)
-                trend_ok = (prev_p is not None and s.p > 0.0 and prev_p < s.p)
-                if p_ok or trend_ok:
-                    eligible.append(s)
 
+                not_seen_before_and_ok = (prev_p is None and s.p >= 0.60)
+                higher_than_prev = (prev_p is not None and s.p > prev_p)  # rule 3 (covers rule 1 too)
+
+                if not_seen_before_and_ok or higher_than_prev:
+                    eligible.append(s)
             if not eligible:
                 for sym, s in best_today_by_symbol.items():
                     last_p_by_symbol[sym] = s.p
-                print("\n(note) Signals present but none passed entry filter: require p>0.61 OR prev_p < today_p.")
+                print("\n(note) Signals present but none passed entry filter: "
+                      "new symbols need p>=0.60; previously-seen symbols need p>=0.60 AND p>prev_p.")
                 d += timedelta(days=1)
                 continue
+
 
             eligible.sort(key=lambda s: (s.p, s.symbol), reverse=True)
             chosen = eligible[0]
