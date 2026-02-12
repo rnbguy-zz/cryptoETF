@@ -1,15 +1,33 @@
 #!/usr/bin/env python3
 """
-Usage:
-  python etf_replay_from_signals_single_position.py --signals-file signals.txt
+ETF Algo.py  (SINGLE POSITION ROTATION replay + OPTIONAL Binance Spot OCO prompt)
 
-Common knobs:
-  --tp-pct 0.20 --sl-pct 0.10 --max-hold-days 21 --ambiguous-fallback sl-first --intraday-interval 1m
+You chose Option B:
+- If the REPLAY ends with an OPEN position, prompt to manage THAT coin on Binance:
+    - If you already have exits open -> do nothing
+    - Else if you already hold the coin -> place OCO exits on FREE qty (or fallback TP then monitor SL)
+    - Else (not holding) -> ask to BUY it, then place OCO exits
+
+Replay keeps ALL its existing history/summary/compound prints.
+
+DRY RUN vs LIVE:
+- default: DRY RUN (prints what it would do)
+- to place real orders:
+    --live-trade
+    set env vars:
+      BINANCE_API_KEY
+      BINANCE_API_SECRET
+
+Usage:
+  python ETF Algo.py --signals-file signals.txt --tp-pct 0.20 --sl-pct 0.12 --max-hold-days 21 \
+    --ambiguous-fallback sl-first --intraday-interval 1m --ask-to-buy-today --live-trade
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -17,19 +35,21 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 import requests
 
 
-# ----------------------------
+# =============================================================================
 # Parsing signals
-# ----------------------------
+# =============================================================================
 
 FILE_RE = re.compile(r"^\s*file=(\d{4}-\d{2}-\d{2})\b")
 BUY_RE = re.compile(r"^\s*BUY\s+([A-Z0-9]+)\b")
-P_RE = re.compile(r"\bp=([0-9]*\.?[0-9]+)\b")
+P_RE = re.compile(r"\bp\s*=\s*([0-9]*\.?[0-9]+)\b")  # parses "p=0.563" if present
 
 
 @dataclass(frozen=True)
@@ -37,7 +57,7 @@ class Signal:
     file_date: date
     symbol: str
     raw_line: str
-    p: float  # optional; 0.0 if missing
+    p: float  # 0.0 if missing
 
 
 def parse_signals_text(text: str) -> Tuple[List[Signal], Dict[date, List[str]]]:
@@ -72,9 +92,9 @@ def load_signals_file(path: Path) -> Tuple[List[Signal], Dict[date, List[str]]]:
     return parse_signals_text(text)
 
 
-# ----------------------------
+# =============================================================================
 # Binance klines + caching
-# ----------------------------
+# =============================================================================
 
 BINANCE_BASE = "https://api.binance.com"
 KLINES_EP = "/api/v3/klines"
@@ -297,9 +317,9 @@ def get_intraday_cached_for_day(
     return out
 
 
-# ----------------------------
+# =============================================================================
 # Strategy
-# ----------------------------
+# =============================================================================
 
 @dataclass
 class Position:
@@ -385,9 +405,537 @@ def evaluate_exit_realistic(
     return None
 
 
-# ----------------------------
+# =============================================================================
+# Binance trading (signed REST) + rounding helpers
+# =============================================================================
+
+class BinanceHTTPError(RuntimeError):
+    pass
+
+
+class BinanceClient:
+    def __init__(self, api_key: str, api_secret: str, base_url: str = BINANCE_BASE) -> None:
+        self.api_key = api_key
+        self.api_secret = api_secret.encode("utf-8")
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.session.headers.update({"X-MBX-APIKEY": self.api_key})
+
+        self._time_offset_ms = 0
+        self._sync_time()
+
+    def _sync_time(self) -> None:
+        try:
+            j = self.session.get(self.base_url + "/api/v3/time", timeout=10).json()
+            server_ms = int(j["serverTime"])
+            local_ms = int(time.time() * 1000)
+            self._time_offset_ms = server_ms - local_ms
+        except Exception:
+            self._time_offset_ms = 0
+
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000) + int(self._time_offset_ms)
+
+    def _sign_query(self, params: dict) -> str:
+        qs = urlencode(params, doseq=True)
+        sig = hmac.new(self.api_secret, qs.encode("utf-8"), hashlib.sha256).hexdigest()
+        return qs + "&signature=" + sig
+
+    def _raise_binance(self, r: requests.Response) -> None:
+        try:
+            body = r.text
+        except Exception:
+            body = "<no body>"
+        raise BinanceHTTPError(f"HTTP {r.status_code} {r.reason} for {r.url}\nResponse: {body}")
+
+    def _get(self, path: str, params: dict, signed: bool = False, timeout: int = 30):
+        url = self.base_url + path
+
+        if not signed:
+            r = self.session.get(url, params=params, timeout=timeout)
+            if not r.ok:
+                self._raise_binance(r)
+            return r.json()
+
+        p = dict(params)
+        p["timestamp"] = self._now_ms()
+        p.setdefault("recvWindow", 20000)
+
+        qs = self._sign_query(p)
+        full_url = url + "?" + qs
+        r = self.session.get(full_url, timeout=timeout)
+
+        if r.status_code == 400:
+            try:
+                j = r.json()
+                if isinstance(j, dict) and j.get("code") == -1021:
+                    self._sync_time()
+                    p["timestamp"] = self._now_ms()
+                    qs = self._sign_query(p)
+                    full_url = url + "?" + qs
+                    r = self.session.get(full_url, timeout=timeout)
+            except Exception:
+                pass
+
+        if not r.ok:
+            self._raise_binance(r)
+        return r.json()
+
+    def _post(self, path: str, params: dict, signed: bool = True, timeout: int = 30):
+        url = self.base_url + path
+
+        if not signed:
+            r = self.session.post(url, params=params, timeout=timeout)
+            if not r.ok:
+                self._raise_binance(r)
+            return r.json()
+
+        p = dict(params)
+        p["timestamp"] = self._now_ms()
+        p.setdefault("recvWindow", 20000)
+
+        qs = self._sign_query(p)
+        full_url = url + "?" + qs
+        r = self.session.post(full_url, timeout=timeout)
+
+        if r.status_code == 400:
+            try:
+                j = r.json()
+                if isinstance(j, dict) and j.get("code") == -1021:
+                    self._sync_time()
+                    p["timestamp"] = self._now_ms()
+                    qs = self._sign_query(p)
+                    full_url = url + "?" + qs
+                    r = self.session.post(full_url, timeout=timeout)
+            except Exception:
+                pass
+
+        if not r.ok:
+            self._raise_binance(r)
+        return r.json()
+
+    def _delete(self, path: str, params: dict, signed: bool = True, timeout: int = 30):
+        url = self.base_url + path
+
+        if not signed:
+            r = self.session.delete(url, params=params, timeout=timeout)
+            if not r.ok:
+                self._raise_binance(r)
+            return r.json()
+
+        p = dict(params)
+        p["timestamp"] = self._now_ms()
+        p.setdefault("recvWindow", 20000)
+
+        qs = self._sign_query(p)
+        full_url = url + "?" + qs
+        r = self.session.delete(full_url, timeout=timeout)
+
+        if r.status_code == 400:
+            try:
+                j = r.json()
+                if isinstance(j, dict) and j.get("code") == -1021:
+                    self._sync_time()
+                    p["timestamp"] = self._now_ms()
+                    qs = self._sign_query(p)
+                    full_url = url + "?" + qs
+                    r = self.session.delete(full_url, timeout=timeout)
+            except Exception:
+                pass
+
+        if not r.ok:
+            self._raise_binance(r)
+        return r.json()
+
+    # ----- endpoints -----
+
+    def exchange_info(self, symbol: str) -> dict:
+        return self._get("/api/v3/exchangeInfo", {"symbol": symbol}, signed=False)
+
+    def account(self) -> dict:
+        return self._get("/api/v3/account", {}, signed=True)
+
+    def ticker_price(self, symbol: str) -> float:
+        j = self._get("/api/v3/ticker/price", {"symbol": symbol}, signed=False)
+        return float(j["price"])
+
+    def open_orders(self, symbol: str) -> list:
+        return self._get("/api/v3/openOrders", {"symbol": symbol}, signed=True)
+
+    def cancel_order(self, symbol: str, order_id: int) -> dict:
+        return self._delete("/api/v3/order", {"symbol": symbol, "orderId": order_id}, signed=True)
+
+    def market_buy_quote_qty(self, symbol: str, quote_qty: Decimal) -> dict:
+        return self._post("/api/v3/order", {
+            "symbol": symbol,
+            "side": "BUY",
+            "type": "MARKET",
+            "quoteOrderQty": f"{quote_qty:f}",
+            "newOrderRespType": "FULL",
+        }, signed=True)
+
+    def oco_sell(self, symbol: str, quantity: Decimal, tp_price: Decimal, sl_stop: Decimal, sl_limit: Decimal) -> dict:
+        return self._post("/api/v3/order/oco", {
+            "symbol": symbol,
+            "side": "SELL",
+            "quantity": f"{quantity:f}",
+            "price": f"{tp_price:f}",
+            "stopPrice": f"{sl_stop:f}",
+            "stopLimitPrice": f"{sl_limit:f}",
+            "stopLimitTimeInForce": "GTC",
+        }, signed=True)
+
+    def order_limit_sell(self, symbol: str, quantity: Decimal, price: Decimal) -> dict:
+        return self._post("/api/v3/order", {
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": f"{quantity:f}",
+            "price": f"{price:f}",
+        }, signed=True)
+
+    def order_stop_loss_limit_sell(self, symbol: str, quantity: Decimal, stop_price: Decimal, limit_price: Decimal) -> dict:
+        return self._post("/api/v3/order", {
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "STOP_LOSS_LIMIT",
+            "timeInForce": "GTC",
+            "quantity": f"{quantity:f}",
+            "stopPrice": f"{stop_price:f}",
+            "price": f"{limit_price:f}",
+        }, signed=True)
+
+
+def _dec(x: float) -> Decimal:
+    return Decimal(str(x))
+
+
+def _round_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _extract_symbol_filters(exchange_info_json: dict) -> Tuple[Decimal, Decimal]:
+    symbols = exchange_info_json.get("symbols") or []
+    if not symbols:
+        raise RuntimeError("exchangeInfo missing symbols[]")
+
+    f = symbols[0].get("filters") or []
+    tick_size = None
+    step_size = None
+    for flt in f:
+        if flt.get("filterType") == "PRICE_FILTER":
+            tick_size = Decimal(str(flt.get("tickSize", "0")))
+        if flt.get("filterType") == "LOT_SIZE":
+            step_size = Decimal(str(flt.get("stepSize", "0")))
+    if tick_size is None or step_size is None:
+        raise RuntimeError("Could not find PRICE_FILTER / LOT_SIZE in exchangeInfo")
+    return tick_size, step_size
+
+
+def _get_free_usdt(acct_json: dict) -> Decimal:
+    for b in acct_json.get("balances", []):
+        if b.get("asset") == "USDT":
+            try:
+                return Decimal(str(b.get("free", "0")))
+            except Exception:
+                return Decimal("0")
+    return Decimal("0")
+
+
+def _base_asset_from_symbol(symbol: str) -> str:
+    if symbol.endswith("USDT"):
+        return symbol[:-4]
+    raise ValueError("This script's live trading assumes USDT quote pairs only (endswith USDT).")
+
+
+def _get_free_asset(acct_json: dict, asset: str) -> Decimal:
+    for b in acct_json.get("balances", []):
+        if b.get("asset") == asset:
+            try:
+                return Decimal(str(b.get("free", "0")))
+            except Exception:
+                return Decimal("0")
+    return Decimal("0")
+
+
+def _get_total_asset(acct_json: dict, asset: str) -> Decimal:
+    for b in acct_json.get("balances", []):
+        if b.get("asset") == asset:
+            try:
+                free = Decimal(str(b.get("free", "0")))
+                locked = Decimal(str(b.get("locked", "0")))
+                return free + locked
+            except Exception:
+                return Decimal("0")
+    return Decimal("0")
+
+
+def _find_exit_orders(open_orders: list) -> Tuple[Optional[dict], Optional[dict]]:
+    tp = None
+    sl = None
+    for o in open_orders:
+        t = (o.get("type") or "").upper()
+        if tp is None and t in ("LIMIT", "LIMIT_MAKER"):
+            tp = o
+        if sl is None and t in ("STOP_LOSS", "STOP_LOSS_LIMIT"):
+            sl = o
+    return tp, sl
+
+
+def _monitor_then_place_sl(
+    *,
+    client: BinanceClient,
+    symbol: str,
+    base_asset: str,
+    sl_stop: Decimal,
+    sl_limit: Decimal,
+    step_size: Decimal,
+    poll_sec: int = 5,
+) -> None:
+    print("\nMonitoring position for TP fill or SL trigger... (Ctrl+C to stop)")
+
+    while True:
+        try:
+            open_orders = client.open_orders(symbol)
+            tp_order, sl_order = _find_exit_orders(open_orders)
+
+            acct = client.account()
+            total_base = _get_total_asset(acct, base_asset)
+            free_base = _get_free_asset(acct, base_asset)
+
+            # Position gone (sold/filled) => done
+            if _round_step(total_base, step_size) <= 0:
+                print("Position likely closed (no remaining base). Done.")
+                return
+
+            # If SL already exists, keep waiting
+            if sl_order is not None:
+                time.sleep(poll_sec)
+                continue
+
+            # No SL order yet: check live price
+            px = Decimal(str(client.ticker_price(symbol)))
+            if px <= sl_stop:
+                print(f"\nSL trigger hit: price={px} <= {sl_stop}")
+
+                # Cancel TP so we can free up balance for SL order
+                if tp_order is not None:
+                    try:
+                        oid = int(tp_order.get("orderId"))
+                        print(f"Cancelling TP orderId={oid} ...")
+                        client.cancel_order(symbol, oid)
+                    except Exception as e:
+                        print(f"WARNING: Failed to cancel TP order: {e}")
+
+                # Re-check free qty and place SL
+                acct2 = client.account()
+                free_base2 = _get_free_asset(acct2, base_asset)
+                qty = _round_step(free_base2, step_size)
+
+                if qty <= 0:
+                    print(f"No FREE {base_asset} available to place SL (free={free_base2}). Done.")
+                    return
+
+                sl_resp = client.order_stop_loss_limit_sell(symbol, qty, sl_stop, sl_limit)
+                print("Placed SL STOP_LOSS_LIMIT sell:")
+                print(json.dumps(sl_resp, indent=2))
+                # after placing SL, continue monitoring
+            time.sleep(poll_sec)
+
+        except KeyboardInterrupt:
+            print("\nStopped monitoring. Note: You may have open orders on Binance.")
+            return
+        except Exception as e:
+            print(f"Monitor loop error: {e}")
+            time.sleep(max(5, poll_sec))
+
+
+def _prompt_manage_replay_open_position_spot(
+    *,
+    replay_pos: Position,
+    tp_pct: float,
+    sl_pct: float,
+    live_trade: bool,
+) -> None:
+    """
+    Option B prompt:
+    - If replay ends OPEN on symbol S, prompt to manage S on Binance.
+    - Uses replay_pos.entry_open to compute TP/SL levels (same as replay).
+    - If not holding S -> ask to buy it (if you want), then place exits.
+    """
+    symbol = replay_pos.symbol.upper()
+    base_asset = _base_asset_from_symbol(symbol)
+
+    tp_price = replay_pos.entry_open * (1.0 + tp_pct)
+    sl_price = replay_pos.entry_open * (1.0 - sl_pct)
+
+    print("\n" + "=" * 80)
+    print(f"BINANCE LIVE PROMPT (REPLAY OPEN POSITION): {symbol}")
+    print(f"Replay entry_open={replay_pos.entry_open:.8g} => TP={tp_price:.8g}  SL={sl_price:.8g}")
+    print("=" * 80)
+
+    api_key = os.getenv("BINANCE_API_KEY", "tE06bWu6VfzgIB1wlyZfZzaZwPe0F6RyVQrp0Fh7B8fvTzNyhxe8UZSrJV3y0Iu0").strip()
+    api_secret = os.getenv("BINANCE_API_SECRET", "bFBUdNU7c8HBW3pNt2CnT1m7RlASUw6ReFsWYRqPFWLyj7NIjVFLK7j2BIaFTGLf").strip()
+    if not api_key or not api_secret:
+        print("ERROR: BINANCE_API_KEY / BINANCE_API_SECRET env vars not set. Cannot trade.")
+        return
+
+    client = BinanceClient(api_key=api_key, api_secret=api_secret)
+
+    # Rounding filters
+    ex = client.exchange_info(symbol)
+    tick_size, step_size = _extract_symbol_filters(ex)
+
+    tp_dec = _round_step(_dec(tp_price), tick_size)
+    sl_stop_dec = _round_step(_dec(sl_price), tick_size)
+    sl_limit_dec = _round_step(sl_stop_dec * Decimal("0.999"), tick_size)  # slightly below stop
+
+    if tp_dec <= 0 or sl_stop_dec <= 0 or sl_limit_dec <= 0:
+        print("ERROR: Computed TP/SL invalid after rounding; aborting.")
+        return
+
+    acct = client.account()
+    free_usdt = _get_free_usdt(acct)
+    total_base = _get_total_asset(acct, base_asset)
+    holding_threshold = step_size
+
+    open_orders = client.open_orders(symbol)
+    tp_order, sl_order = _find_exit_orders(open_orders)
+
+    # If exits already exist, do nothing (prevents stacking multiple OCOs)
+    if tp_order or sl_order:
+        print("\nExisting exit orders detected — not placing another one.")
+        if tp_order:
+            print(f"  TP: orderId={tp_order.get('orderId')} type={tp_order.get('type')} price={tp_order.get('price')}")
+        if sl_order:
+            print(f"  SL: orderId={sl_order.get('orderId')} type={sl_order.get('type')} stopPrice={sl_order.get('stopPrice')} price={sl_order.get('price')}")
+        return
+
+    # If already holding, offer to place exits (no buy)
+    if total_base >= holding_threshold:
+        free_base = _get_free_asset(acct, base_asset)
+        qty = _round_step(free_base, step_size)
+
+        print(f"\nHolding {symbol} detected. total={total_base} {base_asset}, free={free_base} {base_asset}, step={step_size}")
+        if qty <= 0:
+            print(
+                f"No FREE {base_asset} available to place exits (free={free_base}, total={total_base}).\n"
+                "Your balance may be locked elsewhere. Check Binance open orders."
+            )
+            return
+
+        print(f"OCO levels (rounded): TP={tp_dec}  SL(stop)={sl_stop_dec}  SL(limit)={sl_limit_dec}")
+        ans = input(f"Do you want to PLACE OCO exits for {symbol} now? (yes/no): ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+        if not live_trade:
+            print(f"\n[DRY-RUN] Would place OCO exits for qty={qty} {base_asset} on {symbol}")
+            return
+
+        # Try OCO
+        try:
+            oco_resp = client.oco_sell(symbol=symbol, quantity=qty, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
+            print("\nOCO placed successfully:")
+            print(json.dumps(oco_resp, indent=2))
+            return
+        except Exception as e:
+            print(f"\nOCO failed; falling back to TP-first then conditional SL. Reason: {e}")
+
+        # Fallback: TP now, SL later if needed
+        tp_resp = client.order_limit_sell(symbol, qty, tp_dec)
+        print("Placed TP LIMIT sell:")
+        print(json.dumps(tp_resp, indent=2))
+        _monitor_then_place_sl(
+            client=client,
+            symbol=symbol,
+            base_asset=base_asset,
+            sl_stop=sl_stop_dec,
+            sl_limit=sl_limit_dec,
+            step_size=step_size,
+            poll_sec=5,
+        )
+        return
+
+    # Not holding: ask to buy then set exits
+    print(f"\nNot holding {base_asset}. USDT free={free_usdt}")
+
+    if free_usdt <= Decimal("0"):
+        print("WARNING: free USDT is 0; you cannot market-buy right now unless you free USDT.")
+    print(f"OCO levels (rounded): TP={tp_dec}  SL(stop)={sl_stop_dec}  SL(limit)={sl_limit_dec}")
+
+    ans = input(f"Do you want to BUY {symbol} now and place OCO exits? (yes/no): ").strip().lower()
+    if ans not in ("y", "yes"):
+        print("Trade cancelled.")
+        return
+
+    if not live_trade:
+        print("\n[DRY-RUN] Would buy + place OCO exits for:", symbol)
+        return
+
+    spend_usdt = (free_usdt * Decimal("0.999")).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    if spend_usdt <= Decimal("0"):
+        print(f"ERROR: No available USDT to trade (free={free_usdt}).")
+        return
+
+    print(f"\nUSDT available: {free_usdt}  -> spending: {spend_usdt}  (spot, market, no leverage)")
+    buy_resp = client.market_buy_quote_qty(symbol, spend_usdt)
+
+    executed_qty = Decimal(str(buy_resp.get("executedQty", "0")))
+    cumm_quote = Decimal(str(buy_resp.get("cummulativeQuoteQty", "0")))
+
+    if executed_qty <= 0:
+        print("ERROR: Buy returned executedQty=0. Response:")
+        print(json.dumps(buy_resp, indent=2))
+        return
+
+    # Use actual FREE after buy (fees may reduce it)
+    acct2 = client.account()
+    free_base2 = _get_free_asset(acct2, base_asset)
+    qty_for_exit = _round_step(free_base2, step_size)
+
+    print("\nBUY filled:")
+    print(f"  executedQty:            {executed_qty}")
+    print(f"  quote spent (USDT):     {cumm_quote}")
+    print(f"  free {base_asset}:       {free_base2}")
+    print(f"  qty for exits (rounded): {qty_for_exit}")
+
+    if qty_for_exit <= 0:
+        print(f"ERROR: After buy, free {base_asset} rounds to 0; cannot place exits automatically.")
+        print("You may need to place exits manually in Binance Spot UI.")
+        return
+
+    # Try OCO
+    try:
+        oco_resp = client.oco_sell(symbol=symbol, quantity=qty_for_exit, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
+        print("\nOCO placed successfully:")
+        print(json.dumps(oco_resp, indent=2))
+        return
+    except Exception as e:
+        print(f"\nOCO failed; falling back to TP-first then conditional SL. Reason: {e}")
+
+    # Fallback: TP now, SL later if needed
+    tp_resp = client.order_limit_sell(symbol, qty_for_exit, tp_dec)
+    print("Placed TP LIMIT sell:")
+    print(json.dumps(tp_resp, indent=2))
+    _monitor_then_place_sl(
+        client=client,
+        symbol=symbol,
+        base_asset=base_asset,
+        sl_stop=sl_stop_dec,
+        sl_limit=sl_limit_dec,
+        step_size=step_size,
+        poll_sec=5,
+    )
+
+
+# =============================================================================
 # Engine (SINGLE POSITION)
-# ----------------------------
+# =============================================================================
 
 def run_replay_single_position(
     *,
@@ -406,6 +954,8 @@ def run_replay_single_position(
     trail_pct: float,
     time_stop_days: int,
     time_stop_min_gain: float,
+    ask_to_buy_today: bool,
+    live_trade: bool,
 ) -> None:
     session = requests.Session()
     cache = load_cache(cache_path)
@@ -417,9 +967,6 @@ def run_replay_single_position(
         e = s.file_date + timedelta(days=entry_lag_days)
         sig_by_entry_day.setdefault(e, []).append(s)
 
-    # For any day, we might need candles for:
-    # - current position symbol
-    # - candidate signal symbols
     symbols_all = sorted({s.symbol for s in signals})
 
     candles_by_symbol: Dict[str, Dict[date, Candle]] = {}
@@ -459,9 +1006,7 @@ def run_replay_single_position(
     while d <= end_day:
         day_header_printed = False
 
-        # -------------------------
-        # 1) Update/exit existing position (strategy exits)
-        # -------------------------
+        # 1) Update/exit existing position
         if pos is not None and pos.status == "OPEN":
             day_candle = candles_by_symbol.get(pos.symbol, {}).get(d)
 
@@ -473,14 +1018,11 @@ def run_replay_single_position(
                 print(f"Holding {pos.symbol}: (missing 1D candle for {d.isoformat()})")
             else:
                 pos.last_close = day_candle.c
-                # init peak_close
                 if not (pos.peak_close == pos.peak_close):
                     pos.peak_close = day_candle.c
                 pos.peak_close = max(pos.peak_close, day_candle.c)
 
-                # exits only valid from entry_day onward
                 if d >= pos.entry_day:
-                    # TP/SL (with ambiguity handling)
                     exit_hit = evaluate_exit_realistic(
                         pos=pos,
                         day_candle=day_candle,
@@ -507,7 +1049,7 @@ def run_replay_single_position(
                             if day_candle.c < pos.entry_open * (1.0 + time_stop_min_gain):
                                 exit_hit = ("TIME", day_candle.c)
 
-                    # Max hold (CLOSE-based) — aligns with horizon-bounded label world
+                    # Max hold (CLOSE-based)
                     if exit_hit is None and max_hold_days > 0:
                         if d >= (pos.entry_day + timedelta(days=max_hold_days)):
                             exit_hit = ("MAX_HOLD", day_candle.c)
@@ -531,16 +1073,14 @@ def run_replay_single_position(
                         )
                         pos = None  # flat
 
-        # -------------------------
-        # 2) Entries + rotation (SINGLE POSITION)
-        # -------------------------
+        # 2) Entries + rotation
         entry_signals = sig_by_entry_day.get(d, [])
         if entry_signals:
             if not day_header_printed:
                 print(f"\n----\nDate {fmt_d(d)}")
                 day_header_printed = True
 
-            # print raw blocks for the *source file_date(s)* of signals
+            # print raw blocks for the source file_date(s)
             src_file_dates = sorted({s.file_date for s in entry_signals})
             for fd in src_file_dates:
                 blk = raw_blocks.get(fd, [])
@@ -549,48 +1089,39 @@ def run_replay_single_position(
                     for line in blk:
                         print(line)
 
-            # pick best signal for this day (highest p if present, else first)
-            # Build best-p-per-symbol for TODAY (entry day d)
+            # best p per symbol for TODAY
             best_today_by_symbol: Dict[str, Signal] = {}
             for s in entry_signals:
                 cur = best_today_by_symbol.get(s.symbol)
                 if cur is None or s.p > cur.p:
                     best_today_by_symbol[s.symbol] = s
 
-            # Eligibility rule:
-            # Buy only if p > 0.61 OR previous p for same symbol is lower than today's p
+            # Entry filter: p > 0.61 OR prev_p < today_p (and today_p>0)
             eligible: List[Signal] = []
             for sym, s in best_today_by_symbol.items():
                 prev_p = last_p_by_symbol.get(sym)
-
-                p_ok = (s.p > 0.61)
+                p_ok = (s.p >= 0.61)
                 trend_ok = (prev_p is not None and s.p > 0.0 and prev_p < s.p)
-
                 if p_ok or trend_ok:
                     eligible.append(s)
 
             if not eligible:
-                # Still update last_p_by_symbol so tomorrow can compare against today's p
                 for sym, s in best_today_by_symbol.items():
                     last_p_by_symbol[sym] = s.p
-
                 print("\n(note) Signals present but none passed entry filter: require p>0.61 OR prev_p < today_p.")
                 d += timedelta(days=1)
                 continue
 
-            # pick best eligible signal for this day (highest p, then symbol)
             eligible.sort(key=lambda s: (s.p, s.symbol), reverse=True)
             chosen = eligible[0]
             chosen_sym = chosen.symbol
 
-            # ROTATE if currently holding something else:
-            # Exit current at previous day's CLOSE (d-1 close), then buy new at today's OPEN.
+            # rotation: if holding different symbol, exit at prev close and enter new at today's open
             if pos is not None and pos.status == "OPEN" and pos.symbol != chosen_sym:
                 prev_day = d - timedelta(days=1)
                 prev_candle = candles_by_symbol.get(pos.symbol, {}).get(prev_day)
 
                 if prev_candle is None:
-                    # If we cannot price the rotation exit, fallback to today's open if available.
                     today_candle_old = candles_by_symbol.get(pos.symbol, {}).get(d)
                     if today_candle_old is None:
                         print(f"\n(rotate failed) Cannot price exit for {pos.symbol} on {prev_day.isoformat()} or {d.isoformat()}. Keeping position.")
@@ -643,7 +1174,6 @@ def run_replay_single_position(
 
                     tp_price = pos.entry_open * (1.0 + tp_pct)
                     sl_price = pos.entry_open * (1.0 - sl_pct)
-
                     p_txt = f" p={chosen.p:.3f}" if chosen.p > 0 else ""
                     print(
                         f"\nBought {chosen_sym} on {fmt_d(d)} from file={chosen.file_date.isoformat()}{p_txt} "
@@ -651,21 +1181,18 @@ def run_replay_single_position(
                         f"Waiting for TP (>= {tp_price:.8g}) or SL (<= {sl_price:.8g})."
                     )
             else:
-                # pos is open and same symbol as chosen OR we failed rotation
                 if pos.symbol == chosen_sym:
                     print(f"\n(note) Signal for {chosen_sym} arrived but already holding it. No action.")
                 else:
                     print(f"\n(note) Signal for {chosen_sym} arrived but still holding {pos.symbol}. No entry.")
 
-            # Update last seen p for all symbols that had signals today (entry day)
+            # Update last seen p for symbols that had signals today
             for sym, s in best_today_by_symbol.items():
                 last_p_by_symbol[sym] = s.p
 
         d += timedelta(days=1)
 
-    # -------------------------
     # Final summaries
-    # -------------------------
     print("\n" + "=" * 80)
     print("FINAL POSITIONS / TRADES")
     print("=" * 80)
@@ -701,10 +1228,26 @@ def run_replay_single_position(
     print(f"Compounded gain:      {compounded_pct:.2f}%")
     print("=" * 80)
 
+    # Option B live prompt: only if REPLAY ends OPEN
+    if ask_to_buy_today:
+        if pos is None or pos.status != "OPEN":
+            print("\n" + "=" * 80)
+            print("BINANCE LIVE PROMPT")
+            print("=" * 80)
+            print("Replay ended FLAT (no OPEN position). Option B does nothing.")
+            return
 
-# ----------------------------
+        _prompt_manage_replay_open_position_spot(
+            replay_pos=pos,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            live_trade=live_trade,
+        )
+
+
+# =============================================================================
 # CLI
-# ----------------------------
+# =============================================================================
 
 def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
@@ -716,7 +1259,7 @@ def main() -> int:
     ap.add_argument("--entry-lag-days", type=int, default=1)
 
     ap.add_argument("--tp-pct", type=float, default=0.20)
-    ap.add_argument("--sl-pct", type=float, default=0.10)
+    ap.add_argument("--sl-pct", type=float, default=0.12)
 
     ap.add_argument("--start", default="", help="Optional override YYYY-MM-DD")
     ap.add_argument("--end", default="", help="Optional override YYYY-MM-DD")
@@ -725,7 +1268,7 @@ def main() -> int:
     ap.add_argument("--intraday-interval", default="1m", choices=["1m", "3m", "5m", "15m", "30m", "1h"])
     ap.add_argument(
         "--ambiguous-fallback",
-        default="sl-first",  # align to your label (conservative)
+        default="sl-first",
         choices=["none", "tp-first", "sl-first"],
         help="If intraday cannot resolve (or disabled), what to do on TP+SL same day.",
     )
@@ -740,6 +1283,10 @@ def main() -> int:
     ap.add_argument("--trail-pct", type=float, default=0.12, help="Trailing stop pct off PEAK CLOSE (0 disables).")
     ap.add_argument("--time-stop-days", type=int, default=14, help="Time stop days (0 disables).")
     ap.add_argument("--time-stop-min-gain", type=float, default=0.05, help="Min gain required at time stop.")
+
+    # Live prompt + trading
+    ap.add_argument("--ask-to-buy-today", action="store_true", help="(Option B) If replay ends OPEN, prompt to place OCO exits on that coin.")
+    ap.add_argument("--live-trade", action="store_true", help="Actually place Binance Spot orders (else dry-run).")
 
     args = ap.parse_args()
 
@@ -777,6 +1324,8 @@ def main() -> int:
         trail_pct=float(args.trail_pct),
         time_stop_days=int(args.time_stop_days),
         time_stop_min_gain=float(args.time_stop_min_gain),
+        ask_to_buy_today=bool(args.ask_to_buy_today),
+        live_trade=bool(args.live_trade),
     )
     return 0
 
