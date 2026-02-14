@@ -44,6 +44,8 @@ RUNUP_RE = re.compile(
     r"\brunupToHigh\s*=\s*([0-9]*\.?[0-9]+)\s*%?",
     re.IGNORECASE
 )
+FEATDROP_RE = re.compile(r"\bfeatDropP\s*=\s*([0-9]*\.?[0-9]+)\b", re.IGNORECASE)
+
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,7 @@ class Signal:
     raw_line: str
     p: float  # 0.0 if missing
     runup_to_high_pct: Optional[float]  # None if missing; percent (e.g. 7.68)
+    feat_drop_p: Optional[float]  # <-- add this
 
 
 def parse_signals_text(text: str) -> Tuple[List[Signal], Dict[date, List[str]]]:
@@ -81,15 +84,17 @@ def parse_signals_text(text: str) -> Tuple[List[Signal], Dict[date, List[str]]]:
                 mr = RUNUP_RE.search(line)
                 runup = float(mr.group(1)) if mr else None
 
-                signals.append(
-                    Signal(
-                        file_date=cur_file_date,
-                        symbol=sym,
-                        raw_line=line.rstrip("\n"),
-                        p=p,
-                        runup_to_high_pct=runup,
-                    )
-                )
+                mf = FEATDROP_RE.search(line)
+                feat_drop_p = float(mf.group(1)) if mf else None
+
+                signals.append(Signal(
+                    file_date=cur_file_date,
+                    symbol=sym,
+                    raw_line=line.rstrip("\n"),
+                    p=p,
+                    runup_to_high_pct=runup,
+                    feat_drop_p=feat_drop_p,
+                ))
 
     signals.sort(key=lambda s: (s.file_date, s.symbol))
     return signals, raw_block
@@ -478,7 +483,11 @@ def _prompt_pick_from_shortlist(shortlist: List[Signal], latest_day: date) -> Op
         return None
 
     for i, s in enumerate(shortlist, start=1):
-        print(f"{i:02d}) {s.symbol:12s}  p={s.p:.3f}  runupToHigh={s.runup_to_high_pct:.2f}%")
+        fd = "" if s.feat_drop_p is None else f"  featDropP={s.feat_drop_p:.3f}"
+        print(f"{i:02d}) {s.symbol:12s}  p={s.p:.3f}  runupToHigh={s.runup_to_high_pct:.2f}%{fd}")
+
+    if any((x.feat_drop_p or 0.0) > 0.2 for x in shortlist):
+        print("\nWARNING: featDropP > 0.2 detected for at least one candidate — it may dip ~12% first.")
 
     if len(shortlist) == 1:
         s = shortlist[0]
@@ -547,6 +556,7 @@ def _buy_and_place_exits(
     *,
     symbol: str,
     signal_file_date: date,
+    feat_drop_p: Optional[float] = None,
     tp_pct: float,
     sl_pct: float,
     live_trade: bool,
@@ -770,9 +780,19 @@ def run_latest_block_buy_prompt(
     live_trade: bool,
 ) -> None:
     latest_day, shortlist = _latest_block_shortlist(signals, p_min=0.75, runup_max_pct=10.0)
+
     chosen = _prompt_pick_from_shortlist(shortlist, latest_day)
+
+    # MUST check this BEFORE using chosen.*
     if chosen is None:
         return
+
+    # chosen-specific featDropP warning
+    if chosen.feat_drop_p is not None and chosen.feat_drop_p > 0.2:
+        print("\n" + "!" * 80)
+        print(f"WARNING: {chosen.symbol} featDropP={chosen.feat_drop_p:.3f} > 0.2 — it may dip ~12% first.")
+        print("!" * 80 + "\n")
+
     _buy_and_place_exits(
         symbol=chosen.symbol,
         signal_file_date=chosen.file_date,
@@ -781,6 +801,7 @@ def run_latest_block_buy_prompt(
         live_trade=live_trade,
         entry_lag_days=1,
     )
+
 
 
 # =============================================================================
