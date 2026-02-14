@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-rank_oversold.py (AI-ready-to-buy classifier + MODEL PERSISTENCE + BTC MOOD OUTPUT FILTER)
+1, create the model:
+cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/modelmaker.py --dir oversold_analysis/ --retrain --holdout-days 2 --skip-oof
 
-Fixes applied:
-- ALWAYS build df_all/train_dates/predict_dates_list (not only on prefetch failure)
-- Gate logic uses `passed` (removes `if 1:` bug)
-- Removes debug `if 600==1` blocks
-- Adds robust fallback when downside model can't train (fills feat_prob_drop10 with 0.5)
-- Removes hard-coded sender password; env var only
+2,
+cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/modelmaker.py --dir oversold_analysis/ --email --holdout-days 30
+
+3. paste email content into signals.txt
+
+4. Run ETF algo_buy75.py
+
+Lessons:
+- Do not but <0.75 I saw kite hit SL on 14/2/2026
+- Be abit careful if you see dropp > 0.2
 """
 
 from __future__ import annotations
@@ -2083,6 +2088,11 @@ def _missing_days_in_window(df_window: pd.DataFrame, start_day: date, end_day: d
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+     "--email",
+     action="store_true",
+     help="Send email with analysis output (default: no email)",
+    )
 
     ap.add_argument("--threshold", type=float, default=0.50)
     ap.add_argument("--cache-dir", default="kline_store")
@@ -2092,12 +2102,25 @@ def main() -> int:
     ap.add_argument("--skip-oof", action="store_true", help="Kept for compatibility; script always uses skip-oof path.")
     ap.add_argument("--dir", default="oversold_analysis", help="Folder containing *_oversold.txt")
     ap.add_argument(
+    "--holdout-days",
+    type=int,
+    default=HOLDOUT_DAYS,
+    help="Number of most recent file_date days to reserve for prediction/holdout.",
+    )
+
+    ap.add_argument(
         "--offline-cache-only",
         action="store_true",
         help="Never fetch klines from Binance; use cached parquet only. Missing days will be reported.",
     )
 
     args = ap.parse_args()
+    SEND_EMAIL = bool(args.email)
+    holdout_days = int(args.holdout_days)
+    if holdout_days < 1:
+     print("ERROR: --holdout-days must be >= 1", file=sys.stderr)
+     return 2
+
     # --------------------------------------------------
     # CLEAN MODEL + CACHE ONLY WHEN --retrain IS SET
     # --------------------------------------------------
@@ -2149,12 +2172,12 @@ def main() -> int:
         return 2
 
     latest_file_date = file_dates[-1]
-    predict_start_date = latest_file_date - timedelta(days=HOLDOUT_DAYS)
+    predict_start_date = latest_file_date - timedelta(days=holdout_days)
     train_end_date = predict_start_date - timedelta(days=1)
 
     if train_end_date < file_dates[0]:
         print(
-            f"ERROR: HOLDOUT_DAYS={HOLDOUT_DAYS} leaves no training data. "
+            f"ERROR: holdout_days={holdout_days} leaves no training data. "
             f"Oldest file={file_dates[0]} latest file={latest_file_date}",
             file=sys.stderr,
         )
@@ -2163,7 +2186,7 @@ def main() -> int:
     print(
         f"Rolling split: latest_file_date={latest_file_date}  "
         f"train_end_date={train_end_date}  predict_start_date={predict_start_date}  "
-        f"(holdout_days={HOLDOUT_DAYS})"
+        f"(holdout_days={holdout_days})"
     )
 
     # Prefetch (non-fatal). If offline, skip prefetch to avoid any fetch attempts.
@@ -2190,7 +2213,7 @@ def main() -> int:
         folder=folder,
         cache_root=cache_root,
         latest_file_date=latest_file_date,
-        holdout_days=HOLDOUT_DAYS,
+        holdout_days=holdout_days,
         train_end_date=train_end_date,
         predict_start_date=predict_start_date,
         target_pct=args.target_pct,
@@ -2240,7 +2263,7 @@ def main() -> int:
         drop_pct=DROP_PCT,
         drop_horizon_days=DROP_HORIZON_DAYS,
         entry_lag_days=ENTRY_LAG_DAYS,
-        holdout_days=HOLDOUT_DAYS,
+        holdout_days=holdout_days,
         horizon_days=HORIZON_DAYS,
         min_history_hits=MIN_HISTORY_HITS,
     )
@@ -2392,7 +2415,10 @@ def main() -> int:
         model_meta=model_meta,
         topk=TOPK,
     )
-    send_email_with_analysis(body, df=df_pred, directory=str(folder))
+    if SEND_EMAIL:
+     send_email_with_analysis(body, df=df_pred, directory=str(folder))
+    else:
+     print("[EMAIL] Skipped (use --email to enable)")
     return 0
 
 if __name__ == "__main__":
