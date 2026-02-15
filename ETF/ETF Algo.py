@@ -59,6 +59,277 @@ class Signal:
     raw_line: str
     p: float  # 0.0 if missing
 
+class RestartRun(Exception):
+    """Raised to restart the whole run after modifying signals file."""
+    pass
+
+
+def delete_symbol_from_signals_file(signals_path: Path, symbol: str) -> None:
+    """
+    Deletes ALL lines containing the given symbol token (word-boundary) from signals file.
+    Makes a .bak backup first.
+    """
+    symbol = symbol.upper()
+    text = signals_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+
+    # backup
+    bak = signals_path.with_suffix(signals_path.suffix + ".bak")
+    bak.write_text("".join(text), encoding="utf-8")
+
+    # remove any line where SYMBOL appears as a token (so BUY lines definitely go)
+    pat = re.compile(rf"\b{re.escape(symbol)}\b")
+    kept = [ln for ln in text if not pat.search(ln)]
+
+    signals_path.write_text("".join(kept), encoding="utf-8")
+    print(f"\n[signals] Removed all lines containing {symbol}. Backup saved to: {bak}")
+
+
+def _latest_block_candidates(
+    signals: List[Signal],
+    *,
+    min_p: float = 0.0,
+) -> List[Signal]:
+    """Return signals from the latest file_date block sorted by p desc."""
+    if not signals:
+        return []
+    latest_fd = max(s.file_date for s in signals)
+    cands = [s for s in signals if s.file_date == latest_fd and s.p >= min_p]
+    cands.sort(key=lambda s: (s.p, s.symbol), reverse=True)
+    return cands
+
+
+def _prompt_manage_symbol_spot(
+    *,
+    symbol: str,
+    ref_entry_open: float,
+    tp_pct: float,
+    sl_pct: float,
+    live_trade: bool,
+    signals_path: Path,   # NEW
+) -> bool:
+    """
+    Like your existing replay-open prompt, but for an arbitrary symbol + reference entry price.
+    Returns:
+      True  => user accepted and we attempted action (dry-run counts as action)
+      False => user said no / skipped / couldn't act
+    """
+    symbol = symbol.upper()
+    base_asset = _base_asset_from_symbol(symbol)
+
+    tp_price = ref_entry_open * (1.0 + tp_pct)
+    sl_price = ref_entry_open * (1.0 - sl_pct)
+
+    print("\n" + "=" * 80)
+    print(f"BINANCE LIVE PROMPT: {symbol}")
+    print(f"Ref entry_open={ref_entry_open:.8g} => TP={tp_price:.8g}  SL={sl_price:.8g}")
+    print("=" * 80)
+
+    api_key = os.getenv("BINANCE_API_KEY", "tE06bWu6VfzgIB1wlyZfZzaZwPe0F6RyVQrp0Fh7B8fvTzNyhxe8UZSrJV3y0Iu0").strip()
+    api_secret = os.getenv("BINANCE_API_SECRET",
+                           "bFBUdNU7c8HBW3pNt2CnT1m7RlASUw6ReFsWYRqPFWLyj7NIjVFLK7j2BIaFTGLf").strip()
+    if not api_key or not api_secret:
+        print("ERROR: Set BINANCE_API_KEY and BINANCE_API_SECRET env vars. Skipping.")
+        return False
+
+    client = BinanceClient(api_key=api_key, api_secret=api_secret)
+
+    # Rounding filters
+    ex = client.exchange_info(symbol)
+    tick_size, step_size = _extract_symbol_filters(ex)
+
+    tp_dec = _round_step(_dec(tp_price), tick_size)
+    sl_stop_dec = _round_step(_dec(sl_price), tick_size)
+    sl_limit_dec = _round_step(sl_stop_dec * Decimal("0.999"), tick_size)
+
+    if tp_dec <= 0 or sl_stop_dec <= 0 or sl_limit_dec <= 0:
+        print("ERROR: Computed TP/SL invalid after rounding; skipping.")
+        return False
+
+    acct = client.account()
+    free_usdt = _get_free_usdt(acct)
+    total_base = _get_total_asset(acct, base_asset)
+    holding_threshold = step_size
+
+    open_orders = client.open_orders(symbol)
+    tp_order, sl_order = _find_exit_orders(open_orders)
+
+    # If exits already exist, do nothing
+    if tp_order or sl_order:
+        print("\nExisting exit orders detected — not placing another one.")
+        if tp_order:
+            print(f"  TP: orderId={tp_order.get('orderId')} type={tp_order.get('type')} price={tp_order.get('price')}")
+        if sl_order:
+            print(f"  SL: orderId={sl_order.get('orderId')} type={sl_order.get('type')} stopPrice={sl_order.get('stopPrice')} price={sl_order.get('price')}")
+        return True  # we “handled” it
+
+    # If already holding, offer to place exits
+    if total_base >= holding_threshold:
+        free_base = _get_free_asset(acct, base_asset)
+        qty = _round_step(free_base, step_size)
+
+        print(f"\nHolding {symbol} detected. total={total_base} {base_asset}, free={free_base} {base_asset}, step={step_size}")
+        if qty <= 0:
+            print(f"No FREE {base_asset} available to place exits. Skipping.")
+            return False
+
+        print(f"OCO levels (rounded): TP={tp_dec}  SL(stop)={sl_stop_dec}  SL(limit)={sl_limit_dec}")
+        ans = input("Type yes / no: ").strip().lower()
+
+        if ans in ("y", "yes"):
+            pass  # continue with buy/oco logic
+
+        elif ans in ("n", "no"):
+            # IMPORTANT: "no" means permanently remove and rerun whole set
+            delete_symbol_from_signals_file(signals_path, symbol)
+            raise RestartRun()
+
+        else:
+            print("Please type yes or no.")
+            return False
+
+        if not live_trade:
+            print(f"\n[DRY-RUN] Would place OCO exits for qty={qty} {base_asset} on {symbol}")
+            return True
+
+        try:
+            oco_resp = client.oco_sell(symbol=symbol, quantity=qty, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
+            print("\nOCO placed successfully:")
+            print(json.dumps(oco_resp, indent=2))
+            return True
+        except Exception as e:
+            print(f"\nOCO failed; falling back to TP-first then conditional SL. Reason: {e}")
+
+        tp_resp = client.order_limit_sell(symbol, qty, tp_dec)
+        print("Placed TP LIMIT sell:")
+        print(json.dumps(tp_resp, indent=2))
+        _monitor_then_place_sl(
+            client=client,
+            symbol=symbol,
+            base_asset=base_asset,
+            sl_stop=sl_stop_dec,
+            sl_limit=sl_limit_dec,
+            step_size=step_size,
+            poll_sec=5,
+        )
+        return True
+
+    # Not holding: ask to buy then set exits
+    print(f"\nNot holding {base_asset}. USDT free={free_usdt}")
+    print(f"OCO levels (rounded): TP={tp_dec}  SL(stop)={sl_stop_dec}  SL(limit)={sl_limit_dec}")
+
+    ans = input("Type yes / no / delete: ").strip().lower()
+
+    if ans in ("y", "yes"):
+        pass  # continue with the buy/oco path as you already do
+
+    elif ans in ("d", "del", "delete"):
+        delete_symbol_from_signals_file(signals_path, symbol)
+        raise RestartRun()
+
+
+    elif ans in ("n", "no"):
+        delete_symbol_from_signals_file(signals_path, symbol)
+        raise RestartRun()
+    else:
+        print("Please type yes or no.")
+        return False
+
+    if not live_trade:
+        print("\n[DRY-RUN] Would buy + place OCO exits for:", symbol)
+        return True
+
+    if free_usdt <= Decimal("0"):
+        print("ERROR: No free USDT to buy. Skipping.")
+        return False
+
+    spend_usdt = (free_usdt * Decimal("0.999")).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    if spend_usdt <= Decimal("0"):
+        print("ERROR: No available USDT to trade after buffer. Skipping.")
+        return False
+
+    print(f"\nUSDT available: {free_usdt}  -> spending: {spend_usdt}")
+    buy_resp = client.market_buy_quote_qty(symbol, spend_usdt)
+
+    executed_qty = Decimal(str(buy_resp.get("executedQty", "0")))
+    if executed_qty <= 0:
+        print("ERROR: Buy returned executedQty=0. Response:")
+        print(json.dumps(buy_resp, indent=2))
+        return False
+
+    acct2 = client.account()
+    free_base2 = _get_free_asset(acct2, base_asset)
+    qty_for_exit = _round_step(free_base2, step_size)
+
+    print("\nBUY filled:")
+    print(f"  executedQty:             {executed_qty}")
+    print(f"  free {base_asset}:        {free_base2}")
+    print(f"  qty for exits (rounded):  {qty_for_exit}")
+
+    if qty_for_exit <= 0:
+        print("ERROR: After buy, free qty rounds to 0; cannot place exits automatically.")
+        return True  # buy happened
+
+    try:
+        oco_resp = client.oco_sell(symbol=symbol, quantity=qty_for_exit, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
+        print("\nOCO placed successfully:")
+        print(json.dumps(oco_resp, indent=2))
+        return True
+    except Exception as e:
+        print(f"\nOCO failed; falling back to TP-first then conditional SL. Reason: {e}")
+
+    tp_resp = client.order_limit_sell(symbol, qty_for_exit, tp_dec)
+    print("Placed TP LIMIT sell:")
+    print(json.dumps(tp_resp, indent=2))
+    _monitor_then_place_sl(
+        client=client,
+        symbol=symbol,
+        base_asset=base_asset,
+        sl_stop=sl_stop_dec,
+        sl_limit=sl_limit_dec,
+        step_size=step_size,
+        poll_sec=5,
+    )
+    return True
+
+
+def _prompt_manage_candidates_spot(
+    *,
+    candidates: List[Tuple[str, float, str]],
+    tp_pct: float,
+    sl_pct: float,
+    live_trade: bool,
+    signals_path: Path,
+) -> None:
+    """
+    candidates: list of (symbol, ref_entry_open, label)
+    Iterates until user accepts one, or list exhausted.
+    """
+    if not candidates:
+        print("\n(no candidates to prompt)")
+        return
+
+    print("\n" + "=" * 80)
+    print("BINANCE LIVE PROMPT (MULTI-OPTION)")
+    print("=" * 80)
+
+    for idx, (sym, ref_open, label) in enumerate(candidates, start=1):
+        print(f"\nOption {idx}/{len(candidates)}  [{label}]  {sym}  (ref_open={ref_open:.8g})")
+
+        did = _prompt_manage_symbol_spot(
+            symbol=sym,
+            ref_entry_open=ref_open,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            live_trade=live_trade,
+            signals_path=signals_path,
+        )
+
+        if did:
+            print("\nDone (accepted/handled an option).")
+            return
+
+    print("\nAll options skipped. No action taken.")
+
 
 def parse_signals_text(text: str) -> Tuple[List[Signal], Dict[date, List[str]]]:
     cur_file_date: Optional[date] = None
@@ -939,6 +1210,7 @@ def _prompt_manage_replay_open_position_spot(
 
 def run_replay_single_position(
     *,
+    signals_path: Path,
     signals: List[Signal],
     raw_blocks: Dict[date, List[str]],
     start_day: date,
@@ -1121,45 +1393,20 @@ def run_replay_single_position(
             chosen = eligible[0]
             chosen_sym = chosen.symbol
 
-            # rotation: if holding different symbol, exit at prev close and enter new at today's open
-            if pos is not None and pos.status == "OPEN" and pos.symbol != chosen_sym:
-                prev_day = d - timedelta(days=1)
-                prev_candle = candles_by_symbol.get(pos.symbol, {}).get(prev_day)
-
-                if prev_candle is None:
-                    today_candle_old = candles_by_symbol.get(pos.symbol, {}).get(d)
-                    if today_candle_old is None:
-                        print(f"\n(rotate failed) Cannot price exit for {pos.symbol} on {prev_day.isoformat()} or {d.isoformat()}. Keeping position.")
-                    else:
-                        exit_px = today_candle_old.o
-                        g = gain_pct(pos.entry_open, exit_px)
-                        total_realised_gain += g
-                        num_closed_trades += 1
-                        compounded_factor *= (1.0 + g / 100.0)
-                        pos.status = "CLOSED"
-                        pos.exit_day = d
-                        pos.exit_price = float(exit_px)
-                        pos.exit_reason = "ROTATE_OPEN_FALLBACK"
-                        print(
-                            f"\n[ROTATE] Sold {pos.symbol} at {d.isoformat()} OPEN={exit_px:.8g} "
-                            f"(missing prev close). gain={g:.2f}%."
-                        )
-                        pos = None
-                else:
-                    exit_px = prev_candle.c
-                    g = gain_pct(pos.entry_open, exit_px)
-                    total_realised_gain += g
-                    num_closed_trades += 1
-                    compounded_factor *= (1.0 + g / 100.0)
-                    pos.status = "CLOSED"
-                    pos.exit_day = prev_day
-                    pos.exit_price = float(exit_px)
-                    pos.exit_reason = "ROTATE_PREV_CLOSE"
+            # rotation DISABLED: ignore new signals while holding an OPEN position
+            if pos is not None and pos.status == "OPEN":
+                if pos.symbol != chosen_sym:
                     print(
-                        f"\n[ROTATE] Sold {pos.symbol} at {prev_day.isoformat()} CLOSE={exit_px:.8g} "
-                        f"to rotate into {chosen_sym}. gain={g:.2f}%."
-                    )
-                    pos = None
+                        f"\n(note) Signal for {chosen_sym} arrived but holding {pos.symbol}. Rotation disabled; no action.")
+                else:
+                    print(f"\n(note) Signal for {chosen_sym} arrived but already holding it. No action.")
+
+                # still record last seen p for today’s signals
+                for sym, s in best_today_by_symbol.items():
+                    last_p_by_symbol[sym] = s.p
+
+                d += timedelta(days=1)
+                continue
 
             # If flat, enter chosen on today's OPEN
             if pos is None:
@@ -1234,20 +1481,46 @@ def run_replay_single_position(
     print("=" * 80)
 
     # Option B live prompt: only if REPLAY ends OPEN
+    # Option B live prompt:
+    # - If replay ends OPEN: prompt that symbol (single option)
+    # - If replay ends FLAT: prompt through latest file= block (multiple options)
     if ask_to_buy_today:
-        if pos is None or pos.status != "OPEN":
+        candidates: List[Tuple[str, float, str]] = []
+
+        if pos is not None and pos.status == "OPEN":
+            candidates.append((pos.symbol, pos.entry_open, "replay-open"))
+        else:
             print("\n" + "=" * 80)
             print("BINANCE LIVE PROMPT")
             print("=" * 80)
-            print("Replay ended FLAT (no OPEN position). Option B does nothing.")
+            print("Replay ended FLAT. No live action.")
             return
 
-        _prompt_manage_replay_open_position_spot(
-            replay_pos=pos,
+            # Use today's OPEN price (entry day = file_date + entry_lag_days) as reference if candle exists;
+            # otherwise fallback to last known close in cache; otherwise skip that candidate.
+            for s in latest:
+                entry_day = s.file_date + timedelta(days=entry_lag_days)
+                c = candles_by_symbol.get(s.symbol, {}).get(entry_day)
+                if c is not None:
+                    ref_open = c.o
+                    label = f"latest-block p={s.p:.3f} entry_day={entry_day.isoformat()}"
+                    candidates.append((s.symbol, ref_open, label))
+                else:
+                    # fallback: try end_day candle close
+                    c2 = candles_by_symbol.get(s.symbol, {}).get(end_day)
+                    if c2 is not None:
+                        ref_open = c2.c
+                        label = f"latest-block p={s.p:.3f} (fallback close {end_day.isoformat()})"
+                        candidates.append((s.symbol, ref_open, label))
+
+        _prompt_manage_candidates_spot(
+            candidates=candidates,
             tp_pct=tp_pct,
             sl_pct=sl_pct,
             live_trade=live_trade,
+            signals_path=signals_path,
         )
+
 
 
 # =============================================================================
@@ -1290,49 +1563,70 @@ def main() -> int:
     ap.add_argument("--time-stop-min-gain", type=float, default=0.05, help="Min gain required at time stop.")
 
     # Live prompt + trading
-    ap.add_argument("--ask-to-buy-today", action="store_true", help="(Option B) If replay ends OPEN, prompt to place OCO exits on that coin.")
-    ap.add_argument("--live-trade", action="store_true", help="Actually place Binance Spot orders (else dry-run).")
+    ap.add_argument("--ask-to-buy-today", action="store_true",
+                    help="(Option B) Prompt: replay-open or latest-block candidates.")
+    ap.add_argument("--live-trade", action="store_true",
+                    help="Actually place Binance Spot orders (else dry-run).")
 
     args = ap.parse_args()
 
+    # Parse once
     signals_path = Path(args.signals_file)
     if not signals_path.exists():
         print(f"ERROR: signals file not found: {signals_path}", file=sys.stderr)
         return 2
 
-    signals, raw_blocks = load_signals_file(signals_path)
-    if not signals:
-        print("ERROR: No signals found. Need 'file=YYYY-MM-DD' and 'BUY SYMBOL' lines.", file=sys.stderr)
-        return 2
+    # Restart loop: reload signals + rerun replay until it completes without RestartRun
+    run_count = 0
+    while True:
+        run_count += 1
+        try:
+            print("\n" + "#" * 80)
+            print(f"RUN #{run_count}  (signals={signals_path})")
+            print("#" * 80 + "\n")
 
-    file_dates = sorted({s.file_date for s in signals})
-    start_day = _parse_date(args.start) if args.start else min(file_dates) + timedelta(days=int(args.entry_lag_days))
-    end_day = _parse_date(args.end) if args.end else datetime.utcnow().date()
+            signals, raw_blocks = load_signals_file(signals_path)
+            if not signals:
+                print("ERROR: No signals found after filtering. Nothing to do.", file=sys.stderr)
+                return 2
 
-    if end_day < start_day:
-        print(f"ERROR: end < start ({end_day} < {start_day})", file=sys.stderr)
-        return 2
+            file_dates = sorted({s.file_date for s in signals})
+            start_day = _parse_date(args.start) if args.start else min(file_dates) + timedelta(days=int(args.entry_lag_days))
+            end_day = _parse_date(args.end) if args.end else datetime.utcnow().date()
 
-    run_replay_single_position(
-        signals=signals,
-        raw_blocks=raw_blocks,
-        start_day=start_day,
-        end_day=end_day,
-        entry_lag_days=int(args.entry_lag_days),
-        tp_pct=float(args.tp_pct),
-        sl_pct=float(args.sl_pct),
-        cache_path=Path(args.cache_path),
-        intraday_interval=str(args.intraday_interval),
-        ambiguous_fallback=str(args.ambiguous_fallback),
-        resolve_ambiguous_intraday=not bool(args.no_intraday_resolve),
-        max_hold_days=int(args.max_hold_days),
-        trail_pct=float(args.trail_pct),
-        time_stop_days=int(args.time_stop_days),
-        time_stop_min_gain=float(args.time_stop_min_gain),
-        ask_to_buy_today=bool(args.ask_to_buy_today),
-        live_trade=bool(args.live_trade),
-    )
-    return 0
+            if end_day < start_day:
+                print(f"ERROR: end < start ({end_day} < {start_day})", file=sys.stderr)
+                return 2
+
+            run_replay_single_position(
+                signals_path=signals_path,
+                signals=signals,
+                raw_blocks=raw_blocks,
+                start_day=start_day,
+                end_day=end_day,
+                entry_lag_days=int(args.entry_lag_days),
+                tp_pct=float(args.tp_pct),
+                sl_pct=float(args.sl_pct),
+                cache_path=Path(args.cache_path),
+                intraday_interval=str(args.intraday_interval),
+                ambiguous_fallback=str(args.ambiguous_fallback),
+                resolve_ambiguous_intraday=not bool(args.no_intraday_resolve),
+                max_hold_days=int(args.max_hold_days),
+                trail_pct=float(args.trail_pct),
+                time_stop_days=int(args.time_stop_days),
+                time_stop_min_gain=float(args.time_stop_min_gain),
+                ask_to_buy_today=bool(args.ask_to_buy_today),
+                live_trade=bool(args.live_trade),
+            )
+            return 0
+
+        except RestartRun:
+            print("\n[restart] signals.txt updated. Reloading signals + rerunning from scratch...\n")
+            continue
+
+        except KeyboardInterrupt:
+            print("\nInterrupted by user.")
+            return 130
 
 
 if __name__ == "__main__":
