@@ -1371,27 +1371,30 @@ def run_replay_single_position(
             # Entry filter: p > 0.61 OR prev_p < today_p (and today_p>0)
             # Entry filter (new rule):
             # - If symbol seen before: require today's p > last time's p (and still >= 0.60)
-            eligible: List[Signal] = []
-            for sym, s in best_today_by_symbol.items():
-                prev_p = last_p_by_symbol.get(sym)
+            # NEW BUY RULE:
+            # Only buy if p > 0.55 AND (highest of the day OR only crypto that day).
+            MIN_BUY_P = 0.55
 
-                not_seen_before_and_ok = (prev_p is None and s.p >= 0.60)
-                higher_than_prev = (prev_p is not None and s.p > prev_p)  # rule 3 (covers rule 1 too)
+            todays = list(best_today_by_symbol.values())
+            num_symbols_today = len(todays)
 
-                if not_seen_before_and_ok or higher_than_prev:
-                    eligible.append(s)
-            if not eligible:
-                for sym, s in best_today_by_symbol.items():
-                    last_p_by_symbol[sym] = s.p
-                print("\n(note) Signals present but none passed entry filter: "
-                      "new symbols need p>=0.60; previously-seen symbols need p>=0.60 AND p>prev_p.")
+            # Filter to those strictly above the threshold
+            above = [s for s in todays if s.p > MIN_BUY_P]
+
+            if not above:
+                print(f"\n(note) Signals present but none had p > {MIN_BUY_P:.2f}. No entry.")
                 d += timedelta(days=1)
                 continue
 
+            if num_symbols_today == 1:
+                # Rule 2: only crypto for the day (already ensured p > 0.55)
+                chosen = above[0]
+            else:
+                # Rule 1: highest in the day (among those > 0.55)
+                chosen = max(above, key=lambda s: (s.p, s.symbol))
 
-            eligible.sort(key=lambda s: (s.p, s.symbol), reverse=True)
-            chosen = eligible[0]
             chosen_sym = chosen.symbol
+
 
             # rotation DISABLED: ignore new signals while holding an OPEN position
             if pos is not None and pos.status == "OPEN":
