@@ -1371,30 +1371,54 @@ def run_replay_single_position(
             # Entry filter: p > 0.61 OR prev_p < today_p (and today_p>0)
             # Entry filter (new rule):
             # - If symbol seen before: require today's p > last time's p (and still >= 0.60)
-            # NEW BUY RULE:
-            # Only buy if p > 0.55 AND (highest of the day OR only crypto that day).
-            MIN_BUY_P = 0.55
+            # Entry filter (existing rules) + NEW SOLO RULE:
+            # Existing:
+            #   - If symbol not seen before: require p >= 0.60
+            #   - If symbol seen before: require today's p > prev_p
+            #
+            # NEW:
+            #   - If there is ONLY ONE unique symbol today and its p >= 0.55,
+            #     allow it even if it fails the existing rules.
+            eligible: List[Signal] = []
 
-            todays = list(best_today_by_symbol.values())
-            num_symbols_today = len(todays)
+            # NEW: solo override candidate (only if exactly 1 symbol today)
+            solo_override: Optional[Signal] = None
+            if len(best_today_by_symbol) == 1:
+                solo_override = next(iter(best_today_by_symbol.values()))
+                if solo_override.p < 0.55:
+                    solo_override = None  # not strong enough for solo rule
 
-            # Filter to those strictly above the threshold
-            above = [s for s in todays if s.p > MIN_BUY_P]
+            for sym, s in best_today_by_symbol.items():
+                prev_p = last_p_by_symbol.get(sym)
 
-            if not above:
-                print(f"\n(note) Signals present but none had p > {MIN_BUY_P:.2f}. No entry.")
+                not_seen_before_and_ok = (prev_p is None and s.p >= 0.60)
+                higher_than_prev = (prev_p is not None and s.p > prev_p)  # rule 3 (covers rule 1 too)
+
+                passed_normal = (not_seen_before_and_ok or higher_than_prev)
+                passed_solo = (solo_override is not None and s.symbol == solo_override.symbol)
+
+                if passed_normal or passed_solo:
+                    eligible.append(s)
+            if not eligible:
+                # still record last seen p for today’s signals
+                for sym, s in best_today_by_symbol.items():
+                    last_p_by_symbol[sym] = s.p
+
+                print(
+                    "\n(note) Signals present but none passed entry filter: "
+                    "new symbols need p>=0.60; previously-seen symbols need p>prev_p; "
+                    "solo rule only applies when exactly 1 symbol today and p>=0.55."
+                )
                 d += timedelta(days=1)
                 continue
 
-            if num_symbols_today == 1:
-                # Rule 2: only crypto for the day (already ensured p > 0.55)
-                chosen = above[0]
-            else:
-                # Rule 1: highest in the day (among those > 0.55)
-                chosen = max(above, key=lambda s: (s.p, s.symbol))
+            eligible.sort(key=lambda s: (s.p, s.symbol), reverse=True)
+            chosen = eligible[0]
 
+
+            eligible.sort(key=lambda s: (s.p, s.symbol), reverse=True)
+            chosen = eligible[0]
             chosen_sym = chosen.symbol
-
 
             # rotation DISABLED: ignore new signals while holding an OPEN position
             if pos is not None and pos.status == "OPEN":
