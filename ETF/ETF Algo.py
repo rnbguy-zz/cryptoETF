@@ -1,366 +1,152 @@
 #!/usr/bin/env python3
 """
-ETF Algo.py  (SINGLE POSITION ROTATION replay + OPTIONAL Binance Spot OCO prompt)
+gate_from_signals.py
 
-You chose Option B:
-- If the REPLAY ends with an OPEN position, prompt to manage THAT coin on Binance:
-    - If you already have exits open -> do nothing
-    - Else if you already hold the coin -> place OCO exits on FREE qty (or fallback TP then monitor SL)
-    - Else (not holding) -> ask to BUY it, then place OCO exits
+Goal
+----
+Given a pasted "signals" text (same format as your rank_oversold output),
+this script will:
 
-Replay keeps ALL its existing history/summary/compound prints.
+1) Parse model meta (predict_from) + each file=YYYY-MM-DD block
+   and extract: symbol, p, hits30d, featDropP.
 
-DRY RUN vs LIVE:
-- default: DRY RUN (prints what it would do)
-- to place real orders:
-    --live-trade
-    set env vars:
-      BINANCE_API_KEY
-      BINANCE_API_SECRET
+2) "Calibration" (known-now) test:
+   For the FIRST few predicted days (starting at predict_from),
+   it will simulate entries (entry_day = file_date + entry_lag_days, at OPEN),
+   then determine whether TP or SL hit FIRST using:
+     - 1D candles
+     - intraday candles ONLY when TP+SL hit the same day
+   -> label each signal as TP-first, SL-first, or OTHER.
 
-Usage:
-  python ETF Algo.py --signals-file signals.txt --tp-pct 0.20 --sl-pct 0.12 --max-hold-days 21 \
-    --ambiguous-fallback sl-first --intraday-interval 1m --ask-to-buy-today --live-trade
+3) Grid-search gates (p_min, drop_max, hits_min) on that calibration subset,
+   optimizing for HIGH precision (avoid SL-first).
+
+4) Apply the chosen gates to the remaining "future" predicted blocks and print
+   what to buy per day (highest p first).
+
+Usage
+-----
+# Put your pasted text into signals.txt (exactly what you showed)
+python3.9 gate_from_signals.py --signals-file signals.txt \
+  --tp-pct 0.20 --sl-pct 0.12 --entry-lag-days 1 \
+  --calibration-days 5 --intraday-interval 1m \
+  --ambiguous-fallback sl-first
+
+Notes
+-----
+- "Calibration days" are the first N file= blocks starting at model predict_from.
+- If some calibration trades can't be evaluated (missing candles), they're ignored.
+- This is *not* changing your model. It's creating a practical "gate" filter:
+    BUY if (p >= p_min) and (featDropP <= drop_max) and (hits30d >= hits_min)
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import hmac
 import json
 import os
 import re
-import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlencode
 
 import requests
 
 
 # =============================================================================
-# Parsing signals
+# Parsing (signals text)
 # =============================================================================
 
 FILE_RE = re.compile(r"^\s*file=(\d{4}-\d{2}-\d{2})\b")
-BUY_RE = re.compile(r"^\s*BUY\s+([A-Z0-9]+)\b")
-P_RE = re.compile(r"\bp\s*=\s*([0-9]*\.?[0-9]+)\b")  # parses "p=0.563" if present
+META_PREDICT_FROM_RE = re.compile(r"^\s*Model\s+predict_from:\s*(\d{4}-\d{2}-\d{2})\s*$", re.I)
+
+BUY_LINE_RE = re.compile(r"^\s*BUY\s+([A-Z0-9]+)\b")
+P_RE = re.compile(r"\bp\s*=\s*([0-9]*\.?[0-9]+)\b")
+HITS_RE = re.compile(r"\bhits30d\s*=\s*(\d+)\b")
+DROP_RE = re.compile(r"\bfeatDropP\s*=\s*([0-9]*\.?[0-9]+)\b")
+META_TRAINED_THROUGH_RE = re.compile(r"^\s*Model\s+trained_through:\s*(\d{4}-\d{2}-\d{2})\s*$", re.I)
 
 
 @dataclass(frozen=True)
-class Signal:
+class SignalRow:
     file_date: date
     symbol: str
+    p: float
+    hits30d: int
+    drop_p: float
     raw_line: str
-    p: float  # 0.0 if missing
-
-class RestartRun(Exception):
-    """Raised to restart the whole run after modifying signals file."""
-    pass
 
 
-def delete_symbol_from_signals_file(signals_path: Path, symbol: str) -> None:
+def _parse_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def parse_signals_text(text: str) -> Tuple[Optional[date], Optional[date], List[SignalRow], Dict[date, List[str]]]:
     """
-    Deletes ALL lines containing the given symbol token (word-boundary) from signals file.
-    Makes a .bak backup first.
-    """
-    symbol = symbol.upper()
-    text = signals_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
-
-    # backup
-    bak = signals_path.with_suffix(signals_path.suffix + ".bak")
-    bak.write_text("".join(text), encoding="utf-8")
-
-    # remove any line where SYMBOL appears as a token (so BUY lines definitely go)
-    pat = re.compile(rf"\b{re.escape(symbol)}\b")
-    kept = [ln for ln in text if not pat.search(ln)]
-
-    signals_path.write_text("".join(kept), encoding="utf-8")
-    print(f"\n[signals] Removed all lines containing {symbol}. Backup saved to: {bak}")
-
-
-def _latest_block_candidates(
-    signals: List[Signal],
-    *,
-    min_p: float = 0.0,
-) -> List[Signal]:
-    """Return signals from the latest file_date block sorted by p desc."""
-    if not signals:
-        return []
-    latest_fd = max(s.file_date for s in signals)
-    cands = [s for s in signals if s.file_date == latest_fd and s.p >= min_p]
-    cands.sort(key=lambda s: (s.p, s.symbol), reverse=True)
-    return cands
-
-
-def _prompt_manage_symbol_spot(
-    *,
-    symbol: str,
-    ref_entry_open: float,
-    tp_pct: float,
-    sl_pct: float,
-    live_trade: bool,
-    signals_path: Path,   # NEW
-) -> bool:
-    """
-    Like your existing replay-open prompt, but for an arbitrary symbol + reference entry price.
     Returns:
-      True  => user accepted and we attempted action (dry-run counts as action)
-      False => user said no / skipped / couldn't act
+      trained_through (from header if present, else None)
+      predict_from    (from header if present, else None)
+      signals         (one row per BUY line)
+      raw_blocks      (file_date -> list of original lines in that block)
     """
-    symbol = symbol.upper()
-    base_asset = _base_asset_from_symbol(symbol)
-
-    tp_price = ref_entry_open * (1.0 + tp_pct)
-    sl_price = ref_entry_open * (1.0 - sl_pct)
-
-    print("\n" + "=" * 80)
-    print(f"BINANCE LIVE PROMPT: {symbol}")
-    print(f"Ref entry_open={ref_entry_open:.8g} => TP={tp_price:.8g}  SL={sl_price:.8g}")
-    print("=" * 80)
-
-    api_key = os.getenv("BINANCE_API_KEY", "tE06bWu6VfzgIB1wlyZfZzaZwPe0F6RyVQrp0Fh7B8fvTzNyhxe8UZSrJV3y0Iu0").strip()
-    api_secret = os.getenv("BINANCE_API_SECRET",
-                           "bFBUdNU7c8HBW3pNt2CnT1m7RlASUw6ReFsWYRqPFWLyj7NIjVFLK7j2BIaFTGLf").strip()
-    if not api_key or not api_secret:
-        print("ERROR: Set BINANCE_API_KEY and BINANCE_API_SECRET env vars. Skipping.")
-        return False
-
-    client = BinanceClient(api_key=api_key, api_secret=api_secret)
-
-    # Rounding filters
-    ex = client.exchange_info(symbol)
-    tick_size, step_size = _extract_symbol_filters(ex)
-
-    tp_dec = _round_step(_dec(tp_price), tick_size)
-    sl_stop_dec = _round_step(_dec(sl_price), tick_size)
-    sl_limit_dec = _round_step(sl_stop_dec * Decimal("0.999"), tick_size)
-
-    if tp_dec <= 0 or sl_stop_dec <= 0 or sl_limit_dec <= 0:
-        print("ERROR: Computed TP/SL invalid after rounding; skipping.")
-        return False
-
-    acct = client.account()
-    free_usdt = _get_free_usdt(acct)
-    total_base = _get_total_asset(acct, base_asset)
-    holding_threshold = step_size
-
-    open_orders = client.open_orders(symbol)
-    tp_order, sl_order = _find_exit_orders(open_orders)
-
-    # If exits already exist, do nothing
-    if tp_order or sl_order:
-        print("\nExisting exit orders detected — not placing another one.")
-        if tp_order:
-            print(f"  TP: orderId={tp_order.get('orderId')} type={tp_order.get('type')} price={tp_order.get('price')}")
-        if sl_order:
-            print(f"  SL: orderId={sl_order.get('orderId')} type={sl_order.get('type')} stopPrice={sl_order.get('stopPrice')} price={sl_order.get('price')}")
-        return True  # we “handled” it
-
-    # If already holding, offer to place exits
-    if total_base >= holding_threshold:
-        free_base = _get_free_asset(acct, base_asset)
-        qty = _round_step(free_base, step_size)
-
-        print(f"\nHolding {symbol} detected. total={total_base} {base_asset}, free={free_base} {base_asset}, step={step_size}")
-        if qty <= 0:
-            print(f"No FREE {base_asset} available to place exits. Skipping.")
-            return False
-
-        print(f"OCO levels (rounded): TP={tp_dec}  SL(stop)={sl_stop_dec}  SL(limit)={sl_limit_dec}")
-        ans = input("Type yes / no: ").strip().lower()
-
-        if ans in ("y", "yes"):
-            pass  # continue with buy/oco logic
-
-        elif ans in ("n", "no"):
-            # IMPORTANT: "no" means permanently remove and rerun whole set
-            delete_symbol_from_signals_file(signals_path, symbol)
-            raise RestartRun()
-
-        else:
-            print("Please type yes or no.")
-            return False
-
-        if not live_trade:
-            print(f"\n[DRY-RUN] Would place OCO exits for qty={qty} {base_asset} on {symbol}")
-            return True
-
-        try:
-            oco_resp = client.oco_sell(symbol=symbol, quantity=qty, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
-            print("\nOCO placed successfully:")
-            print(json.dumps(oco_resp, indent=2))
-            return True
-        except Exception as e:
-            print(f"\nOCO failed; falling back to TP-first then conditional SL. Reason: {e}")
-
-        tp_resp = client.order_limit_sell(symbol, qty, tp_dec)
-        print("Placed TP LIMIT sell:")
-        print(json.dumps(tp_resp, indent=2))
-        _monitor_then_place_sl(
-            client=client,
-            symbol=symbol,
-            base_asset=base_asset,
-            sl_stop=sl_stop_dec,
-            sl_limit=sl_limit_dec,
-            step_size=step_size,
-            poll_sec=5,
-        )
-        return True
-
-    # Not holding: ask to buy then set exits
-    print(f"\nNot holding {base_asset}. USDT free={free_usdt}")
-    print(f"OCO levels (rounded): TP={tp_dec}  SL(stop)={sl_stop_dec}  SL(limit)={sl_limit_dec}")
-
-    ans = input("Type yes / no / delete: ").strip().lower()
-
-    if ans in ("y", "yes"):
-        pass  # continue with the buy/oco path as you already do
-
-    elif ans in ("d", "del", "delete"):
-        delete_symbol_from_signals_file(signals_path, symbol)
-        raise RestartRun()
-
-
-    elif ans in ("n", "no"):
-        delete_symbol_from_signals_file(signals_path, symbol)
-        raise RestartRun()
-    else:
-        print("Please type yes or no.")
-        return False
-
-    if not live_trade:
-        print("\n[DRY-RUN] Would buy + place OCO exits for:", symbol)
-        return True
-
-    if free_usdt <= Decimal("0"):
-        print("ERROR: No free USDT to buy. Skipping.")
-        return False
-
-    spend_usdt = (free_usdt * Decimal("0.999")).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-    if spend_usdt <= Decimal("0"):
-        print("ERROR: No available USDT to trade after buffer. Skipping.")
-        return False
-
-    print(f"\nUSDT available: {free_usdt}  -> spending: {spend_usdt}")
-    buy_resp = client.market_buy_quote_qty(symbol, spend_usdt)
-
-    executed_qty = Decimal(str(buy_resp.get("executedQty", "0")))
-    if executed_qty <= 0:
-        print("ERROR: Buy returned executedQty=0. Response:")
-        print(json.dumps(buy_resp, indent=2))
-        return False
-
-    acct2 = client.account()
-    free_base2 = _get_free_asset(acct2, base_asset)
-    qty_for_exit = _round_step(free_base2, step_size)
-
-    print("\nBUY filled:")
-    print(f"  executedQty:             {executed_qty}")
-    print(f"  free {base_asset}:        {free_base2}")
-    print(f"  qty for exits (rounded):  {qty_for_exit}")
-
-    if qty_for_exit <= 0:
-        print("ERROR: After buy, free qty rounds to 0; cannot place exits automatically.")
-        return True  # buy happened
-
-    try:
-        oco_resp = client.oco_sell(symbol=symbol, quantity=qty_for_exit, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
-        print("\nOCO placed successfully:")
-        print(json.dumps(oco_resp, indent=2))
-        return True
-    except Exception as e:
-        print(f"\nOCO failed; falling back to TP-first then conditional SL. Reason: {e}")
-
-    tp_resp = client.order_limit_sell(symbol, qty_for_exit, tp_dec)
-    print("Placed TP LIMIT sell:")
-    print(json.dumps(tp_resp, indent=2))
-    _monitor_then_place_sl(
-        client=client,
-        symbol=symbol,
-        base_asset=base_asset,
-        sl_stop=sl_stop_dec,
-        sl_limit=sl_limit_dec,
-        step_size=step_size,
-        poll_sec=5,
-    )
-    return True
-
-
-def _prompt_manage_candidates_spot(
-    *,
-    candidates: List[Tuple[str, float, str]],
-    tp_pct: float,
-    sl_pct: float,
-    live_trade: bool,
-    signals_path: Path,
-) -> None:
-    """
-    candidates: list of (symbol, ref_entry_open, label)
-    Iterates until user accepts one, or list exhausted.
-    """
-    if not candidates:
-        print("\n(no candidates to prompt)")
-        return
-
-    print("\n" + "=" * 80)
-    print("BINANCE LIVE PROMPT (MULTI-OPTION)")
-    print("=" * 80)
-
-    for idx, (sym, ref_open, label) in enumerate(candidates, start=1):
-        print(f"\nOption {idx}/{len(candidates)}  [{label}]  {sym}  (ref_open={ref_open:.8g})")
-
-        did = _prompt_manage_symbol_spot(
-            symbol=sym,
-            ref_entry_open=ref_open,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            live_trade=live_trade,
-            signals_path=signals_path,
-        )
-
-        if did:
-            print("\nDone (accepted/handled an option).")
-            return
-
-    print("\nAll options skipped. No action taken.")
-
-
-def parse_signals_text(text: str) -> Tuple[List[Signal], Dict[date, List[str]]]:
+    trained_through: Optional[date] = None
+    predict_from: Optional[date] = None
     cur_file_date: Optional[date] = None
-    raw_block: Dict[date, List[str]] = {}
-    signals: List[Signal] = []
+
+    raw_blocks: Dict[date, List[str]] = {}
+    out: List[SignalRow] = []
 
     for line in text.splitlines():
-        m = FILE_RE.match(line)
-        if m:
-            cur_file_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
-            raw_block.setdefault(cur_file_date, []).append(line.rstrip("\n"))
+        mtrain = META_TRAINED_THROUGH_RE.match(line)
+        if mtrain and trained_through is None:
+            trained_through = _parse_date(mtrain.group(1))
+
+        mpred = META_PREDICT_FROM_RE.match(line)
+        if mpred and predict_from is None:
+            predict_from = _parse_date(mpred.group(1))
+
+        mfile = FILE_RE.match(line)
+        if mfile:
+            cur_file_date = _parse_date(mfile.group(1))
+            raw_blocks.setdefault(cur_file_date, []).append(line)
             continue
 
         if cur_file_date is not None:
             if line.strip():
-                raw_block.setdefault(cur_file_date, []).append(line.rstrip("\n"))
+                raw_blocks.setdefault(cur_file_date, []).append(line)
 
-            b = BUY_RE.match(line)
-            if b:
-                sym = b.group(1).upper()
+            mbuy = BUY_LINE_RE.match(line)
+            if mbuy:
+                sym = mbuy.group(1).upper()
+
                 mp = P_RE.search(line)
+                mh = HITS_RE.search(line)
+                md = DROP_RE.search(line)
+
                 p = float(mp.group(1)) if mp else 0.0
-                signals.append(Signal(file_date=cur_file_date, symbol=sym, raw_line=line.rstrip("\n"), p=p))
+                hits = int(mh.group(1)) if mh else 0
+                drop_p = float(md.group(1)) if md else 1.0
 
-    signals.sort(key=lambda s: (s.file_date, s.symbol))
-    return signals, raw_block
+                out.append(SignalRow(
+                    file_date=cur_file_date,
+                    symbol=sym,
+                    p=p,
+                    hits30d=hits,
+                    drop_p=drop_p,
+                    raw_line=line,
+                ))
+
+    out.sort(key=lambda r: (r.file_date, r.symbol))
+    return trained_through, predict_from, out, raw_blocks
 
 
-def load_signals_file(path: Path) -> Tuple[List[Signal], Dict[date, List[str]]]:
-    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+
+def load_signals_file(path: Path) -> Tuple[Optional[date], Optional[date], List[SignalRow], Dict[date, List[str]]]:
+    text = path.read_text(encoding="utf-8", errors="ignore")
     return parse_signals_text(text)
+
 
 
 # =============================================================================
@@ -382,7 +168,7 @@ class Candle:
 
 @dataclass
 class IntraCandle:
-    ts_ms: int   # open time in ms UTC
+    ts_ms: int
     o: float
     h: float
     l: float
@@ -448,7 +234,6 @@ def fetch_1d_klines(symbol: str, start_day: date, end_day: date, session: reques
 
         cur = chunk_end + timedelta(days=1)
 
-    # dedupe by day
     by_day: Dict[date, Candle] = {}
     for c in out:
         by_day[c.day] = c
@@ -589,26 +374,14 @@ def get_intraday_cached_for_day(
 
 
 # =============================================================================
-# Strategy
+# TP/SL evaluation (SL-before-TP logic)
 # =============================================================================
 
-@dataclass
-class Position:
-    symbol: str
-    entry_day: date
-    entry_open: float
-    status: str  # OPEN/CLOSED
-    exit_day: Optional[date] = None
-    exit_price: Optional[float] = None
-    exit_reason: Optional[str] = None
-
-    peak_close: float = float("nan")     # for trailing stop
-    last_close: float = float("nan")     # for reporting
-
-
-def evaluate_exit_realistic(
+def evaluate_tp_sl_first(
     *,
-    pos: Position,
+    symbol: str,
+    entry_open: float,
+    day: date,
     day_candle: Candle,
     tp_pct: float,
     sl_pct: float,
@@ -616,20 +389,249 @@ def evaluate_exit_realistic(
     cache: dict,
     cache_path: Path,
     intraday_interval: str,
-    ambiguous_fallback: str,     # "none"|"tp-first"|"sl-first"
+    ambiguous_fallback: str,   # "none"|"tp-first"|"sl-first"
+    resolve_ambiguous_intraday: bool,
+) -> Optional[str]:
+    """
+    For a given day candle AFTER entry, determine if TP or SL hit first on that day.
+    Returns "TP" or "SL" (or None if neither hit).
+    """
+    tp_price = entry_open * (1.0 + tp_pct)
+    sl_price = entry_open * (1.0 - sl_pct)
+
+    hit_tp_1d = day_candle.h >= tp_price
+    hit_sl_1d = day_candle.l <= sl_price
+
+    if hit_tp_1d and not hit_sl_1d:
+        return "TP"
+    if hit_sl_1d and not hit_tp_1d:
+        return "SL"
+    if not hit_tp_1d and not hit_sl_1d:
+        return None
+
+    # BOTH hit same day
+    intra: List[IntraCandle] = []
+    if resolve_ambiguous_intraday:
+        intra = get_intraday_cached_for_day(
+            symbol, day,
+            interval=intraday_interval,
+            session=session, cache=cache, cache_path=cache_path,
+        )
+
+    if not intra:
+        if ambiguous_fallback == "tp-first":
+            return "TP"
+        if ambiguous_fallback == "sl-first":
+            return "SL"
+        return None
+
+    for c in intra:
+        hit_tp = c.h >= tp_price
+        hit_sl = c.l <= sl_price
+
+        if hit_tp and not hit_sl:
+            return "TP"
+        if hit_sl and not hit_tp:
+            return "SL"
+        if hit_tp and hit_sl:
+            # can't resolve inside this intraday candle
+            if ambiguous_fallback == "tp-first":
+                return "TP"
+            if ambiguous_fallback == "sl-first":
+                return "SL"
+            return None
+
+    return None
+
+
+def simulate_trade_outcome(
+    *,
+    symbol: str,
+    entry_day: date,
+    entry_open: float,
+    candles_by_day: Dict[date, Candle],
+    tp_pct: float,
+    sl_pct: float,
+    max_hold_days: int,
+    session: requests.Session,
+    cache: dict,
+    cache_path: Path,
+    intraday_interval: str,
+    ambiguous_fallback: str,
+    resolve_ambiguous_intraday: bool,
+) -> str:
+    """
+    Walk forward from entry_day inclusive until TP or SL hit first; else OTHER.
+    Returns: "TP", "SL", or "OTHER"
+    """
+    last_day = entry_day + timedelta(days=max_hold_days)
+    d = entry_day
+    while d <= last_day:
+        c = candles_by_day.get(d)
+        if c is None:
+            d += timedelta(days=1)
+            continue
+
+        hit = evaluate_tp_sl_first(
+            symbol=symbol,
+            entry_open=entry_open,
+            day=d,
+            day_candle=c,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            session=session,
+            cache=cache,
+            cache_path=cache_path,
+            intraday_interval=intraday_interval,
+            ambiguous_fallback=ambiguous_fallback,
+            resolve_ambiguous_intraday=resolve_ambiguous_intraday,
+        )
+        if hit in ("TP", "SL"):
+            return hit
+        d += timedelta(days=1)
+
+    return "OTHER"
+
+
+# =============================================================================
+# Gate search
+# =============================================================================
+
+@dataclass(frozen=True)
+class Gate:
+    p_min: float
+    drop_max: float
+    hits_min: int
+
+
+def passes_gate(sig: SignalRow, gate: Gate) -> bool:
+    return (sig.p >= gate.p_min) and (sig.drop_p <= gate.drop_max) and (sig.hits30d >= gate.hits_min)
+
+
+@dataclass
+class CalibRow:
+    sig: SignalRow
+    outcome: str  # "TP" | "SL" | "OTHER"
+
+
+def score_gate(rows: List[CalibRow], gate: Gate) -> Tuple[float, int, int, int]:
+    """
+    Returns: (precision, taken, tp, sl)
+    Precision is computed on TP/(TP+SL) for taken rows where outcome in {TP,SL}.
+    OTHER outcomes are counted in taken but do not affect precision denominator.
+    """
+    taken = 0
+    tp = 0
+    sl = 0
+    for r in rows:
+        if passes_gate(r.sig, gate):
+            taken += 1
+            if r.outcome == "TP":
+                tp += 1
+            elif r.outcome == "SL":
+                sl += 1
+
+    denom = tp + sl
+    prec = (tp / denom) if denom > 0 else 0.0
+    return prec, taken, tp, sl
+
+
+def pick_best_gate(rows: List[CalibRow]) -> Tuple[Gate, Dict[str, float]]:
+    # Coarse-but-safe grid (fast + avoids overfit)
+    p_grid = [0.50, 0.52, 0.54, 0.55, 0.56, 0.58, 0.60, 0.62, 0.65, 0.70, 0.75]
+    drop_grid = [0.40, 0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65, 0.70]
+    hits_grid = [1, 2, 3, 4, 5, 8, 10, 12, 15]
+
+    best_gate = Gate(0.60, 0.60, 3)
+    best = (-1.0, -1, -1, 10**9)  # (precision, tp, taken, sl) with sl as tie-breaker (lower better)
+
+    # Require at least some decided outcomes exist in calibration
+    decided = [r for r in rows if r.outcome in ("TP", "SL")]
+    if len(decided) == 0:
+        # fallback gate (your current empiric)
+        return best_gate, {"precision": 0.0, "taken": 0, "tp": 0, "sl": 0}
+
+    for pmin in p_grid:
+        for dmax in drop_grid:
+            for hmin in hits_grid:
+                gate = Gate(pmin, dmax, hmin)
+                prec, taken, tp, sl = score_gate(rows, gate)
+
+                # Hard constraints to avoid silly "precision=1.0 with 1 trade"
+                if (tp + sl) < 2:
+                    continue
+                if tp < 1:
+                    continue
+
+                cand = (prec, tp, taken, sl)
+                if cand[0] > best[0]:
+                    best = cand
+                    best_gate = gate
+                elif cand[0] == best[0]:
+                    # tie-break: prefer more TP
+                    if cand[1] > best[1]:
+                        best = cand
+                        best_gate = gate
+                    elif cand[1] == best[1]:
+                        # then prefer fewer SL
+                        if cand[3] < best[3]:
+                            best = cand
+                            best_gate = gate
+                        elif cand[3] == best[3]:
+                            # then prefer more taken (coverage)
+                            if cand[2] > best[2]:
+                                best = cand
+                                best_gate = gate
+
+    prec, taken, tp, sl = score_gate(rows, best_gate)
+    return best_gate, {"precision": prec, "taken": taken, "tp": tp, "sl": sl}
+
+# =============================================================================
+# Replay (single-position) + compounding (ETF Algo style)
+# =============================================================================
+
+@dataclass
+class ReplayTrade:
+    symbol: str
+    file_date: date          # signal day (file=...)
+    entry_day: date
+    entry_open: float
+    exit_day: date
+    exit_price: float
+    exit_reason: str         # TP/SL/TP_AMBIG/SL_AMBIG/MAX_HOLD
+    gain_pct: float
+
+
+def _gain_pct(entry: float, exit_px: float) -> float:
+    return (exit_px / max(entry, 1e-12) - 1.0) * 100.0
+
+
+def _fmt_d(d: date) -> str:
+    # Windows-friendly day/month formatting
+    return d.strftime("%Y-%m-%d")
+
+
+def evaluate_exit_reason_and_price(
+    *,
+    symbol: str,
+    entry_open: float,
+    day: date,
+    day_candle: Candle,
+    tp_pct: float,
+    sl_pct: float,
+    session: requests.Session,
+    cache: dict,
+    cache_path: Path,
+    intraday_interval: str,
+    ambiguous_fallback: str,
     resolve_ambiguous_intraday: bool,
 ) -> Optional[Tuple[str, float]]:
     """
     Returns (reason, exit_price) or None.
-
-    - If only TP hit in 1D: exit TP
-    - If only SL hit in 1D: exit SL
-    - If both hit in 1D:
-        - If resolve_ambiguous_intraday: use intraday candles to determine which hit first
-        - If cannot resolve or resolve_ambiguous_intraday=False: use ambiguous_fallback
+    Uses SAME logic as your ETF Algo: TP if hit, SL if hit, if both then intraday resolution else fallback.
     """
-    tp_price = pos.entry_open * (1.0 + tp_pct)
-    sl_price = pos.entry_open * (1.0 - sl_pct)
+    tp_price = entry_open * (1.0 + tp_pct)
+    sl_price = entry_open * (1.0 - sl_pct)
 
     hit_tp_1d = day_candle.h >= tp_price
     hit_sl_1d = day_candle.l <= sl_price
@@ -641,23 +643,23 @@ def evaluate_exit_realistic(
     if not hit_tp_1d and not hit_sl_1d:
         return None
 
-    # BOTH hit on 1D
+    # BOTH hit same day
+    intra: List[IntraCandle] = []
     if resolve_ambiguous_intraday:
         intra = get_intraday_cached_for_day(
-            pos.symbol, day_candle.day,
+            symbol, day,
             interval=intraday_interval,
             session=session, cache=cache, cache_path=cache_path,
         )
-    else:
-        intra = []
 
     if not intra:
         if ambiguous_fallback == "tp-first":
             return ("TP_AMBIG", tp_price)
         if ambiguous_fallback == "sl-first":
             return ("SL_AMBIG", sl_price)
-        return None
+        return None  # "none" -> unknown
 
+    # scan intraday candles in time order
     for c in intra:
         hit_tp = c.h >= tp_price
         hit_sl = c.l <= sl_price
@@ -667,6 +669,7 @@ def evaluate_exit_realistic(
         if hit_sl and not hit_tp:
             return ("SL", sl_price)
         if hit_tp and hit_sl:
+            # still ambiguous within this intraday candle
             if ambiguous_fallback == "tp-first":
                 return ("TP_AMBIG", tp_price)
             if ambiguous_fallback == "sl-first":
@@ -676,9 +679,171 @@ def evaluate_exit_realistic(
     return None
 
 
+def replay_single_position_from_gated_picks(
+    *,
+    gated_picks_by_file_date: Dict[date, SignalRow],  # one pick per file day (#01 per day)
+    entry_lag_days: int,
+    tp_pct: float,
+    sl_pct: float,
+    max_hold_days: int,
+    cache_path: Path,
+    intraday_interval: str,
+    ambiguous_fallback: str,
+    resolve_ambiguous_intraday: bool,
+    end_day: Optional[date] = None,  # default today UTC
+) -> Tuple[List["ReplayTrade"], float, Optional[dict]]:
+    """
+    Single-position replay (NO ROLLING):
+      - If FLAT: enter the pick for file_date on entry_day = file_date + entry_lag_days (at OPEN).
+      - If HOLDING: ignore ALL new picks until exit.
+      - Exit ONLY on TP/SL (intraday resolve when both hit same day) OR max_hold_days at CLOSE.
+
+    Returns:
+      trades            List[ReplayTrade] for CLOSED trades only
+      compounded_factor Product of (1 + gain) for CLOSED trades only
+      open_pos          dict describing OPEN position at end_day (or None)
+    """
+    if not gated_picks_by_file_date:
+        return [], 1.0, None
+
+    session = requests.Session()
+    cache = load_cache(cache_path)
+
+    file_days = sorted(gated_picks_by_file_date.keys())
+    start_entry_day = min(fd + timedelta(days=entry_lag_days) for fd in file_days)
+
+    if end_day is None:
+        end_day = datetime.utcnow().date()
+
+    # All symbols that could be traded (from the gated picks)
+    symbols = sorted({s.symbol for s in gated_picks_by_file_date.values()})
+
+    # Fetch candles for each symbol from the first possible entry day through end_day
+    candles_by_symbol: Dict[str, Dict[date, Candle]] = {}
+    for sym in symbols:
+        candles_by_symbol[sym] = get_candles_cached(
+            sym,
+            start_entry_day,
+            end_day,
+            session=session,
+            cache=cache,
+            cache_path=cache_path,
+        )
+
+    trades: List[ReplayTrade] = []
+    compounded = 1.0
+
+    holding_symbol: Optional[str] = None
+    holding_entry_open: float = 0.0
+    holding_entry_day: Optional[date] = None
+    holding_file_date: Optional[date] = None
+
+    d = start_entry_day
+    while d <= end_day:
+        # 1) If holding, check exit (TP/SL first; else MAX_HOLD at close)
+        if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
+            c = candles_by_symbol.get(holding_symbol, {}).get(d)
+            if c is not None and d >= holding_entry_day:
+                hit = evaluate_exit_reason_and_price(
+                    symbol=holding_symbol,
+                    entry_open=holding_entry_open,
+                    day=d,
+                    day_candle=c,
+                    tp_pct=tp_pct,
+                    sl_pct=sl_pct,
+                    session=session,
+                    cache=cache,
+                    cache_path=cache_path,
+                    intraday_interval=intraday_interval,
+                    ambiguous_fallback=ambiguous_fallback,
+                    resolve_ambiguous_intraday=resolve_ambiguous_intraday,
+                )
+
+                reason: Optional[str] = None
+                exit_px: Optional[float] = None
+
+                if hit is not None:
+                    reason, exit_px = hit
+                else:
+                    if max_hold_days > 0 and d >= (holding_entry_day + timedelta(days=max_hold_days)):
+                        reason = "MAX_HOLD"
+                        exit_px = c.c
+
+                if reason is not None and exit_px is not None:
+                    g = _gain_pct(holding_entry_open, float(exit_px))
+                    compounded *= (1.0 + g / 100.0)
+
+                    trades.append(
+                        ReplayTrade(
+                            symbol=holding_symbol,
+                            file_date=holding_file_date,
+                            entry_day=holding_entry_day,
+                            entry_open=holding_entry_open,
+                            exit_day=d,
+                            exit_price=float(exit_px),
+                            exit_reason=reason,
+                            gain_pct=g,
+                        )
+                    )
+
+                    # go FLAT
+                    holding_symbol = None
+                    holding_entry_open = 0.0
+                    holding_entry_day = None
+                    holding_file_date = None
+
+        # 2) If FLAT, see if a pick becomes active today (entry_day == d)
+        if holding_symbol is None:
+            candidates: List[SignalRow] = []
+            for fd, sig in gated_picks_by_file_date.items():
+                if fd + timedelta(days=entry_lag_days) == d:
+                    candidates.append(sig)
+
+            if candidates:
+                # If multiple map to same entry day, take highest p (tie-break lower drop, higher hits)
+                candidates.sort(key=lambda s: (-s.p, s.drop_p, -s.hits30d, s.symbol))
+                chosen = candidates[0]
+
+                c_entry = candles_by_symbol.get(chosen.symbol, {}).get(d)
+                if c_entry is not None:
+                    holding_symbol = chosen.symbol
+                    holding_entry_open = c_entry.o
+                    holding_entry_day = d
+                    holding_file_date = chosen.file_date
+
+        d += timedelta(days=1)
+
+    # Build open position summary (if still holding at end_day)
+    open_pos: Optional[dict] = None
+    if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
+        c_last = candles_by_symbol.get(holding_symbol, {}).get(end_day)
+        last_close = c_last.c if c_last else holding_entry_open
+        unreal = (last_close / max(holding_entry_open, 1e-12) - 1.0) * 100.0
+
+        open_pos = {
+            "symbol": holding_symbol,
+            "file_date": holding_file_date,
+            "entry_day": holding_entry_day,
+            "entry_open": float(holding_entry_open),
+            "last_day": end_day,
+            "last_close": float(last_close),
+            "unrealized_pct": float(unreal),
+        }
+
+    return trades, compounded, open_pos
+
 # =============================================================================
-# Binance trading (signed REST) + rounding helpers
+# Binance LIVE trading (Spot) + OCO exits
+# Drop these functions/classes into your script (gate_from_signals.py)
 # =============================================================================
+
+import hashlib
+import hmac
+from decimal import Decimal, ROUND_DOWN
+from urllib.parse import urlencode
+
+BINANCE_BASE = "https://api.binance.com"
+
 
 class BinanceHTTPError(RuntimeError):
     pass
@@ -721,7 +886,6 @@ class BinanceClient:
 
     def _get(self, path: str, params: dict, signed: bool = False, timeout: int = 30):
         url = self.base_url + path
-
         if not signed:
             r = self.session.get(url, params=params, timeout=timeout)
             if not r.ok:
@@ -736,6 +900,7 @@ class BinanceClient:
         full_url = url + "?" + qs
         r = self.session.get(full_url, timeout=timeout)
 
+        # auto re-sync time on -1021
         if r.status_code == 400:
             try:
                 j = r.json()
@@ -754,7 +919,6 @@ class BinanceClient:
 
     def _post(self, path: str, params: dict, signed: bool = True, timeout: int = 30):
         url = self.base_url + path
-
         if not signed:
             r = self.session.post(url, params=params, timeout=timeout)
             if not r.ok:
@@ -785,40 +949,7 @@ class BinanceClient:
             self._raise_binance(r)
         return r.json()
 
-    def _delete(self, path: str, params: dict, signed: bool = True, timeout: int = 30):
-        url = self.base_url + path
-
-        if not signed:
-            r = self.session.delete(url, params=params, timeout=timeout)
-            if not r.ok:
-                self._raise_binance(r)
-            return r.json()
-
-        p = dict(params)
-        p["timestamp"] = self._now_ms()
-        p.setdefault("recvWindow", 20000)
-
-        qs = self._sign_query(p)
-        full_url = url + "?" + qs
-        r = self.session.delete(full_url, timeout=timeout)
-
-        if r.status_code == 400:
-            try:
-                j = r.json()
-                if isinstance(j, dict) and j.get("code") == -1021:
-                    self._sync_time()
-                    p["timestamp"] = self._now_ms()
-                    qs = self._sign_query(p)
-                    full_url = url + "?" + qs
-                    r = self.session.delete(full_url, timeout=timeout)
-            except Exception:
-                pass
-
-        if not r.ok:
-            self._raise_binance(r)
-        return r.json()
-
-    # ----- endpoints -----
+    # -------- endpoints --------
 
     def exchange_info(self, symbol: str) -> dict:
         return self._get("/api/v3/exchangeInfo", {"symbol": symbol}, signed=False)
@@ -826,56 +957,40 @@ class BinanceClient:
     def account(self) -> dict:
         return self._get("/api/v3/account", {}, signed=True)
 
+    def open_orders(self, symbol: str) -> list:
+        return self._get("/api/v3/openOrders", {"symbol": symbol}, signed=True)
+
     def ticker_price(self, symbol: str) -> float:
         j = self._get("/api/v3/ticker/price", {"symbol": symbol}, signed=False)
         return float(j["price"])
 
-    def open_orders(self, symbol: str) -> list:
-        return self._get("/api/v3/openOrders", {"symbol": symbol}, signed=True)
-
-    def cancel_order(self, symbol: str, order_id: int) -> dict:
-        return self._delete("/api/v3/order", {"symbol": symbol, "orderId": order_id}, signed=True)
-
     def market_buy_quote_qty(self, symbol: str, quote_qty: Decimal) -> dict:
-        return self._post("/api/v3/order", {
-            "symbol": symbol,
-            "side": "BUY",
-            "type": "MARKET",
-            "quoteOrderQty": f"{quote_qty:f}",
-            "newOrderRespType": "FULL",
-        }, signed=True)
+        return self._post(
+            "/api/v3/order",
+            {
+                "symbol": symbol,
+                "side": "BUY",
+                "type": "MARKET",
+                "quoteOrderQty": f"{quote_qty:f}",
+                "newOrderRespType": "FULL",
+            },
+            signed=True,
+        )
 
     def oco_sell(self, symbol: str, quantity: Decimal, tp_price: Decimal, sl_stop: Decimal, sl_limit: Decimal) -> dict:
-        return self._post("/api/v3/order/oco", {
-            "symbol": symbol,
-            "side": "SELL",
-            "quantity": f"{quantity:f}",
-            "price": f"{tp_price:f}",
-            "stopPrice": f"{sl_stop:f}",
-            "stopLimitPrice": f"{sl_limit:f}",
-            "stopLimitTimeInForce": "GTC",
-        }, signed=True)
-
-    def order_limit_sell(self, symbol: str, quantity: Decimal, price: Decimal) -> dict:
-        return self._post("/api/v3/order", {
-            "symbol": symbol,
-            "side": "SELL",
-            "type": "LIMIT",
-            "timeInForce": "GTC",
-            "quantity": f"{quantity:f}",
-            "price": f"{price:f}",
-        }, signed=True)
-
-    def order_stop_loss_limit_sell(self, symbol: str, quantity: Decimal, stop_price: Decimal, limit_price: Decimal) -> dict:
-        return self._post("/api/v3/order", {
-            "symbol": symbol,
-            "side": "SELL",
-            "type": "STOP_LOSS_LIMIT",
-            "timeInForce": "GTC",
-            "quantity": f"{quantity:f}",
-            "stopPrice": f"{stop_price:f}",
-            "price": f"{limit_price:f}",
-        }, signed=True)
+        return self._post(
+            "/api/v3/order/oco",
+            {
+                "symbol": symbol,
+                "side": "SELL",
+                "quantity": f"{quantity:f}",
+                "price": f"{tp_price:f}",
+                "stopPrice": f"{sl_stop:f}",
+                "stopLimitPrice": f"{sl_limit:f}",
+                "stopLimitTimeInForce": "GTC",
+            },
+            signed=True,
+        )
 
 
 def _dec(x: float) -> Decimal:
@@ -892,18 +1007,26 @@ def _extract_symbol_filters(exchange_info_json: dict) -> Tuple[Decimal, Decimal]
     symbols = exchange_info_json.get("symbols") or []
     if not symbols:
         raise RuntimeError("exchangeInfo missing symbols[]")
+    filters = symbols[0].get("filters") or []
 
-    f = symbols[0].get("filters") or []
     tick_size = None
     step_size = None
-    for flt in f:
+    for flt in filters:
         if flt.get("filterType") == "PRICE_FILTER":
             tick_size = Decimal(str(flt.get("tickSize", "0")))
-        if flt.get("filterType") == "LOT_SIZE":
+        elif flt.get("filterType") == "LOT_SIZE":
             step_size = Decimal(str(flt.get("stepSize", "0")))
+
     if tick_size is None or step_size is None:
         raise RuntimeError("Could not find PRICE_FILTER / LOT_SIZE in exchangeInfo")
     return tick_size, step_size
+
+
+def _base_asset_from_symbol(symbol: str) -> str:
+    symbol = symbol.upper()
+    if symbol.endswith("USDT"):
+        return symbol[:-4]
+    raise ValueError("This live logic assumes USDT quote pairs only (symbol endswith USDT).")
 
 
 def _get_free_usdt(acct_json: dict) -> Decimal:
@@ -914,12 +1037,6 @@ def _get_free_usdt(acct_json: dict) -> Decimal:
             except Exception:
                 return Decimal("0")
     return Decimal("0")
-
-
-def _base_asset_from_symbol(symbol: str) -> str:
-    if symbol.endswith("USDT"):
-        return symbol[:-4]
-    raise ValueError("This script's live trading assumes USDT quote pairs only (endswith USDT).")
 
 
 def _get_free_asset(acct_json: dict, asset: str) -> Decimal:
@@ -945,6 +1062,12 @@ def _get_total_asset(acct_json: dict, asset: str) -> Decimal:
 
 
 def _find_exit_orders(open_orders: list) -> Tuple[Optional[dict], Optional[dict]]:
+    """
+    Heuristic:
+      - TP typically shows as LIMIT
+      - SL leg shows as STOP_LOSS_LIMIT (but OCO legs may appear differently across accounts)
+    This is “good enough” to avoid stacking extra exits.
+    """
     tp = None
     sl = None
     for o in open_orders:
@@ -956,107 +1079,41 @@ def _find_exit_orders(open_orders: list) -> Tuple[Optional[dict], Optional[dict]
     return tp, sl
 
 
-def _monitor_then_place_sl(
+def live_manage_or_buy_with_oco(
     *,
-    client: BinanceClient,
     symbol: str,
-    base_asset: str,
-    sl_stop: Decimal,
-    sl_limit: Decimal,
-    step_size: Decimal,
-    poll_sec: int = 5,
-) -> None:
-    print("\nMonitoring position for TP fill or SL trigger... (Ctrl+C to stop)")
-
-    while True:
-        try:
-            open_orders = client.open_orders(symbol)
-            tp_order, sl_order = _find_exit_orders(open_orders)
-
-            acct = client.account()
-            total_base = _get_total_asset(acct, base_asset)
-            free_base = _get_free_asset(acct, base_asset)
-
-            # Position gone (sold/filled) => done
-            if _round_step(total_base, step_size) <= 0:
-                print("Position likely closed (no remaining base). Done.")
-                return
-
-            # If SL already exists, keep waiting
-            if sl_order is not None:
-                time.sleep(poll_sec)
-                continue
-
-            # No SL order yet: check live price
-            px = Decimal(str(client.ticker_price(symbol)))
-            if px <= sl_stop:
-                print(f"\nSL trigger hit: price={px} <= {sl_stop}")
-
-                # Cancel TP so we can free up balance for SL order
-                if tp_order is not None:
-                    try:
-                        oid = int(tp_order.get("orderId"))
-                        print(f"Cancelling TP orderId={oid} ...")
-                        client.cancel_order(symbol, oid)
-                    except Exception as e:
-                        print(f"WARNING: Failed to cancel TP order: {e}")
-
-                # Re-check free qty and place SL
-                acct2 = client.account()
-                free_base2 = _get_free_asset(acct2, base_asset)
-                qty = _round_step(free_base2, step_size)
-
-                if qty <= 0:
-                    print(f"No FREE {base_asset} available to place SL (free={free_base2}). Done.")
-                    return
-
-                sl_resp = client.order_stop_loss_limit_sell(symbol, qty, sl_stop, sl_limit)
-                print("Placed SL STOP_LOSS_LIMIT sell:")
-                print(json.dumps(sl_resp, indent=2))
-                # after placing SL, continue monitoring
-            time.sleep(poll_sec)
-
-        except KeyboardInterrupt:
-            print("\nStopped monitoring. Note: You may have open orders on Binance.")
-            return
-        except Exception as e:
-            print(f"Monitor loop error: {e}")
-            time.sleep(max(5, poll_sec))
-
-
-def _prompt_manage_replay_open_position_spot(
-    *,
-    replay_pos: Position,
-    tp_pct: float,
-    sl_pct: float,
-    live_trade: bool,
-) -> None:
+    ref_entry_open: float,   # IMPORTANT: you asked TP/SL derived from ENTRY DATE OPEN
+    tp_pct: float,           # e.g. 0.20
+    sl_pct: float,           # e.g. 0.12
+    live_trade: bool,        # False => dry-run
+) -> bool:
     """
-    Option B prompt:
-    - If replay ends OPEN on symbol S, prompt to manage S on Binance.
-    - Uses replay_pos.entry_open to compute TP/SL levels (same as replay).
-    - If not holding S -> ask to buy it (if you want), then place exits.
+    If you already HOLD the symbol (spot) and you have NO exit orders open for it:
+      -> place OCO exits based on ref_entry_open (+20% / -12% etc.)
+
+    Else if you do NOT hold it:
+      -> ask to market buy with (almost) all free USDT, then place OCO exits based on ref_entry_open.
+
+    If exit orders already exist:
+      -> do nothing (return True).
+
+    Returns True if we handled an action path (including dry-run) else False.
     """
-    symbol = replay_pos.symbol.upper()
+    symbol = symbol.upper()
     base_asset = _base_asset_from_symbol(symbol)
 
-    tp_price = replay_pos.entry_open * (1.0 + tp_pct)
-    sl_price = replay_pos.entry_open * (1.0 - sl_pct)
-
-    print("\n" + "=" * 80)
-    print(f"BINANCE LIVE PROMPT (REPLAY OPEN POSITION): {symbol}")
-    print(f"Replay entry_open={replay_pos.entry_open:.8g} => TP={tp_price:.8g}  SL={sl_price:.8g}")
-    print("=" * 80)
-
     api_key = os.getenv("BINANCE_API_KEY", "tE06bWu6VfzgIB1wlyZfZzaZwPe0F6RyVQrp0Fh7B8fvTzNyhxe8UZSrJV3y0Iu0").strip()
-    api_secret = os.getenv("BINANCE_API_SECRET", "bFBUdNU7c8HBW3pNt2CnT1m7RlASUw6ReFsWYRqPFWLyj7NIjVFLK7j2BIaFTGLf").strip()
+    api_secret = os.getenv("BINANCE_API_SECRET",
+                           "bFBUdNU7c8HBW3pNt2CnT1m7RlASUw6ReFsWYRqPFWLyj7NIjVFLK7j2BIaFTGLf").strip()
     if not api_key or not api_secret:
-        print("ERROR: BINANCE_API_KEY / BINANCE_API_SECRET env vars not set. Cannot trade.")
-        return
+        print("ERROR: Set BINANCE_API_KEY and BINANCE_API_SECRET env vars.")
+        return False
 
     client = BinanceClient(api_key=api_key, api_secret=api_secret)
 
-    # Rounding filters
+    tp_price = ref_entry_open * (1.0 + tp_pct)
+    sl_price = ref_entry_open * (1.0 - sl_pct)
+
     ex = client.exchange_info(symbol)
     tick_size, step_size = _extract_symbol_filters(ex)
 
@@ -1064,596 +1121,423 @@ def _prompt_manage_replay_open_position_spot(
     sl_stop_dec = _round_step(_dec(sl_price), tick_size)
     sl_limit_dec = _round_step(sl_stop_dec * Decimal("0.999"), tick_size)  # slightly below stop
 
-    if tp_dec <= 0 or sl_stop_dec <= 0 or sl_limit_dec <= 0:
-        print("ERROR: Computed TP/SL invalid after rounding; aborting.")
-        return
+    print("\n" + "=" * 90)
+    print(f"BINANCE LIVE MANAGER: {symbol}")
+    print(f"ref_entry_open={ref_entry_open:.8g} -> TP={tp_dec}  SL(stop)={sl_stop_dec}  SL(limit)={sl_limit_dec}")
+    print("=" * 90)
 
     acct = client.account()
     free_usdt = _get_free_usdt(acct)
     total_base = _get_total_asset(acct, base_asset)
-    holding_threshold = step_size
 
     open_orders = client.open_orders(symbol)
     tp_order, sl_order = _find_exit_orders(open_orders)
 
-    # If exits already exist, do nothing (prevents stacking multiple OCOs)
     if tp_order or sl_order:
-        print("\nExisting exit orders detected — not placing another one.")
+        print("Existing exit orders detected — not placing another OCO.")
         if tp_order:
-            print(f"  TP: orderId={tp_order.get('orderId')} type={tp_order.get('type')} price={tp_order.get('price')}")
+            print(f"  TP: type={tp_order.get('type')} price={tp_order.get('price')} orderId={tp_order.get('orderId')}")
         if sl_order:
-            print(f"  SL: orderId={sl_order.get('orderId')} type={sl_order.get('type')} stopPrice={sl_order.get('stopPrice')} price={sl_order.get('price')}")
-        return
+            print(f"  SL: type={sl_order.get('type')} stopPrice={sl_order.get('stopPrice')} orderId={sl_order.get('orderId')}")
+        return True
 
-    # If already holding, offer to place exits (no buy)
+    holding_threshold = step_size  # “>= 1 step” means we consider it a holding
+
+    # ---- If holding: just place exits for FREE qty ----
     if total_base >= holding_threshold:
         free_base = _get_free_asset(acct, base_asset)
         qty = _round_step(free_base, step_size)
 
-        print(f"\nHolding {symbol} detected. total={total_base} {base_asset}, free={free_base} {base_asset}, step={step_size}")
+        print(f"Holding detected: total={total_base} {base_asset}, free={free_base} {base_asset}, qty_for_exits={qty}")
         if qty <= 0:
-            print(
-                f"No FREE {base_asset} available to place exits (free={free_base}, total={total_base}).\n"
-                "Your balance may be locked elsewhere. Check Binance open orders."
-            )
-            return
+            print("No FREE qty available (it may be locked). Check open orders/balance on Binance.")
+            return False
 
-        print(f"OCO levels (rounded): TP={tp_dec}  SL(stop)={sl_stop_dec}  SL(limit)={sl_limit_dec}")
-        ans = input(f"Do you want to PLACE OCO exits for {symbol} now? (yes/no): ").strip().lower()
+        ans = input("Place OCO exits now? (yes/no): ").strip().lower()
         if ans not in ("y", "yes"):
             print("Cancelled.")
-            return
+            return False
 
         if not live_trade:
-            print(f"\n[DRY-RUN] Would place OCO exits for qty={qty} {base_asset} on {symbol}")
-            return
+            print(f"[DRY-RUN] Would place OCO SELL qty={qty} on {symbol} at TP={tp_dec}, SL={sl_stop_dec}/{sl_limit_dec}")
+            return True
 
-        # Try OCO
-        try:
-            oco_resp = client.oco_sell(symbol=symbol, quantity=qty, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
-            print("\nOCO placed successfully:")
-            print(json.dumps(oco_resp, indent=2))
-            return
-        except Exception as e:
-            print(f"\nOCO failed; falling back to TP-first then conditional SL. Reason: {e}")
+        resp = client.oco_sell(symbol=symbol, quantity=qty, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
+        print("OCO placed:")
+        print(json.dumps(resp, indent=2))
+        return True
 
-        # Fallback: TP now, SL later if needed
-        tp_resp = client.order_limit_sell(symbol, qty, tp_dec)
-        print("Placed TP LIMIT sell:")
-        print(json.dumps(tp_resp, indent=2))
-        _monitor_then_place_sl(
-            client=client,
-            symbol=symbol,
-            base_asset=base_asset,
-            sl_stop=sl_stop_dec,
-            sl_limit=sl_limit_dec,
-            step_size=step_size,
-            poll_sec=5,
-        )
-        return
-
-    # Not holding: ask to buy then set exits
-    print(f"\nNot holding {base_asset}. USDT free={free_usdt}")
-
+    # ---- Not holding: buy then place exits ----
+    print(f"Not holding {base_asset}. Free USDT={free_usdt}")
     if free_usdt <= Decimal("0"):
-        print("WARNING: free USDT is 0; you cannot market-buy right now unless you free USDT.")
-    print(f"OCO levels (rounded): TP={tp_dec}  SL(stop)={sl_stop_dec}  SL(limit)={sl_limit_dec}")
+        print("No free USDT to buy.")
+        return False
 
-    ans = input(f"Do you want to BUY {symbol} now and place OCO exits? (yes/no): ").strip().lower()
+    ans = input("Buy now (market) and place OCO exits? (yes/no): ").strip().lower()
     if ans not in ("y", "yes"):
-        print("Trade cancelled.")
-        return
-
-    if not live_trade:
-        print("\n[DRY-RUN] Would buy + place OCO exits for:", symbol)
-        return
+        print("Cancelled.")
+        return False
 
     spend_usdt = (free_usdt * Decimal("0.999")).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
     if spend_usdt <= Decimal("0"):
-        print(f"ERROR: No available USDT to trade (free={free_usdt}).")
-        return
+        print("Spend calc resulted in 0.")
+        return False
 
-    print(f"\nUSDT available: {free_usdt}  -> spending: {spend_usdt}  (spot, market, no leverage)")
-    buy_resp = client.market_buy_quote_qty(symbol, spend_usdt)
+    if not live_trade:
+        print(f"[DRY-RUN] Would MARKET BUY {symbol} using quoteOrderQty={spend_usdt} then place OCO exits.")
+        return True
 
-    executed_qty = Decimal(str(buy_resp.get("executedQty", "0")))
-    cumm_quote = Decimal(str(buy_resp.get("cummulativeQuoteQty", "0")))
+    buy = client.market_buy_quote_qty(symbol, spend_usdt)
+    print("BUY response:")
+    print(json.dumps(buy, indent=2))
 
-    if executed_qty <= 0:
-        print("ERROR: Buy returned executedQty=0. Response:")
-        print(json.dumps(buy_resp, indent=2))
-        return
-
-    # Use actual FREE after buy (fees may reduce it)
     acct2 = client.account()
     free_base2 = _get_free_asset(acct2, base_asset)
-    qty_for_exit = _round_step(free_base2, step_size)
+    qty2 = _round_step(free_base2, step_size)
 
-    print("\nBUY filled:")
-    print(f"  executedQty:            {executed_qty}")
-    print(f"  quote spent (USDT):     {cumm_quote}")
-    print(f"  free {base_asset}:       {free_base2}")
-    print(f"  qty for exits (rounded): {qty_for_exit}")
+    print(f"Post-buy free {base_asset}={free_base2} -> qty_for_exits={qty2}")
+    if qty2 <= 0:
+        print("After buy, free qty rounds to 0 (stepSize). Place exits manually.")
+        return True
 
-    if qty_for_exit <= 0:
-        print(f"ERROR: After buy, free {base_asset} rounds to 0; cannot place exits automatically.")
-        print("You may need to place exits manually in Binance Spot UI.")
-        return
+    resp = client.oco_sell(symbol=symbol, quantity=qty2, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
+    print("OCO placed:")
+    print(json.dumps(resp, indent=2))
+    return True
 
-    # Try OCO
-    try:
-        oco_resp = client.oco_sell(symbol=symbol, quantity=qty_for_exit, tp_price=tp_dec, sl_stop=sl_stop_dec, sl_limit=sl_limit_dec)
-        print("\nOCO placed successfully:")
-        print(json.dumps(oco_resp, indent=2))
-        return
-    except Exception as e:
-        print(f"\nOCO failed; falling back to TP-first then conditional SL. Reason: {e}")
-
-    # Fallback: TP now, SL later if needed
-    tp_resp = client.order_limit_sell(symbol, qty_for_exit, tp_dec)
-    print("Placed TP LIMIT sell:")
-    print(json.dumps(tp_resp, indent=2))
-    _monitor_then_place_sl(
-        client=client,
-        symbol=symbol,
-        base_asset=base_asset,
-        sl_stop=sl_stop_dec,
-        sl_limit=sl_limit_dec,
-        step_size=step_size,
-        poll_sec=5,
-    )
-
-
-# =============================================================================
-# Engine (SINGLE POSITION)
-# =============================================================================
-
-def run_replay_single_position(
+def run_live_prompt_after_gate(
     *,
-    signals_path: Path,
-    signals: List[Signal],
-    raw_blocks: Dict[date, List[str]],
-    start_day: date,
-    end_day: date,
+    open_pos: Optional[dict],
+    gated_picks_by_file_date: Dict[date, SignalRow],  # your #01-per-day picks (future blocks)
     entry_lag_days: int,
     tp_pct: float,
     sl_pct: float,
     cache_path: Path,
-    intraday_interval: str,
-    ambiguous_fallback: str,
-    resolve_ambiguous_intraday: bool,
-    max_hold_days: int,
-    trail_pct: float,
-    time_stop_days: int,
-    time_stop_min_gain: float,
-    ask_to_buy_today: bool,
     live_trade: bool,
 ) -> None:
-    session = requests.Session()
-    cache = load_cache(cache_path)
-    last_p_by_symbol: Dict[str, float] = {}
+    """
+    Live behavior you asked for:
 
-    # Build signals by ENTRY day (file_date + lag)
-    sig_by_entry_day: Dict[date, List[Signal]] = {}
-    for s in signals:
-        e = s.file_date + timedelta(days=entry_lag_days)
-        sig_by_entry_day.setdefault(e, []).append(s)
+    1) If we have an OPEN position from the replay (open_pos != None),
+       we assume that's the position to manage NOW:
+         - Do NOT buy anything new
+         - Just add OCO exits for it (if you’re holding it and no exits exist)
 
-    symbols_all = sorted({s.symbol for s in signals})
+    2) Else (no open_pos), take the latest available gated pick (max file_date),
+       compute its ENTRY OPEN from Binance 1D candle on entry_day = file_date + lag,
+       then:
+         - If already holding it -> add OCO exits
+         - Else -> optionally buy then add OCO exits
 
-    candles_by_symbol: Dict[str, Dict[date, Candle]] = {}
-    for sym in symbols_all:
-        candles_by_symbol[sym] = get_candles_cached(
-            sym, start_day, end_day,
-            session=session, cache=cache, cache_path=cache_path,
-        )
-
-    def fmt_d(d: date) -> str:
-        return d.strftime("%-d-%-m-%Y") if os.name != "nt" else d.strftime("%#d-%#m-%Y")
-
-    def gain_pct(entry: float, px: float) -> float:
-        return (px / max(entry, 1e-12) - 1.0) * 100.0
-
-    compounded_factor = 1.0
-    total_realised_gain = 0.0
-    num_closed_trades = 0
-
-    pos: Optional[Position] = None
-    trades: List[Position] = []
-
-    print("=" * 80)
-    print("ETF REPLAY (SINGLE POSITION ROTATION, horizon-bounded, ambiguity aligned)")
-    print("=" * 80)
-    print(f"Replay window (UTC days): {start_day.isoformat()} .. {end_day.isoformat()}")
-    print(f"Entry lag days: {entry_lag_days}  TP: {tp_pct*100:.0f}%  SL: {sl_pct*100:.0f}%")
-    print(f"Max hold days: {max_hold_days} (exit at CLOSE on day entry+max_hold)")
-    print(f"Trail pct: {trail_pct*100:.1f}%  Time stop: {time_stop_days}d (min gain {time_stop_min_gain*100:.1f}%)")
-    print(f"Intraday interval: {intraday_interval}  Resolve ambiguous intraday: {resolve_ambiguous_intraday}")
-    print(f"Ambiguous fallback: {ambiguous_fallback}")
-    print(f"Signals parsed: {len(signals)}  Symbols: {len(symbols_all)}")
-    print(f"Cache: {cache_path}")
-    print("=" * 80)
-
-    d = start_day
-    while d <= end_day:
-        day_header_printed = False
-
-        # 1) Update/exit existing position
-        if pos is not None and pos.status == "OPEN":
-            day_candle = candles_by_symbol.get(pos.symbol, {}).get(d)
-
-            if not day_header_printed:
-                print(f"\n----\nDate {fmt_d(d)}")
-                day_header_printed = True
-
-            if day_candle is None:
-                print(f"Holding {pos.symbol}: (missing 1D candle for {d.isoformat()})")
-            else:
-                pos.last_close = day_candle.c
-                if not (pos.peak_close == pos.peak_close):
-                    pos.peak_close = day_candle.c
-                pos.peak_close = max(pos.peak_close, day_candle.c)
-
-                if d >= pos.entry_day:
-                    exit_hit = evaluate_exit_realistic(
-                        pos=pos,
-                        day_candle=day_candle,
-                        tp_pct=tp_pct,
-                        sl_pct=sl_pct,
-                        session=session,
-                        cache=cache,
-                        cache_path=cache_path,
-                        intraday_interval=intraday_interval,
-                        ambiguous_fallback=ambiguous_fallback,
-                        resolve_ambiguous_intraday=resolve_ambiguous_intraday,
-                    )
-
-                    # Trailing stop (CLOSE-based)
-                    if exit_hit is None and trail_pct > 0:
-                        trail_px = pos.peak_close * (1.0 - trail_pct)
-                        if day_candle.c <= trail_px:
-                            exit_hit = ("TRAIL", day_candle.c)
-
-                    # Time stop (CLOSE-based)
-                    if exit_hit is None and time_stop_days > 0:
-                        age = (d - pos.entry_day).days
-                        if age >= time_stop_days:
-                            if day_candle.c < pos.entry_open * (1.0 + time_stop_min_gain):
-                                exit_hit = ("TIME", day_candle.c)
-
-                    # Max hold (CLOSE-based)
-                    if exit_hit is None and max_hold_days > 0:
-                        if d >= (pos.entry_day + timedelta(days=max_hold_days)):
-                            exit_hit = ("MAX_HOLD", day_candle.c)
-
-                    if exit_hit is not None:
-                        reason, exit_price = exit_hit
-                        pos.status = "CLOSED"
-                        pos.exit_day = d
-                        pos.exit_price = float(exit_price)
-                        pos.exit_reason = reason
-
-                        g = gain_pct(pos.entry_open, pos.exit_price)
-                        total_realised_gain += g
-                        num_closed_trades += 1
-                        compounded_factor *= (1.0 + g / 100.0)
-
-                        print("\n" + "=" * 80)
-                        print(
-                            f"Sold {pos.symbol}: close={day_candle.c:.8g}, high={day_candle.h:.8g}, low={day_candle.l:.8g}, "
-                            f"exit={pos.exit_price:.8g} ({reason}), gain={g:.2f}%."
-                        )
-                        pos = None  # flat
-
-        # 2) Entries + rotation
-        entry_signals = sig_by_entry_day.get(d, [])
-        if entry_signals:
-            if not day_header_printed:
-                print(f"\n----\nDate {fmt_d(d)}")
-                day_header_printed = True
-
-            # print raw blocks for the source file_date(s)
-            src_file_dates = sorted({s.file_date for s in entry_signals})
-            for fd in src_file_dates:
-                blk = raw_blocks.get(fd, [])
-                if blk:
-                    print("")
-                    for line in blk:
-                        print(line)
-
-            # best p per symbol for TODAY
-            best_today_by_symbol: Dict[str, Signal] = {}
-            for s in entry_signals:
-                cur = best_today_by_symbol.get(s.symbol)
-                if cur is None or s.p > cur.p:
-                    best_today_by_symbol[s.symbol] = s
-
-            # Entry filter: p > 0.61 OR prev_p < today_p (and today_p>0)
-            # Entry filter (new rule):
-            # - If symbol seen before: require today's p > last time's p (and still >= 0.60)
-            # Entry filter (existing rules) + NEW SOLO RULE:
-            # Existing:
-            #   - If symbol not seen before: require p >= 0.60
-            #   - If symbol seen before: require today's p > prev_p
-            #
-            # NEW:
-            #   - If there is ONLY ONE unique symbol today and its p >= 0.55,
-            #     allow it even if it fails the existing rules.
-            eligible: List[Signal] = []
-
-            # NEW: solo override candidate (only if exactly 1 symbol today)
-            solo_override: Optional[Signal] = None
-            if len(best_today_by_symbol) == 1:
-                solo_override = next(iter(best_today_by_symbol.values()))
-                if solo_override.p < 0.55:
-                    solo_override = None  # not strong enough for solo rule
-
-            for sym, s in best_today_by_symbol.items():
-                prev_p = last_p_by_symbol.get(sym)
-
-                not_seen_before_and_ok = (prev_p is None and s.p >= 0.60)
-                higher_than_prev = (prev_p is not None and s.p > prev_p)  # rule 3 (covers rule 1 too)
-
-                passed_normal = (not_seen_before_and_ok or higher_than_prev)
-                passed_solo = (solo_override is not None and s.symbol == solo_override.symbol)
-
-                if passed_normal or passed_solo:
-                    eligible.append(s)
-            if not eligible:
-                # still record last seen p for today’s signals
-                for sym, s in best_today_by_symbol.items():
-                    last_p_by_symbol[sym] = s.p
-
-                print(
-                    "\n(note) Signals present but none passed entry filter: "
-                    "new symbols need p>=0.60; previously-seen symbols need p>prev_p; "
-                    "solo rule only applies when exactly 1 symbol today and p>=0.55."
-                )
-                d += timedelta(days=1)
-                continue
-
-            eligible.sort(key=lambda s: (s.p, s.symbol), reverse=True)
-            chosen = eligible[0]
-
-
-            eligible.sort(key=lambda s: (s.p, s.symbol), reverse=True)
-            chosen = eligible[0]
-            chosen_sym = chosen.symbol
-
-            # rotation DISABLED: ignore new signals while holding an OPEN position
-            if pos is not None and pos.status == "OPEN":
-                if pos.symbol != chosen_sym:
-                    print(
-                        f"\n(note) Signal for {chosen_sym} arrived but holding {pos.symbol}. Rotation disabled; no action.")
-                else:
-                    print(f"\n(note) Signal for {chosen_sym} arrived but already holding it. No action.")
-
-                # still record last seen p for today’s signals
-                for sym, s in best_today_by_symbol.items():
-                    last_p_by_symbol[sym] = s.p
-
-                d += timedelta(days=1)
-                continue
-
-            # If flat, enter chosen on today's OPEN
-            if pos is None:
-                c_new = candles_by_symbol.get(chosen_sym, {}).get(d)
-                if c_new is None:
-                    print(f"\n(buy failed) {chosen_sym} entry_day={d.isoformat()} missing 1D candle data.")
-                else:
-                    pos = Position(
-                        symbol=chosen_sym,
-                        entry_day=d,
-                        entry_open=c_new.o,
-                        status="OPEN",
-                        peak_close=c_new.c,
-                        last_close=c_new.c,
-                    )
-                    trades.append(pos)
-
-                    tp_price = pos.entry_open * (1.0 + tp_pct)
-                    sl_price = pos.entry_open * (1.0 - sl_pct)
-                    p_txt = f" p={chosen.p:.3f}" if chosen.p > 0 else ""
-                    print(
-                        f"\nBought {chosen_sym} on {fmt_d(d)} from file={chosen.file_date.isoformat()}{p_txt} "
-                        f"at buy price (open={pos.entry_open:.8g}). "
-                        f"Waiting for TP (>= {tp_price:.8g}) or SL (<= {sl_price:.8g})."
-                    )
-            else:
-                if pos.symbol == chosen_sym:
-                    print(f"\n(note) Signal for {chosen_sym} arrived but already holding it. No action.")
-                else:
-                    print(f"\n(note) Signal for {chosen_sym} arrived but still holding {pos.symbol}. No entry.")
-
-            # Update last seen p for symbols that had signals today
-            for sym, s in best_today_by_symbol.items():
-                last_p_by_symbol[sym] = s.p
-
-        d += timedelta(days=1)
-
-    # Final summaries
-    print("\n" + "=" * 80)
-    print("FINAL POSITIONS / TRADES")
-    print("=" * 80)
-
-    for i, p in enumerate(trades, start=1):
-        if p.status == "OPEN":
-            last_px = p.last_close if (p.last_close == p.last_close) else p.entry_open
-            g = gain_pct(p.entry_open, last_px)
-            print(
-                f"{i:03d}. {p.symbol}: OPEN  entry_day={p.entry_day.isoformat()} entry_open={p.entry_open:.8g} "
-                f"last_close={last_px:.8g} gain={g:.2f}%"
-            )
-        else:
-            exit_px = float(p.exit_price or p.entry_open)
-            g = gain_pct(p.entry_open, exit_px)
-            print(
-                f"{i:03d}. {p.symbol}: CLOSED entry_day={p.entry_day.isoformat()} exit_day={(p.exit_day.isoformat() if p.exit_day else '')} "
-                f"exit={exit_px:.8g} reason={p.exit_reason} gain={g:.2f}%"
-            )
-
-    print("\n" + "=" * 80)
-    print("PERFORMANCE SUMMARY (CLOSED TRADES)")
-    print("=" * 80)
-    if num_closed_trades > 0:
-        avg_gain = total_realised_gain / num_closed_trades
-        print(f"Closed trades:        {num_closed_trades}")
-        print(f"Total realised gain:  {total_realised_gain:.2f}%")
-        print(f"AVG gain per trade:   {avg_gain:.2f}%")
-    else:
-        print("No closed trades yet — cannot compute average.")
-
-    compounded_pct = (compounded_factor - 1.0) * 100.0
-    print(f"Compounded gain:      {compounded_pct:.2f}%")
-    print("=" * 80)
-
-    # Option B live prompt: only if REPLAY ends OPEN
-    # Option B live prompt:
-    # - If replay ends OPEN: prompt that symbol (single option)
-    # - If replay ends FLAT: prompt through latest file= block (multiple options)
-    if ask_to_buy_today:
-        candidates: List[Tuple[str, float, str]] = []
-
-        if pos is not None and pos.status == "OPEN":
-            candidates.append((pos.symbol, pos.entry_open, "replay-open"))
-        else:
-            print("\n" + "=" * 80)
-            print("BINANCE LIVE PROMPT")
-            print("=" * 80)
-            print("Replay ended FLAT. No live action.")
-            return
-
-            # Use today's OPEN price (entry day = file_date + entry_lag_days) as reference if candle exists;
-            # otherwise fallback to last known close in cache; otherwise skip that candidate.
-            for s in latest:
-                entry_day = s.file_date + timedelta(days=entry_lag_days)
-                c = candles_by_symbol.get(s.symbol, {}).get(entry_day)
-                if c is not None:
-                    ref_open = c.o
-                    label = f"latest-block p={s.p:.3f} entry_day={entry_day.isoformat()}"
-                    candidates.append((s.symbol, ref_open, label))
-                else:
-                    # fallback: try end_day candle close
-                    c2 = candles_by_symbol.get(s.symbol, {}).get(end_day)
-                    if c2 is not None:
-                        ref_open = c2.c
-                        label = f"latest-block p={s.p:.3f} (fallback close {end_day.isoformat()})"
-                        candidates.append((s.symbol, ref_open, label))
-
-        _prompt_manage_candidates_spot(
-            candidates=candidates,
+    TP/SL levels are always based on that entry_open (your requirement).
+    """
+    # Case 1: manage existing open position
+    if open_pos is not None:
+        sym = str(open_pos["symbol"]).upper()
+        ref_entry_open = float(open_pos["entry_open"])
+        print("\n" + "=" * 90)
+        print("LIVE: managing OPEN position from replay (no new buys)")
+        print("=" * 90)
+        live_manage_or_buy_with_oco(
+            symbol=sym,
+            ref_entry_open=ref_entry_open,
             tp_pct=tp_pct,
             sl_pct=sl_pct,
             live_trade=live_trade,
-            signals_path=signals_path,
         )
+        return
 
+    # Case 2: no open position -> use latest gated pick
+    if not gated_picks_by_file_date:
+        print("\nLIVE: no gated picks available to buy/manage.")
+        return
+
+    latest_fd = max(gated_picks_by_file_date.keys())
+    pick = gated_picks_by_file_date[latest_fd]
+    entry_day = latest_fd + timedelta(days=int(entry_lag_days))
+
+    # fetch entry day's OPEN for that symbol (this is your TP/SL anchor)
+    session = requests.Session()
+    cache = load_cache(cache_path)
+    candles = get_candles_cached(
+        pick.symbol,
+        entry_day,
+        entry_day,
+        session=session,
+        cache=cache,
+        cache_path=cache_path,
+    )
+    c = candles.get(entry_day)
+    if c is None:
+        print(f"\nLIVE: missing entry candle for {pick.symbol} on {entry_day.isoformat()} -> cannot compute entry_open anchor.")
+        return
+
+    print("\n" + "=" * 90)
+    print(f"LIVE: latest gated pick is file={latest_fd.isoformat()} -> entry_day={entry_day.isoformat()}")
+    print(f"  #01 BUY {pick.symbol}  p={pick.p:.3f} hits30d={pick.hits30d} featDropP={pick.drop_p:.3f}")
+    print("=" * 90)
+
+    live_manage_or_buy_with_oco(
+        symbol=pick.symbol,
+        ref_entry_open=float(c.o),
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        live_trade=live_trade,
+    )
 
 
 # =============================================================================
-# CLI
+# Main
 # =============================================================================
-
-def _parse_date(s: str) -> date:
-    return datetime.strptime(s, "%Y-%m-%d").date()
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--signals-file", required=True)
-    ap.add_argument("--entry-lag-days", type=int, default=1)
-
-    ap.add_argument("--tp-pct", type=float, default=0.20)
-    ap.add_argument("--sl-pct", type=float, default=0.12)
-
-    ap.add_argument("--start", default="", help="Optional override YYYY-MM-DD")
-    ap.add_argument("--end", default="", help="Optional override YYYY-MM-DD")
     ap.add_argument("--cache-path", default="binance_cache.json")
 
-    ap.add_argument("--intraday-interval", default="1m", choices=["1m", "3m", "5m", "15m", "30m", "1h"])
-    ap.add_argument(
-        "--ambiguous-fallback",
-        default="sl-first",
-        choices=["none", "tp-first", "sl-first"],
-        help="If intraday cannot resolve (or disabled), what to do on TP+SL same day.",
-    )
-    ap.add_argument(
-        "--no-intraday-resolve",
-        action="store_true",
-        help="Disable intraday resolution entirely (more like your daily-label world).",
-    )
+    ap.add_argument("--entry-lag-days", type=int, default=1)
+    ap.add_argument("--tp-pct", type=float, default=0.20)
+    ap.add_argument("--sl-pct", type=float, default=0.12)
+    ap.add_argument("--max-hold-days", type=int, default=21)
 
-    # Alignment knobs
-    ap.add_argument("--max-hold-days", type=int, default=21, help="Exit at CLOSE on/after entry_day + max_hold_days.")
-    ap.add_argument("--trail-pct", type=float, default=0.12, help="Trailing stop pct off PEAK CLOSE (0 disables).")
-    ap.add_argument("--time-stop-days", type=int, default=14, help="Time stop days (0 disables).")
-    ap.add_argument("--time-stop-min-gain", type=float, default=0.05, help="Min gain required at time stop.")
+    ap.add_argument("--calibration-days", type=int, default=5,
+                    help="How many file= blocks from predict_from to use as calibration.")
+    ap.add_argument("--intraday-interval", default="1m",
+                    choices=["1m", "3m", "5m", "15m", "30m", "1h"])
+    ap.add_argument("--ambiguous-fallback", default="sl-first",
+                    choices=["none", "tp-first", "sl-first"])
+    ap.add_argument("--no-intraday-resolve", action="store_true",
+                    help="Disable intraday disambiguation (faster, less accurate).")
 
-    # Live prompt + trading
+    # ---- MISSING FLAGS (your crash) ----
     ap.add_argument("--ask-to-buy-today", action="store_true",
-                    help="(Option B) Prompt: replay-open or latest-block candidates.")
+                    help="After gate+replay, manage open position (or latest gated pick) on Binance.")
     ap.add_argument("--live-trade", action="store_true",
-                    help="Actually place Binance Spot orders (else dry-run).")
+                    help="Actually place orders on Binance (default is DRY-RUN).")
 
     args = ap.parse_args()
 
-    # Parse once
     signals_path = Path(args.signals_file)
     if not signals_path.exists():
-        print(f"ERROR: signals file not found: {signals_path}", file=sys.stderr)
+        print(f"ERROR: signals file not found: {signals_path}")
         return 2
 
-    # Restart loop: reload signals + rerun replay until it completes without RestartRun
-    run_count = 0
-    while True:
-        run_count += 1
-        try:
-            print("\n" + "#" * 80)
-            print(f"RUN #{run_count}  (signals={signals_path})")
-            print("#" * 80 + "\n")
+    trained_through, predict_from, signals, raw_blocks = load_signals_file(signals_path)
+    if not signals:
+        print("ERROR: No BUY lines found.")
+        return 2
 
-            signals, raw_blocks = load_signals_file(signals_path)
-            if not signals:
-                print("ERROR: No signals found after filtering. Nothing to do.", file=sys.stderr)
-                return 2
+    file_dates = sorted(raw_blocks.keys())
+    if not file_dates:
+        print("ERROR: No file= blocks found.")
+        return 2
 
-            file_dates = sorted({s.file_date for s in signals})
-            start_day = _parse_date(args.start) if args.start else min(file_dates) + timedelta(days=int(args.entry_lag_days))
-            end_day = _parse_date(args.end) if args.end else datetime.utcnow().date()
+    if trained_through is None:
+        trained_through = max(file_dates)
+        print(f"[warn] No 'Model trained_through' found in header. Using latest file date as trained_through: {trained_through.isoformat()}")
 
-            if end_day < start_day:
-                print(f"ERROR: end < start ({end_day} < {start_day})", file=sys.stderr)
-                return 2
+    # Calibration = known data (<= trained_through)
+    calib_file_dates = [d for d in file_dates if d <= trained_through]
+    if not calib_file_dates:
+        print(f"ERROR: No calibration blocks <= trained_through ({trained_through.isoformat()}).")
+        return 2
+    calib_end = max(calib_file_dates)
 
-            run_replay_single_position(
-                signals_path=signals_path,
-                signals=signals,
-                raw_blocks=raw_blocks,
-                start_day=start_day,
-                end_day=end_day,
-                entry_lag_days=int(args.entry_lag_days),
-                tp_pct=float(args.tp_pct),
-                sl_pct=float(args.sl_pct),
-                cache_path=Path(args.cache_path),
-                intraday_interval=str(args.intraday_interval),
-                ambiguous_fallback=str(args.ambiguous_fallback),
-                resolve_ambiguous_intraday=not bool(args.no_intraday_resolve),
-                max_hold_days=int(args.max_hold_days),
-                trail_pct=float(args.trail_pct),
-                time_stop_days=int(args.time_stop_days),
-                time_stop_min_gain=float(args.time_stop_min_gain),
-                ask_to_buy_today=bool(args.ask_to_buy_today),
-                live_trade=bool(args.live_trade),
-            )
-            return 0
+    # Future = predicted window (> trained_through)
+    future_file_dates = [d for d in file_dates if d > calib_end]
 
-        except RestartRun:
-            print("\n[restart] signals.txt updated. Reloading signals + rerunning from scratch...\n")
+    # Group signals by file_date
+    sig_by_file: Dict[date, List[SignalRow]] = {}
+    for s in signals:
+        sig_by_file.setdefault(s.file_date, []).append(s)
+
+    lag = int(args.entry_lag_days)
+    max_hold = int(args.max_hold_days)
+
+    # Candle range needed for calibration simulation (entry day through hold window)
+    calib_min_entry = min(d + timedelta(days=lag) for d in calib_file_dates)
+    calib_max_last = max(d + timedelta(days=lag + max_hold) for d in calib_file_dates)
+
+    today_utc = datetime.utcnow().date()
+    fetch_end = min(calib_max_last, today_utc)
+
+    session = requests.Session()
+    cache_path = Path(args.cache_path)
+    cache = load_cache(cache_path)
+
+    symbols_calib = sorted({s.symbol for d in calib_file_dates for s in sig_by_file.get(d, [])})
+    candles_by_symbol: Dict[str, Dict[date, Candle]] = {}
+    for sym in symbols_calib:
+        candles_by_symbol[sym] = get_candles_cached(
+            sym,
+            calib_min_entry,
+            fetch_end,
+            session=session,
+            cache=cache,
+            cache_path=cache_path,
+        )
+
+    resolve_intraday = not bool(args.no_intraday_resolve)
+
+    print("\n" + "=" * 90)
+    print("CALIBRATION (simulate TP vs SL first)")
+    print("=" * 90)
+    print(f"predict_from:        {(predict_from.isoformat() if predict_from else '(missing)')}")
+    print(f"calibration blocks:  {calib_file_dates[0].isoformat()} .. {calib_end.isoformat()}  (N={len(calib_file_dates)})")
+    print(f"entry_lag_days:      {lag}")
+    print(f"tp_pct / sl_pct:     {args.tp_pct:.2f} / {args.sl_pct:.2f}")
+    print(f"max_hold_days:       {max_hold}")
+    print(f"intraday_interval:   {args.intraday_interval}  (resolve={resolve_intraday}, fallback={args.ambiguous_fallback})")
+    print(f"candle fetch range:  {calib_min_entry.isoformat()} .. {fetch_end.isoformat()}  (today_utc={today_utc.isoformat()})")
+    print("=" * 90)
+
+    calib_rows: List[CalibRow] = []
+    decided_tp = 0
+    decided_sl = 0
+    undecided = 0
+    missing = 0
+
+    for fd in calib_file_dates:
+        rows = sig_by_file.get(fd, [])
+        if not rows:
             continue
 
-        except KeyboardInterrupt:
-            print("\nInterrupted by user.")
-            return 130
+        print(f"\nfile={fd.isoformat()}  (rows={len(rows)})")
+
+        for r in sorted(rows, key=lambda x: (-x.p, x.symbol)):
+            entry_day = fd + timedelta(days=lag)
+            c_entry = candles_by_symbol.get(r.symbol, {}).get(entry_day)
+            if c_entry is None:
+                missing += 1
+                print(f"  {r.symbol:10s} p={r.p:.3f} drop={r.drop_p:.3f} hits={r.hits30d:2d}  -> SKIP (missing entry candle {entry_day.isoformat()})")
+                continue
+
+            outcome = simulate_trade_outcome(
+                symbol=r.symbol,
+                entry_day=entry_day,
+                entry_open=c_entry.o,
+                candles_by_day=candles_by_symbol.get(r.symbol, {}),
+                tp_pct=float(args.tp_pct),
+                sl_pct=float(args.sl_pct),
+                max_hold_days=max_hold,
+                session=session,
+                cache=cache,
+                cache_path=cache_path,
+                intraday_interval=str(args.intraday_interval),
+                ambiguous_fallback=str(args.ambiguous_fallback),
+                resolve_ambiguous_intraday=resolve_intraday,
+            )
+
+            calib_rows.append(CalibRow(sig=r, outcome=outcome))
+            if outcome == "TP":
+                decided_tp += 1
+            elif outcome == "SL":
+                decided_sl += 1
+            else:
+                undecided += 1
+
+            print(f"  {r.symbol:10s} p={r.p:.3f} drop={r.drop_p:.3f} hits={r.hits30d:2d}  -> {outcome}")
+
+    print("\n" + "-" * 90)
+    print(f"Calibration outcomes: TP={decided_tp}  SL={decided_sl}  OTHER={undecided}  missing_entry={missing}")
+    print("-" * 90)
+
+    gate, metrics = pick_best_gate(calib_rows)
+
+    print("\n" + "=" * 90)
+    print("CHOSEN GATE (fit on calibration)")
+    print("=" * 90)
+    print(f"BUY if: p >= {gate.p_min:.2f}  AND  featDropP <= {gate.drop_max:.2f}  AND  hits30d >= {gate.hits_min}")
+    print(f"Calibration precision (TP/(TP+SL)): {metrics['precision']:.3f}   taken={int(metrics['taken'])}  TP={int(metrics['tp'])}  SL={int(metrics['sl'])}")
+    print("=" * 90)
+
+    if not future_file_dates:
+        print("\n(no future blocks after calibration end — nothing to recommend)")
+        return 0
+
+    print("\n" + "=" * 90)
+    print("RECOMMENDED BUYS (apply gate to remaining predicted days)")
+    print("=" * 90)
+
+    gated_picks_by_file_date: Dict[date, SignalRow] = {}
+
+    for fd in future_file_dates:
+        rows = sig_by_file.get(fd, [])
+        if not rows:
+            continue
+
+        passed = [r for r in rows if passes_gate(r, gate)]
+        passed.sort(key=lambda x: (-x.p, x.drop_p, -x.hits30d, x.symbol))
+
+        print(f"\nfile={fd.isoformat()}  (passed {len(passed)}/{len(rows)})")
+        if not passed:
+            print("  (none)")
+            continue
+
+        for i, r in enumerate(passed, start=1):
+            print(f"  #{i:02d} BUY {r.symbol:10s}  p={r.p:.3f}  hits30d={r.hits30d:2d}  featDropP={r.drop_p:.3f}")
+
+        gated_picks_by_file_date[fd] = passed[0]  # #01 per day
+
+    trades, compounded_factor, open_pos = replay_single_position_from_gated_picks(
+        gated_picks_by_file_date=gated_picks_by_file_date,
+        entry_lag_days=int(args.entry_lag_days),
+        tp_pct=float(args.tp_pct),
+        sl_pct=float(args.sl_pct),
+        max_hold_days=int(args.max_hold_days),
+        cache_path=Path(args.cache_path),
+        intraday_interval=str(args.intraday_interval),
+        ambiguous_fallback=str(args.ambiguous_fallback),
+        resolve_ambiguous_intraday=not bool(args.no_intraday_resolve),
+        end_day=datetime.utcnow().date(),
+    )
+
+    print("\n" + "=" * 90)
+    print("REPLAY (SINGLE POSITION) ON GATED PICKS  (#01 per day)")
+    print("=" * 90)
+
+    if not trades:
+        print("No CLOSED trades in replay window (maybe still holding / missing candles).")
+    else:
+        for i, t in enumerate(trades, start=1):
+            print(
+                f"{i:03d}. {t.symbol:10s}  signal_file={t.file_date.isoformat()}  "
+                f"entry={t.entry_day.isoformat()} open={t.entry_open:.8g}  "
+                f"exit={t.exit_day.isoformat()} px={t.exit_price:.8g}  "
+                f"reason={t.exit_reason:9s}  gain={t.gain_pct:+.2f}%"
+            )
+
+    if open_pos is not None:
+        print("\nOPEN POSITION (not closed yet):")
+        print(
+            f"  {open_pos['symbol']}  "
+            f"signal_file={open_pos['file_date'].isoformat()}  "
+            f"entry={open_pos['entry_day'].isoformat()}  "
+            f"open={open_pos['entry_open']:.8g}  "
+            f"last_day={open_pos['last_day'].isoformat()}  "
+            f"last_close={open_pos['last_close']:.8g}  "
+            f"unrealized={open_pos['unrealized_pct']:+.2f}%"
+        )
+
+    compounded_pct = (compounded_factor - 1.0) * 100.0
+    print("\n" + "-" * 90)
+    print(f"Compounded factor: {compounded_factor:.6f}")
+    print(f"Compounded gain:   {compounded_pct:+.2f}%")
+    print("-" * 90)
+
+    # ---- LIVE prompt (optional) ----
+    if args.ask_to_buy_today:
+        run_live_prompt_after_gate(
+            open_pos=open_pos,
+            gated_picks_by_file_date=gated_picks_by_file_date,
+            entry_lag_days=int(args.entry_lag_days),
+            tp_pct=float(args.tp_pct),
+            sl_pct=float(args.sl_pct),
+            cache_path=Path(args.cache_path),
+            live_trade=bool(args.live_trade),
+        )
+
+    return 0
+
 
 
 if __name__ == "__main__":
