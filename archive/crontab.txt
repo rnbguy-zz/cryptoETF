@@ -1,8 +1,11 @@
-0 8 * * * /usr/bin/find /tmp -mindepth 1 -exec rm -rf {} +
-2 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/slope_history.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
-5 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/lambdatester_first_slopeonly.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
-7 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/timeslope_plotter_positive.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
-9 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/oversoldanalysis.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+01 11 * * * /usr/bin/find /tmp -mindepth 1 -exec /bin/rm -rf '{}' \;
+02 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/slope_history.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+04 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/lambdatester_first_slopeonly.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+06 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/timeslope_plotter_positive.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+08 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/oversoldanalysis.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
 10 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/buysignal.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
-*/15 * * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/volumemonitor.py >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
-0 8 * * * /usr/bin/find /home/ec2-user/pythonProject1/outputs -type f -name 'output_*.xlsx' | /usr/bin/awk -F'[_.]' '{print $2}' | while read d; do if [ "$(/usr/bin/date -d "$d" +\%s)" -lt "$(/usr/bin/date -d "95 days ago" +\%s)" ]; then rm -f "/home/ec2-user/pythonProject1/outputs/output_${d}.xlsx"; fi; done
+10 11 16,30 * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/rank_oversold_maker.py --cache-dir /dev/shm/kline_cache >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+14 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/rank_oversold.py --cache-dir /dev/shm/kline_cache >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+16 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/modelmaker.py --dir oversold_analysis/ --retrain --holdout-days 2 --retrain >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+22 11 * * * cd /home/ec2-user/pythonProject1 && /usr/local/bin/python3.9 /home/ec2-user/pythonProject1/modelmaker.py --dir oversold_analysis/ --email --holdout-days 30 --skip-oof >> /home/ec2-user/pythonProject1/cron_log.txt 2>&1
+01 11 * * * /usr/bin/find /home/ec2-user/pythonProject1/outputs -type f -name 'output_*.xlsx' | /usr/bin/awk -F'[_.]' '{print $2}' | while read d; do if [ "$(/usr/bin/date -d "$d" +\%s)" -lt "$(/usr/bin/date -d "95 days ago" +\%s)" ]; then rm -f "/home/ec2-user/pythonProject1/outputs/output_${d}.xlsx"; fi; done

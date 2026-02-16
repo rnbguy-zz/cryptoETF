@@ -1,0 +1,450 @@
+{
+  "asof_day": "2026-02-15",
+  "events": [
+    {
+      "day": "2026-02-01",
+      "entry_px": 0.05544,
+      "featDropP": 0.09713029892322567,
+      "p": 0.9172470433001295,
+      "symbol": "AWEUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-01",
+      "entry_px": 0.0041,
+      "featDropP": 0.5034946369790142,
+      "p": 0.7269437150759421,
+      "symbol": "ZILUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-02",
+      "entry_px": 0.6542,
+      "featDropP": 0.3341875965793521,
+      "p": 0.7950849280638772,
+      "symbol": "BARDUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-02",
+      "entry_px": 0.2125,
+      "featDropP": 0.29054579938719693,
+      "p": 0.7754919787060446,
+      "symbol": "THEUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-02",
+      "entry_px": 0.0195,
+      "featDropP": 0.5483901303037302,
+      "p": 0.7271238302970019,
+      "symbol": "C98USDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-02",
+      "entry_px": 0.2553,
+      "featDropP": 0.97477404262869,
+      "p": 0.5084213149483152,
+      "symbol": "STXUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-03",
+      "entry_px": 0.06276,
+      "featDropP": 0.7075145290906378,
+      "p": 0.598455552893693,
+      "symbol": "SCRUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-05",
+      "entry_px": 0.0369,
+      "featDropP": 0.36055339641022444,
+      "p": 0.5581063035535225,
+      "symbol": "BANKUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-05",
+      "entry_px": 0.1499,
+      "featDropP": 0.5883636442938115,
+      "p": 0.5489025658720453,
+      "symbol": "KITEUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-11",
+      "entry_px": 0.0678,
+      "featDropP": 0.688397813728334,
+      "p": 0.5149743298770534,
+      "symbol": "NEWTUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-14",
+      "entry_px": 0.02378,
+      "featDropP": 0.4879817398022895,
+      "p": 0.5400852851348791,
+      "symbol": "SENTUSDT",
+      "type": "ENTRY"
+    },
+    {
+      "day": "2026-02-01",
+      "peak_close": 0.0568,
+      "peak_gain_pct": 2.4531024531024626,
+      "symbol": "AWEUSDT",
+      "trail_gain_pct": -9.84126984126985,
+      "trail_px": 0.049984,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-02",
+      "peak_close": 0.05857,
+      "peak_gain_pct": 5.645743145743132,
+      "symbol": "AWEUSDT",
+      "trail_gain_pct": -7.031746031746033,
+      "trail_px": 0.0515416,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-02",
+      "exit_gain_pct": 20.0,
+      "exit_px": 0.00492,
+      "sold_frac": 1.0,
+      "symbol": "ZILUSDT",
+      "type": "EXIT_TP_20"
+    },
+    {
+      "day": "2026-02-02",
+      "peak_close": 0.6884,
+      "peak_gain_pct": 5.227759095077955,
+      "symbol": "BARDUSDT",
+      "trail_gain_pct": -7.3995719963313995,
+      "trail_px": 0.605792,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-02",
+      "peak_close": 0.2264,
+      "peak_gain_pct": 6.541176470588228,
+      "symbol": "THEUSDT",
+      "trail_gain_pct": -6.243764705882349,
+      "trail_px": 0.199232,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-02",
+      "exit_gain_pct": 20.0,
+      "exit_px": 0.0234,
+      "sold_frac": 1.0,
+      "symbol": "C98USDT",
+      "type": "EXIT_TP_20"
+    },
+    {
+      "day": "2026-02-02",
+      "exit_gain_pct": 20.0,
+      "exit_px": 0.30636,
+      "sold_frac": 1.0,
+      "symbol": "STXUSDT",
+      "type": "EXIT_TP_20"
+    },
+    {
+      "day": "2026-02-03",
+      "peak_close": 0.06079,
+      "peak_gain_pct": 9.650072150072141,
+      "symbol": "AWEUSDT",
+      "trail_gain_pct": -3.5079365079365155,
+      "trail_px": 0.0534952,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-03",
+      "peak_close": 0.7238,
+      "peak_gain_pct": 10.638948333842869,
+      "symbol": "BARDUSDT",
+      "trail_gain_pct": -2.637725466218288,
+      "trail_px": 0.636944,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-04",
+      "peak_close": 0.06282,
+      "peak_gain_pct": 13.311688311688297,
+      "symbol": "AWEUSDT",
+      "trail_gain_pct": -0.28571428571428914,
+      "trail_px": 0.0552816,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-04",
+      "exit_gain_pct": -9.999999999999998,
+      "exit_px": 0.056484,
+      "sold_frac": 1.0,
+      "symbol": "SCRUSDT",
+      "type": "EXIT_HARD_STOP"
+    },
+    {
+      "day": "2026-02-05",
+      "exit_gain_pct": 20.0,
+      "exit_px": 0.066528,
+      "sold_frac": 1.0,
+      "symbol": "AWEUSDT",
+      "type": "EXIT_TP_20"
+    },
+    {
+      "day": "2026-02-05",
+      "exit_gain_pct": 20.0,
+      "exit_px": 0.255,
+      "sold_frac": 1.0,
+      "symbol": "THEUSDT",
+      "type": "EXIT_TP_20"
+    },
+    {
+      "day": "2026-02-05",
+      "exit_gain_pct": -9.999999999999998,
+      "exit_px": 0.03321,
+      "sold_frac": 1.0,
+      "symbol": "BANKUSDT",
+      "type": "EXIT_HARD_STOP"
+    },
+    {
+      "day": "2026-02-05",
+      "exit_gain_pct": -9.999999999999998,
+      "exit_px": 0.13491,
+      "sold_frac": 1.0,
+      "symbol": "KITEUSDT",
+      "type": "EXIT_HARD_STOP"
+    },
+    {
+      "day": "2026-02-06",
+      "exit_gain_pct": 20.0,
+      "exit_px": 0.78504,
+      "sold_frac": 1.0,
+      "symbol": "BARDUSDT",
+      "type": "EXIT_TP_20"
+    },
+    {
+      "day": "2026-02-11",
+      "peak_close": 0.0701,
+      "peak_gain_pct": 3.3923303834808127,
+      "symbol": "NEWTUSDT",
+      "trail_gain_pct": -9.01474926253687,
+      "trail_px": 0.061688,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-12",
+      "peak_close": 0.0708,
+      "peak_gain_pct": 4.424778761061954,
+      "symbol": "NEWTUSDT",
+      "trail_gain_pct": -8.106194690265479,
+      "trail_px": 0.062304000000000005,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-13",
+      "peak_close": 0.0733,
+      "peak_gain_pct": 8.112094395280245,
+      "symbol": "NEWTUSDT",
+      "trail_gain_pct": -4.861356932153383,
+      "trail_px": 0.064504,
+      "type": "UPDATE_PEAK"
+    },
+    {
+      "day": "2026-02-14",
+      "peak_close": 0.0755,
+      "peak_gain_pct": 11.356932153392329,
+      "symbol": "NEWTUSDT",
+      "trail_gain_pct": -2.0058997050147465,
+      "trail_px": 0.06644,
+      "type": "UPDATE_PEAK"
+    }
+  ],
+  "last_entry_file_date": "2026-02-15",
+  "positions": {
+    "AWEUSDT": {
+      "closed_day": "2026-02-05",
+      "closed_reason": "TP_20",
+      "entry_day": "2026-02-01",
+      "entry_price": 0.05544,
+      "meta": {
+        "featDropP": 0.09713029892322567,
+        "p": 0.9172470433001295,
+        "source_file_date": "2026-01-31"
+      },
+      "peak_close": 0.06282,
+      "peak_day": "2026-02-04",
+      "remaining_frac": 0.0,
+      "status": "CLOSED",
+      "took_tp": true,
+      "trail_px": 0.0552816
+    },
+    "BANKUSDT": {
+      "closed_day": "2026-02-05",
+      "closed_reason": "HARD_STOP",
+      "entry_day": "2026-02-05",
+      "entry_price": 0.0369,
+      "meta": {
+        "featDropP": 0.36055339641022444,
+        "p": 0.5581063035535225,
+        "source_file_date": "2026-02-04"
+      },
+      "peak_close": 0.0369,
+      "peak_day": "2026-02-05",
+      "remaining_frac": 0.0,
+      "status": "CLOSED",
+      "took_tp": false,
+      "trail_px": 0.032472
+    },
+    "BARDUSDT": {
+      "closed_day": "2026-02-06",
+      "closed_reason": "TP_20",
+      "entry_day": "2026-02-02",
+      "entry_price": 0.6542,
+      "meta": {
+        "featDropP": 0.3341875965793521,
+        "p": 0.7950849280638772,
+        "source_file_date": "2026-02-01"
+      },
+      "peak_close": 0.7238,
+      "peak_day": "2026-02-03",
+      "remaining_frac": 0.0,
+      "status": "CLOSED",
+      "took_tp": true,
+      "trail_px": 0.636944
+    },
+    "C98USDT": {
+      "closed_day": "2026-02-02",
+      "closed_reason": "TP_20",
+      "entry_day": "2026-02-02",
+      "entry_price": 0.0195,
+      "meta": {
+        "featDropP": 0.5483901303037302,
+        "p": 0.7271238302970019,
+        "source_file_date": "2026-02-01"
+      },
+      "peak_close": 0.0195,
+      "peak_day": "2026-02-02",
+      "remaining_frac": 0.0,
+      "status": "CLOSED",
+      "took_tp": true,
+      "trail_px": 0.01716
+    },
+    "KITEUSDT": {
+      "closed_day": "2026-02-05",
+      "closed_reason": "HARD_STOP",
+      "entry_day": "2026-02-05",
+      "entry_price": 0.1499,
+      "meta": {
+        "featDropP": 0.5883636442938115,
+        "p": 0.5489025658720453,
+        "source_file_date": "2026-02-04"
+      },
+      "peak_close": 0.1499,
+      "peak_day": "2026-02-05",
+      "remaining_frac": 0.0,
+      "status": "CLOSED",
+      "took_tp": false,
+      "trail_px": 0.131912
+    },
+    "NEWTUSDT": {
+      "entry_day": "2026-02-11",
+      "entry_price": 0.0678,
+      "meta": {
+        "featDropP": 0.688397813728334,
+        "p": 0.5149743298770534,
+        "source_file_date": "2026-02-10"
+      },
+      "peak_close": 0.0755,
+      "peak_day": "2026-02-14",
+      "remaining_frac": 1.0,
+      "status": "OPEN",
+      "took_tp": false,
+      "trail_px": 0.06644
+    },
+    "SCRUSDT": {
+      "closed_day": "2026-02-04",
+      "closed_reason": "HARD_STOP",
+      "entry_day": "2026-02-03",
+      "entry_price": 0.06276,
+      "meta": {
+        "featDropP": 0.7075145290906378,
+        "p": 0.598455552893693,
+        "source_file_date": "2026-02-02"
+      },
+      "peak_close": 0.06276,
+      "peak_day": "2026-02-03",
+      "remaining_frac": 0.0,
+      "status": "CLOSED",
+      "took_tp": false,
+      "trail_px": 0.055228799999999995
+    },
+    "SENTUSDT": {
+      "entry_day": "2026-02-14",
+      "entry_price": 0.02378,
+      "meta": {
+        "featDropP": 0.4879817398022895,
+        "p": 0.5400852851348791,
+        "source_file_date": "2026-02-13"
+      },
+      "peak_close": 0.02378,
+      "peak_day": "2026-02-14",
+      "remaining_frac": 1.0,
+      "status": "OPEN",
+      "took_tp": false,
+      "trail_px": 0.020926399999999998
+    },
+    "STXUSDT": {
+      "closed_day": "2026-02-02",
+      "closed_reason": "TP_20",
+      "entry_day": "2026-02-02",
+      "entry_price": 0.2553,
+      "meta": {
+        "featDropP": 0.97477404262869,
+        "p": 0.5084213149483152,
+        "source_file_date": "2026-02-01"
+      },
+      "peak_close": 0.2553,
+      "peak_day": "2026-02-02",
+      "remaining_frac": 0.0,
+      "status": "CLOSED",
+      "took_tp": true,
+      "trail_px": 0.22466400000000003
+    },
+    "THEUSDT": {
+      "closed_day": "2026-02-05",
+      "closed_reason": "TP_20",
+      "entry_day": "2026-02-02",
+      "entry_price": 0.2125,
+      "meta": {
+        "featDropP": 0.29054579938719693,
+        "p": 0.7754919787060446,
+        "source_file_date": "2026-02-01"
+      },
+      "peak_close": 0.2264,
+      "peak_day": "2026-02-02",
+      "remaining_frac": 0.0,
+      "status": "CLOSED",
+      "took_tp": true,
+      "trail_px": 0.199232
+    },
+    "ZILUSDT": {
+      "closed_day": "2026-02-02",
+      "closed_reason": "TP_20",
+      "entry_day": "2026-02-01",
+      "entry_price": 0.0041,
+      "meta": {
+        "featDropP": 0.5034946369790142,
+        "p": 0.7269437150759421,
+        "source_file_date": "2026-01-31"
+      },
+      "peak_close": 0.0041,
+      "peak_day": "2026-02-01",
+      "remaining_frac": 0.0,
+      "status": "CLOSED",
+      "took_tp": true,
+      "trail_px": 0.0036080000000000005
+    }
+  }
+}
