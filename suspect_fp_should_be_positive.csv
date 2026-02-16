@@ -1,1 +1,0 @@
-file_date,symbol,error_type,label,audit_p1_oof,p,y_pred,feat_prob_drop10,last_prev_rsi,last_cur_rsi,last_drop,last_drop_pct_simple,hits_7d,hits_30d,hits_60d,days_since_first,days_since_last,drop_mean,drop_std,drop_max,drop_min,cur_rsi_slope,drop_is_newmax_30d

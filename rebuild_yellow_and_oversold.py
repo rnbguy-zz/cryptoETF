@@ -214,7 +214,10 @@ def read_cached_day(cache_dir: Path, interval: str, symbol: str, d: date) -> Opt
 def write_cached_day(cache_dir: Path, interval: str, symbol: str, d: date, rows: list):
     p = day_cache_path(cache_dir, interval, symbol, d)
     ensure_dir(p.parent)
-    p.write_text(json.dumps(rows))
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(rows))
+    tmp.replace(p)  # atomic on same filesystem
+
 
 def split_klines_by_day(klines: list) -> Dict[str, list]:
     """
@@ -233,12 +236,18 @@ def split_klines_by_day(klines: list) -> Dict[str, list]:
         buckets.setdefault(k, []).append(row)
     return buckets
 
-def fetch_klines_interval(symbol: str, interval: str, start_ms: int, end_ms: int, limit: int = 1000) -> list:
+
+def fetch_klines_interval(symbol: str, interval: str, start_ms: int, end_ms: int, limit: int = 1000) -> Optional[list]:
     """
-    Paginate Binance klines from start_ms..end_ms inclusive-ish.
+    Paginate Binance klines from start_ms..end_ms.
+    Returns:
+      - list on success (possibly empty)
+      - None on failure (timeouts/429/etc)
     """
     out = []
     cur = start_ms
+    first = True
+
     while cur < end_ms:
         params = {
             "symbol": symbol,
@@ -248,17 +257,27 @@ def fetch_klines_interval(symbol: str, interval: str, start_ms: int, end_ms: int
             "limit": limit
         }
         data = safe_get(KLINES_URL, params=params)
-        if not data:
-            break
+
+        # if the FIRST call fails, treat it as a fetch failure
+        if data is None:
+            return None if first else out  # if we already got some pages, return partial rather than poison cache
+
+        first = False
+
+        # Binance returns [] legitimately sometimes, but usually means no data in that window
+        if not isinstance(data, list):
+            return None
+
         out.extend(data)
         if len(data) < limit:
             break
-        # advance to next candle after last openTime
+
         last_ot = int(data[-1][0])
         cur = last_ot + 1
-        # gentle pacing
         time.sleep(0.02)
+
     return out
+
 
 def ensure_cached_range(
     cache_dir: Path,
@@ -269,7 +288,10 @@ def ensure_cached_range(
 ):
     """
     Ensure per-day cache files exist for start_day..end_day.
-    Only fetches missing days; downloads in larger window chunks, then splits.
+    IMPORTANT:
+      - If fetch fails (None), DO NOT write empty cache files.
+      - Only write days that have actual rows in the fetched result.
+      - Leave truly-missing days uncached so future runs can retry.
     """
     missing = []
     for d in daterange(start_day, end_day):
@@ -278,26 +300,28 @@ def ensure_cached_range(
     if not missing:
         return
 
-    # fetch one continuous window covering missing range (min..max)
     fetch_start = min(missing)
     fetch_end = max(missing)
 
     start_ms = int(datetime(fetch_start.year, fetch_start.month, fetch_start.day).timestamp() * 1000)
-    # end_ms is end of fetch_end day
     end_ms = int((datetime(fetch_end.year, fetch_end.month, fetch_end.day) + timedelta(days=1)).timestamp() * 1000) - 1
 
     klines = fetch_klines_interval(symbol, interval, start_ms, end_ms)
+
+    # If fetch failed -> DON'T poison the cache
+    if klines is None:
+        return
+
     buckets = split_klines_by_day(klines)
 
-    # write only missing days we have data for
+    # Only write cache files for days where we have rows.
+    # If a day has no rows, leave it missing so later runs can retry.
     for d in missing:
         k = iso(d)
         rows = buckets.get(k, [])
         if rows:
             write_cached_day(cache_dir, interval, symbol, d, rows)
-        else:
-            # write empty to avoid refetch loops
-            write_cached_day(cache_dir, interval, symbol, d, [])
+
 
 # ---------- Step 1: rebuild outputs (daily slope files) ----------
 
@@ -509,26 +533,34 @@ def compute_yellow_circle_days_from_outputs(outputs_dir: Path) -> Tuple[pd.DataF
 
     return df_results, yellow_circle_days
 
+
 def check_dates_for_day(yellow_circle_days: List[str], day_str: str, n: int = 3) -> List[str]:
     """
-    Mimic your writer:
-    - If 'day' is itself a yellow circle day: take n entries BEFORE that day
-    - Else: take last n yellow circle days (before that day)
+    Return up to n yellow circle days prior to day_str.
+    If none exist (early history), backtrack up to BACKTRACK_DAYS earlier and try again.
     """
-    # only consider yellows <= day
-    y = [d for d in yellow_circle_days if d <= day_str]
+    BACKTRACK_DAYS = 60  # hardcoded fallback window
+
+    y = sorted([d for d in yellow_circle_days if d <= day_str])
     if not y:
         return []
 
-    if day_str in y:
-        idx = y.index(day_str)
-        return y[max(0, idx - n):idx]
-    else:
-        # last n prior
-        prior = [d for d in y if d < day_str]
-        return prior[-n:] if prior else y[-n:]
+    # normal behavior: last n yellow days BEFORE this day
+    prior = [d for d in y if d < day_str]
+    if prior:
+        return prior[-n:]
 
-# ---------- Step 3: oversold analysis (same output style, optimized caching) ----------
+    # early-history fallback: try earlier days
+    base = parse_iso(day_str)
+    y_all = sorted(yellow_circle_days)
+    for k in range(1, BACKTRACK_DAYS + 1):
+        ds2 = iso(base - timedelta(days=k))
+        prior2 = [d for d in y_all if d < ds2]
+        if prior2:
+            return prior2[-n:]
+
+    return []
+
 
 def hourly_to_rsi_series(hourly_klines: list) -> pd.DataFrame:
     if not hourly_klines:
@@ -620,10 +652,7 @@ def build_oversold_for_day(
     final_date = iso(day)
 
     if not check_dates:
-        # No check dates => cannot compute "between check dates"; still create empty file if you want
-        out = oversold_dir / f"{final_date}_oversold.txt"
-        out.write_text("")
-        print(f"[oversold] {final_date}: no check_dates; wrote empty {out.name}")
+        print(f"[oversold] {final_date}: no check_dates even after backfill/backtrack; skipping file")
         return
 
     # Determine earliest hourly day needed: min(check_dates) - 7 days buffer
@@ -662,6 +691,41 @@ def build_oversold_for_day(
             if vals:
                 rsi_values[sym] = vals
 
+    # ---------- >>> PUT THE NEW CODE HERE <<< ----------
+    need_dates = check_dates + [final_date]
+
+    any_rsi = sum(1 for v in rsi_values.values() if v)
+    all_dates = sum(1 for v in rsi_values.values() if all(ds in v for ds in need_dates))
+    total = len(symbols)
+
+    print(
+        f"[coverage] {final_date} "
+        f"total={total} any_rsi={any_rsi} all_dates={all_dates} "
+        f"need_dates={len(need_dates)}"
+    )
+
+    # --- OPTIONAL AUTO-RETRY ON BAD DAY ---
+    if total >= 50 and any_rsi < int(0.60 * total):
+        print(f"[warn] {final_date} low RSI coverage ({any_rsi}/{total}). Re-trying once...")
+
+        # Re-run the same symbol processing block ONE MORE TIME
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(process_symbol, sym): sym for sym in symbols}
+            for fut in as_completed(futs):
+                sym, vals = fut.result()
+                if vals:
+                    rsi_values[sym] = vals
+
+        # Recompute coverage after retry
+        any_rsi = sum(1 for v in rsi_values.values() if v)
+        all_dates = sum(1 for v in rsi_values.values() if all(ds in v for ds in need_dates))
+
+        print(
+            f"[coverage-after-retry] {final_date} "
+            f"any_rsi={any_rsi} all_dates={all_dates}"
+        )
+    # ---------- >>> END NEW CODE <<< ----------
+
     rsi_drops = detect_rsi_drops(rsi_values)
 
     out_path = oversold_dir / f"{final_date}_oversold.txt"
@@ -689,6 +753,511 @@ def build_oversold_for_day(
                     f.write(cluster_df.sort_values(by="Drop", ascending=True).to_string(index=False))
 
     print(f"[oversold] wrote {out_path}")
+
+
+
+# =========================
+# FIXES: Rate limits + UTC + negative caching
+# =========================
+
+import json
+import random
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import requests
+
+
+# --- Prefer Binance public market-data host first (still rate limited, but often more stable) ---
+BINANCE_BASE_URLS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+]
+
+KLINES_PATH = "/api/v3/klines"
+BOOKTICKER_PATH = "/api/v3/ticker/bookTicker"
+
+
+# ----------------------------
+# UTC helpers (CRITICAL FIX)
+# ----------------------------
+
+def utc_day_start_ms(d: date) -> int:
+    """UTC midnight for day d, in epoch ms."""
+    return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp() * 1000)
+
+def utc_day_end_ms(d: date) -> int:
+    """UTC 23:59:59.999 for day d, in epoch ms."""
+    # end = start of next day minus 1 ms
+    return utc_day_start_ms(d + timedelta(days=1)) - 1
+
+
+# ----------------------------
+# Process-wide token-bucket limiter (shared across threads)
+# ----------------------------
+
+@dataclass
+class RateLimitSnapshot:
+    used_weight_1m: Optional[str] = None
+    used_weight: Optional[str] = None
+    used_weight_5m: Optional[str] = None
+
+class GlobalBinanceLimiter:
+    """
+    Token bucket in 'request weight' units.
+    For /api/v3/klines, weight is 2 per request (per your report).
+    Default target is set a bit below 6000/min to avoid spikes.
+    """
+    def __init__(self, weight_per_minute: int = 4500):
+        self.capacity = float(weight_per_minute)
+        self.tokens = float(weight_per_minute)
+        self.refill_per_sec = float(weight_per_minute) / 60.0
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self, cost: int):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                elapsed = now - self.last
+                if elapsed > 0:
+                    self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_per_sec)
+                    self.last = now
+
+                if self.tokens >= cost:
+                    self.tokens -= cost
+                    return
+
+                deficit = cost - self.tokens
+                sleep_s = deficit / self.refill_per_sec if self.refill_per_sec > 0 else 1.0
+
+            # small jitter so threads don't thump at the same instant
+            time.sleep(max(0.05, sleep_s) + random.uniform(0.0, 0.15))
+
+
+# single global limiter instance used by all threads
+BINANCE_LIMITER = GlobalBinanceLimiter(weight_per_minute=4500)
+
+
+# ----------------------------
+# Robust HTTP GET with:
+# - global limiter
+# - Retry-After (429/418)
+# - base-url failover
+# - optional debug logging
+# ----------------------------
+
+def _extract_rl_headers(headers: dict) -> RateLimitSnapshot:
+    if not headers:
+        return RateLimitSnapshot()
+    # Binance can return different header variants depending on infra
+    return RateLimitSnapshot(
+        used_weight_1m=headers.get("X-MBX-USED-WEIGHT-1M"),
+        used_weight=headers.get("X-MBX-USED-WEIGHT"),
+        used_weight_5m=headers.get("X-MBX-USED-WEIGHT-5M"),
+    )
+
+def _retry_after_seconds(resp: requests.Response) -> Optional[float]:
+    ra = resp.headers.get("Retry-After")
+    if not ra:
+        return None
+    try:
+        return float(ra)
+    except Exception:
+        return None
+
+def safe_get(
+    path: str,
+    params: dict,
+    *,
+    weight_cost: int = 1,
+    retries: int = 6,
+    timeout: int = 30,
+    debug_log_path: Optional[Path] = None,
+) -> Optional[list]:
+    """
+    Returns JSON list on success, otherwise None.
+    - Uses a shared token-bucket limiter across threads (prevents bursts).
+    - Honors Retry-After on 429 and 418.
+    - Treats 418 as "hard stop" cooldown; retries AFTER the wait.
+    - Tries multiple base URLs.
+    """
+
+    last_err = None
+
+    for attempt in range(retries):
+        # Smooth traffic globally (per-IP limit protection)
+        BINANCE_LIMITER.acquire(weight_cost)
+
+        base = BINANCE_BASE_URLS[attempt % len(BINANCE_BASE_URLS)]
+        url = base + path
+
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+
+            snap = _extract_rl_headers(r.headers)
+            ra_s = _retry_after_seconds(r)
+
+            if debug_log_path:
+                # Write one line per request (append-only)
+                # Keeps it simple and fast; you can grep later for 429/418 and weights.
+                line = (
+                    f"{datetime.utcnow().isoformat()}Z "
+                    f"GET {path} "
+                    f"sym={params.get('symbol')} int={params.get('interval')} "
+                    f"st={params.get('startTime')} et={params.get('endTime')} lim={params.get('limit')} "
+                    f"status={r.status_code} "
+                    f"retry_after={ra_s} "
+                    f"w1m={snap.used_weight_1m} w={snap.used_weight} w5m={snap.used_weight_5m}\n"
+                )
+                debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+                debug_log_path.open("a", encoding="utf-8").write(line)
+
+            # Rate-limit / ban handling
+            if r.status_code in (429, 418):
+                # Must honor Retry-After if present; otherwise backoff with jitter
+                wait_s = ra_s if ra_s is not None else (2.0 * (1.6 ** attempt))
+                wait_s += random.uniform(0.0, 0.5)
+
+                # 418 is "banned"; be more conservative
+                if r.status_code == 418:
+                    wait_s = max(wait_s, 30.0)  # don't hammer
+                time.sleep(wait_s)
+                last_err = f"HTTP {r.status_code}"
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+
+            # Binance error payloads look like {"code":..., "msg":...}
+            if isinstance(data, dict) and "code" in data:
+                # treat like transient unless it's clearly permanent
+                last_err = f"Binance error dict code={data.get('code')}"
+                time.sleep(1.0 + random.uniform(0.0, 0.5))
+                continue
+
+            if not isinstance(data, list):
+                last_err = "Non-list JSON"
+                time.sleep(1.0 + random.uniform(0.0, 0.5))
+                continue
+
+            return data
+
+        except Exception as e:
+            last_err = repr(e)
+            time.sleep(1.0 * (1.4 ** attempt) + random.uniform(0.0, 0.4))
+
+    return None
+
+
+# ----------------------------
+# Caching: support "known empty" days (negative caching)
+# ----------------------------
+
+def day_cache_path(cache_dir: Path, interval: str, symbol: str, d: date) -> Path:
+    return cache_dir / interval / symbol / f"{d.strftime('%Y-%m-%d')}.json"
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def _meta_path(cache_dir: Path, interval: str, symbol: str) -> Path:
+    return cache_dir / interval / symbol / "_meta.json"
+
+def _load_meta(cache_dir: Path, interval: str, symbol: str) -> dict:
+    p = _meta_path(cache_dir, interval, symbol)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text().strip() or "{}")
+    except Exception:
+        return {}
+
+def _save_meta(cache_dir: Path, interval: str, symbol: str, meta: dict):
+    p = _meta_path(cache_dir, interval, symbol)
+    ensure_dir(p.parent)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(meta, sort_keys=True))
+    tmp.replace(p)
+
+def read_cached_day(cache_dir: Path, interval: str, symbol: str, d: date) -> Optional[list]:
+    """
+    Returns:
+      - list of rows if present
+      - [] if known-empty marker
+      - None if not cached
+    """
+    p = day_cache_path(cache_dir, interval, symbol, d)
+    if not p.exists():
+        return None
+    try:
+        obj = json.loads((p.read_text().strip() or "null"))
+        if obj is None:
+            return None
+        # negative cache marker
+        if isinstance(obj, dict) and obj.get("_empty") is True:
+            return []
+        # normal rows
+        if isinstance(obj, list):
+            return obj
+        return None
+    except Exception:
+        return None
+
+def _write_cached_day_atomic(path: Path, payload):
+    ensure_dir(path.parent)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    tmp.replace(path)
+
+def write_cached_day(cache_dir: Path, interval: str, symbol: str, d: date, rows: list):
+    p = day_cache_path(cache_dir, interval, symbol, d)
+    _write_cached_day_atomic(p, rows)
+
+def write_known_empty_day(cache_dir: Path, interval: str, symbol: str, d: date):
+    """
+    Negative cache marker: 'fetch succeeded' but there are legitimately no rows for that day.
+    This prevents infinite re-fetch loops on pre-listing history.
+    """
+    p = day_cache_path(cache_dir, interval, symbol, d)
+    _write_cached_day_atomic(p, {"_empty": True})
+
+
+# ----------------------------
+# Bucket klines by UTC day (your existing logic is fine, keep it UTC)
+# ----------------------------
+
+def split_klines_by_day(klines: list) -> Dict[str, list]:
+    buckets: Dict[str, list] = {}
+    for row in klines:
+        ot = int(row[0])
+        d = datetime.fromtimestamp(ot / 1000, tz=timezone.utc).date()
+        k = d.strftime("%Y-%m-%d")
+        buckets.setdefault(k, []).append(row)
+    return buckets
+
+
+# ----------------------------
+# Klines pagination with correct UTC windows + no-cache-poisoning
+# ----------------------------
+
+def fetch_klines_interval(symbol: str, interval: str, start_ms: int, end_ms: int, limit: int = 1000,
+                         debug_log_path: Optional[Path] = None) -> Optional[list]:
+    """
+    Paginate /api/v3/klines from start_ms..end_ms (UTC epoch ms).
+    Returns:
+      - list (possibly empty) on success
+      - None on hard failure
+    """
+    out: List[list] = []
+    cur = start_ms
+    first = True
+
+    # Binance /api/v3/klines weight is 2 (per your report).
+    WEIGHT_COST = 2
+
+    while cur < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cur,
+            "endTime": end_ms,
+            "limit": limit,
+        }
+        data = safe_get(
+            KLINES_PATH,
+            params=params,
+            weight_cost=WEIGHT_COST,
+            retries=6,
+            timeout=30,
+            debug_log_path=debug_log_path,
+        )
+
+        if data is None:
+            # if FIRST call fails, propagate failure
+            return None if first else out
+
+        first = False
+
+        if not data:
+            # legitimate empty page/window
+            break
+
+        out.extend(data)
+
+        if len(data) < limit:
+            break
+
+        last_ot = int(data[-1][0])
+        # prevent duplicates when paging
+        cur = last_ot + 1
+
+        # tiny per-page delay (limiter already smooths globally)
+        time.sleep(0.01)
+
+    return out
+
+
+def ensure_cached_range(cache_dir: Path, interval: str, symbol: str, start_day: date, end_day: date,
+                        debug_log_path: Optional[Path] = None):
+    """
+    Ensures per-day cache files exist for start_day..end_day.
+
+    FIXES:
+    - Uses UTC day windows (no local timezone skew).
+    - Writes known-empty markers when fetch succeeds but day has no rows.
+    - DOES NOT write empties on fetch failure (None).
+    - Tracks earliest seen openTime to mark pre-listing days as known-empty without re-fetching forever.
+    """
+
+    meta = _load_meta(cache_dir, interval, symbol)
+    first_open_ms = meta.get("first_open_ms")  # earliest candle openTime seen for this symbol+interval
+
+    missing_days: List[date] = []
+    for d in daterange(start_day, end_day):
+        cached = read_cached_day(cache_dir, interval, symbol, d)
+        if cached is None:
+            # If we already know first candle date, we can negative-cache earlier days immediately
+            if first_open_ms is not None:
+                first_day = datetime.fromtimestamp(first_open_ms / 1000, tz=timezone.utc).date()
+                if d < first_day:
+                    write_known_empty_day(cache_dir, interval, symbol, d)
+                    continue
+            missing_days.append(d)
+
+    if not missing_days:
+        return
+
+    fetch_start = min(missing_days)
+    fetch_end = max(missing_days)
+
+    start_ms = utc_day_start_ms(fetch_start)
+    end_ms = utc_day_end_ms(fetch_end)
+
+    klines = fetch_klines_interval(symbol, interval, start_ms, end_ms, limit=1000, debug_log_path=debug_log_path)
+
+    if klines is None:
+        # hard failure -> do not poison cache
+        return
+
+    # update earliest seen open time (for future negative caching)
+    if klines:
+        earliest = min(int(r[0]) for r in klines)
+        if first_open_ms is None or earliest < int(first_open_ms):
+            meta["first_open_ms"] = int(earliest)
+            _save_meta(cache_dir, interval, symbol, meta)
+            first_open_ms = meta["first_open_ms"]
+
+    buckets = split_klines_by_day(klines)
+
+    # For each day:
+    # - if rows exist -> write rows
+    # - if no rows, but fetch succeeded -> write known-empty marker
+    for d in missing_days:
+        rows = buckets.get(d.strftime("%Y-%m-%d"), [])
+        if rows:
+            write_cached_day(cache_dir, interval, symbol, d, rows)
+        else:
+            # successful fetch but no rows for this day => negative cache it
+            write_known_empty_day(cache_dir, interval, symbol, d)
+
+
+def ensure_cached_range_bulk_1d_for_symbol(cache_dir: Path, symbol: str, start_day: date, end_day: date,
+                                           debug_log_path: Optional[Path] = None):
+    """
+    Bulk 1d fetch once, split into per-day cache.
+
+    FIXES:
+    - UTC windows
+    - known-empty markers to avoid infinite re-fetch loops when history legitimately doesn't exist
+    """
+    # If every day already has some cache file (data or known-empty), skip.
+    all_present = True
+    for d in daterange(start_day, end_day):
+        if read_cached_day(cache_dir, "1d", symbol, d) is None:
+            all_present = False
+            break
+    if all_present:
+        return
+
+    start_ms = utc_day_start_ms(start_day)
+    end_ms = utc_day_end_ms(end_day)
+
+    klines = fetch_klines_interval(symbol, "1d", start_ms, end_ms, limit=1000, debug_log_path=debug_log_path)
+    if klines is None:
+        return
+
+    # track first_open_ms in meta for negative caching
+    meta = _load_meta(cache_dir, "1d", symbol)
+    if klines:
+        earliest = min(int(r[0]) for r in klines)
+        cur_first = meta.get("first_open_ms")
+        if cur_first is None or earliest < int(cur_first):
+            meta["first_open_ms"] = int(earliest)
+            _save_meta(cache_dir, "1d", symbol, meta)
+
+    buckets = split_klines_by_day(klines)
+
+    for d in daterange(start_day, end_day):
+        # If it exists already, do not overwrite
+        existing = read_cached_day(cache_dir, "1d", symbol, d)
+        if existing is not None:
+            continue
+
+        rows = buckets.get(d.strftime("%Y-%m-%d"), [])
+        if rows:
+            write_cached_day(cache_dir, "1d", symbol, d, rows)
+        else:
+            write_known_empty_day(cache_dir, "1d", symbol, d)
+
+
+# ----------------------------
+# Optional: hourly gap checker (helps prove if "missing candles" are real)
+# ----------------------------
+
+def gap_check_hourly_day(rows: list, d: date) -> Tuple[bool, str]:
+    """
+    Returns (ok, message). Expects 24 1h candles aligned to UTC day boundary.
+    """
+    if not rows:
+        return False, "no rows"
+
+    # openTimes in ms
+    ots = sorted(int(r[0]) for r in rows)
+    # expected: day boundary at 00:00 UTC
+    start = utc_day_start_ms(d)
+    expected = [start + i * 3600_000 for i in range(24)]
+
+    ot_set = set(ots)
+    missing = [e for e in expected if e not in ot_set]
+    duplicates = len(ots) - len(ot_set)
+
+    if duplicates > 0:
+        return False, f"duplicates={duplicates}"
+
+    if missing:
+        # show only first few to keep logs small
+        miss_hours = [(m - start) // 3600_000 for m in missing[:6]]
+        return False, f"missing_hours={miss_hours} (count={len(missing)})"
+
+    return True, "ok"
+
+
+# ----------------------------
+# BookTicker using safe_get (no auth required)
+# ----------------------------
+
+def get_all_usdt_symbols() -> List[str]:
+    data = safe_get(BOOKTICKER_PATH, params={}, weight_cost=1, retries=6, timeout=30)
+    if not data:
+        raise RuntimeError("Failed to fetch bookTicker symbols from Binance.")
+    return [x["symbol"] for x in data if x.get("symbol", "").endswith("USDT")]
+
+
+
 
 # ---------- Main orchestration ----------
 
@@ -748,10 +1317,36 @@ def main():
 
     # 2) Compute yellow circle days from outputs
     print("\n=== Step 2: compute yellow circles ===")
-    df_results, yellow_circle_days = compute_yellow_circle_days_from_outputs(outputs_dir)
-    print(f"[yellow] found {len(yellow_circle_days)} yellow days in outputs history")
 
-    # Save a “master” list for reference
+    # ---------------------------
+    # HARD-CODED BACKFILL POLICY
+    # ---------------------------
+    MIN_YELLOW = 12  # require at least this many yellow circle days
+    BACKFILL_CHUNK_DAYS = 30  # extend history earlier by this many days per attempt
+    MAX_BACKFILL_DAYS = 365  # absolute cap on how far back we’ll go
+
+    extra = 0
+    yellow_circle_days = []
+
+    while True:
+        df_results, yellow_circle_days = compute_yellow_circle_days_from_outputs(outputs_dir)
+        print(f"[yellow] found {len(yellow_circle_days)} yellow days (extra_backfill={extra}d)")
+
+        if len(yellow_circle_days) >= MIN_YELLOW:
+            break
+
+        if extra >= MAX_BACKFILL_DAYS:
+            print(f"[yellow][warn] reached max backfill ({MAX_BACKFILL_DAYS}d). Proceeding anyway.")
+            break
+
+        extra += BACKFILL_CHUNK_DAYS
+        backfill_start = start - timedelta(days=extra)
+        backfill_days = daterange(backfill_start, end)
+
+        print(f"[yellow] insufficient yellow circles -> backfilling outputs {iso(backfill_start)}..{iso(end)}")
+        rebuild_outputs_bulk_1d(symbols, backfill_days, cache_dir, outputs_dir, max_workers=args.max_workers)
+
+    # Save master list
     (yellow_dir / "yellow_circle_days_all.txt").write_text("\n".join(yellow_circle_days))
 
     # 3) For each day, derive check_dates as-of that day and build oversold file
@@ -786,4 +1381,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

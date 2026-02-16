@@ -4,12 +4,38 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="58eaf82f-ff54-448c-9e96-da08f5844f45" name="Changes" comment="updating ETF algo.&#10;Fixed loading rolling bundle.">
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/serverbackup.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    <list default="true" id="58eaf82f-ff54-448c-9e96-da08f5844f45" name="Changes" comment="added a model that auto calibrates before buying.">
+      <change afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/archive/rank_oversold_orig.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/123 compound/modelmaker.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/40 compound/rank_oversold.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/40 compound/signals.txt" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/80 compound/ai_predictions.csv" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/80 compound/method1/rank_oversold_orig_80.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/80 compound/method1/rank_oversold_parent.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/80 compound/method2/rank_oversold_orig_80_withdip_modeluser_nosweep.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/80 compound/method2/rank_oversold_parent_withdip_20_ModelMaker_sweepertoo.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/80 compound/positions_etf.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/ETF Algo_withbuy.py" beforeDir="false" afterPath="$PROJECT_DIR$/archive/ETF Algo_withbuy.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ETF/ETF Algo_buy75.py" beforeDir="false" afterPath="$PROJECT_DIR$/ETF/ETFAlgo_buy75(2ndemail).py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ai_predictions.csv" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/archive/crontab.txt" beforeDir="false" afterPath="$PROJECT_DIR$/archive/crontab.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/binance_1d_cache.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/binance_cache.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/cron_log.txt" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/model_feature_importance.csv" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/positions_etf.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/rank_oversold.py" beforeDir="false" afterPath="$PROJECT_DIR$/archive/rank_oversold.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/rank_oversold_orig.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/rebuild_yellow_and_oversold.py" beforeDir="false" afterPath="$PROJECT_DIR$/rebuild_yellow_and_oversold.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/signals.txt" beforeDir="false" afterPath="$PROJECT_DIR$/signals.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/supportchecker.py" beforeDir="false" afterPath="$PROJECT_DIR$/archive/supportchecker.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/suspect_fp_should_be_positive.csv" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/sweeppredict.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/yellowcircle.txt" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -40,7 +66,7 @@
 }</component>
   <component name="GithubPullRequestsUISettings">{
   &quot;selectedUrlAndAccountId&quot;: {
-    &quot;url&quot;: &quot;https://github.com/rnbguy-zz/cryptoETF.git&quot;,
+    &quot;url&quot;: &quot;git@github.com:rnbguy-zz/cryptoETF.git&quot;,
     &quot;accountId&quot;: &quot;b025cb43-8fe7-4eb0-84a7-617ae86b8e98&quot;
   }
 }</component>
@@ -57,20 +83,62 @@
   </component>
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
+    "Python.ETF Algo (1).executor": "Run",
     "Python.ETF Algo.executor": "Run",
+    "Python.ETF Algo_buy75.executor": "Run",
+    "Python.ETF Algo_buy75_withhistory.executor": "Run",
+    "Python.ETF Algo_withbuy (1).executor": "Run",
+    "Python.ETF Algo_withbuy.executor": "Run",
+    "Python.ETF_algo_1stemail.executor": "Run",
     "Python.bullish.executor": "Run",
+    "Python.joblibdecoder.executor": "Run",
     "Python.rank_oversold.executor": "Run",
+    "Python.rank_oversold_79.executor": "Run",
+    "Python.rank_oversold_accel.executor": "Run",
     "Python.rank_oversold_helper.executor": "Run",
+    "Python.rank_oversold_orig - Copy.executor": "Run",
     "Python.rank_oversold_orig.executor": "Run",
+    "Python.rank_oversold_orig_80.executor": "Run",
+    "Python.rank_oversold_orig_80_withdip.executor": "Run",
+    "Python.rank_oversold_orig_80_withdip_modeluser_nosweep (1).executor": "Run",
+    "Python.rank_oversold_orig_80_withdip_sweep.executor": "Run",
+    "Python.rank_oversold_parent.executor": "Run",
+    "Python.rank_oversold_parent_withdip.executor": "Run",
+    "Python.rank_oversold_parent_withdip_20 (1).executor": "Run",
+    "Python.rank_oversold_parent_withdip_20 (2).executor": "Run",
+    "Python.rank_oversold_parent_withdip_20_ModelMaker.executor": "Run",
+    "Python.rank_oversold_parent_withdip_20_ModelMaker_sweepertoo (1).executor": "Run",
+    "Python.rank_oversold_parent_withdip_20_Realworld.executor": "Run",
+    "Python.supportchecker.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.git.unshallow": "true",
     "git-widget-placeholder": "master",
     "ignore.virus.scanning.warn.message": "true",
-    "settings.editor.selected.configurable": "com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable"
+    "last_opened_file_path": "C:/Users/minam/OneDrive/Desktop/serverbackup",
+    "settings.editor.selected.configurable": "Errors"
   }
 }]]></component>
-  <component name="RunManager" selected="Python.ETF Algo">
-    <configuration name="ETF Algo" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="C:\Users\minam\OneDrive\Desktop\serverbackup" />
+      <recent name="C:\Users\minam\OneDrive\Desktop\serverbackup\ETF" />
+      <recent name="C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound\method2" />
+      <recent name="C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound" />
+    </key>
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="C:\Users\minam\OneDrive\Desktop\serverbackup\archive" />
+      <recent name="C:\Users\minam\OneDrive\Desktop\serverbackup" />
+      <recent name="C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound\ETF" />
+      <recent name="C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound\method2" />
+    </key>
+  </component>
+  <component name="RunAnythingCache">
+    <option name="myCommands">
+      <command value="sweep_train_and_save_final_model" />
+    </option>
+  </component>
+  <component name="RunManager" selected="Python.ETF_algo_1stemail">
+    <configuration name="ETF Algo (1)" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="serverbackup" />
       <option name="ENV_FILES" value="" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -79,12 +147,12 @@
         <env name="PYTHONUNBUFFERED" value="1" />
       </envs>
       <option name="SDK_HOME" value="" />
-      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/ETF" />
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/ETF Algo.py" />
-      <option name="PARAMETERS" value="--signals-file signals.txt --intraday-interval 1m --ambiguous-fallback sl-first" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/ETF/ETF Algo.py" />
+      <option name="PARAMETERS" value="--tp-pct 0.2 --sl-pct 0.12 --max-hold-days 21 --ambiguous-fallback sl-first --intraday-interval 1m --signals-file &quot;C:\Users\minam\OneDrive\Desktop\serverbackup\signals.txt&quot; --ask-to-buy-today --live-trade" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
       <option name="MODULE_MODE" value="false" />
@@ -92,7 +160,29 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
-    <configuration name="bullish" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+    <configuration name="ETF Algo_buy75_withhistory" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/ETF" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/ETF/ETF Algo_buy75_withhistory.py" />
+      <option name="PARAMETERS" value="--signals-file ../signals.txt --simulate-filtered --p-min 0.75 --pdrop-max 0.40 --tp-pct 0.20 --sl-pct 0.12 --max-hold-days 21 --entry-lag-days 0 --fee-rate 0.001 --ambiguous-fallback sl-first" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="ETF Algo_withbuy" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="serverbackup" />
       <option name="ENV_FILES" value="" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -105,7 +195,95 @@
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/bullish.py" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound\ETF\ETF Algo_withbuy.py" />
+      <option name="PARAMETERS" value="--signals-file signals.txt --intraday-interval 1m --ambiguous-fallback sl-first --ask-to-buy-today --live-trade" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="ETF Algo_withbuy" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/ETF" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\archive\ETF Algo_withbuy.py" />
+      <option name="PARAMETERS" value="--tp-pct 0.20 --sl-pct 0.12 --ambiguous-fallback sl-first --intraday-interval 1m --signals-file &quot;C:\Users\minam\OneDrive\Desktop\serverbackup\signals.txt&quot;" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="ETFAlgo_buy75(2ndemail)" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/ETF" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\ETF\ETFAlgo_buy75(2ndemail).py" />
+      <option name="PARAMETERS" value="--tp-pct 0.20 --signals-file &quot;C:\Users\minam\OneDrive\Desktop\serverbackup\signals.txt&quot; --live-trade --ask-to-buy-today" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="ETF_algo_1stemail" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/Email1" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/Email1/ETF_algo_1stemail.py" />
+      <option name="PARAMETERS" value="--tp-pct 0.2 --sl-pct 0.12 --max-hold-days 21 --ambiguous-fallback sl-first --intraday-interval 1m --signals-file ../signals.txt --ask-to-buy-today --live-trade" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="joblibdecoder" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/joblibdecoder.py" />
       <option name="PARAMETERS" value="" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
@@ -123,12 +301,12 @@
         <env name="PYTHONUNBUFFERED" value="1" />
       </envs>
       <option name="SDK_HOME" value="" />
-      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/Email1" />
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/rank_oversold.py" />
-      <option name="PARAMETERS" value="--retrain" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/Email1/rank_oversold.py" />
+      <option name="PARAMETERS" value="--dir ../oversold_analysis" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
       <option name="MODULE_MODE" value="false" />
@@ -136,7 +314,7 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
-    <configuration name="rank_oversold_helper" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+    <configuration name="rank_oversold_79" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="serverbackup" />
       <option name="ENV_FILES" value="" />
       <option name="INTERPRETER_OPTIONS" value="" />
@@ -149,8 +327,30 @@
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/rank_oversold_helper.py" />
-      <option name="PARAMETERS" value="--threshold 0.5 --retrain --target-pct 0.2" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\archive\rank_oversold_79.py" />
+      <option name="PARAMETERS" value="--retrain" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_accel" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/rank_oversold_accel.py" />
+      <option name="PARAMETERS" value="--retrain" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
       <option name="MODULE_MODE" value="false" />
@@ -171,8 +371,250 @@
       <option name="IS_MODULE_SDK" value="true" />
       <option name="ADD_CONTENT_ROOTS" value="true" />
       <option name="ADD_SOURCE_ROOTS" value="true" />
-      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/rank_oversold_orig.py" />
-      <option name="PARAMETERS" value="--skip-oof" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\archive\rank_oversold_orig.py" />
+      <option name="PARAMETERS" value="--retrain --skip-oof" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_orig_80" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/80 compound/rank_oversold_orig_80.py" />
+      <option name="PARAMETERS" value="--dir C:\Users\minam\OneDrive\Desktop\serverbackup\oversold_analysis" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_orig_80_withdip_child" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound\rank_oversold_orig_80_withdip_child.py" />
+      <option name="PARAMETERS" value="--dir C:\Users\minam\OneDrive\Desktop\serverbackup\oversold_analysis" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_orig_80_withdip_modeluser_nosweep (1)" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound/method2" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/80 compound/method2/rank_oversold_orig_80_withdip_modeluser_nosweep.py" />
+      <option name="PARAMETERS" value="--dir C:\Users\minam\OneDrive\Desktop\serverbackup\oversold_analysis --threshold 0.55" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_orig_80_withdip_modeluser_nosweep" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound/method2" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound\method2\rank_oversold_orig_80_withdip_modeluser_nosweep.py" />
+      <option name="PARAMETERS" value="--sweep --sweep-files 200 --sweep-fast --sweep-enforce-sl-not-first" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_parent" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/80 compound/rank_oversold_parent.py" />
+      <option name="PARAMETERS" value="--retrain --dir C:\Users\minam\OneDrive\Desktop\serverbackup\oversold_analysis" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_parent_withdip_20_ModelMaker_sweepertoo (1)" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound/method2" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/80 compound/method2/rank_oversold_parent_withdip_20_ModelMaker_sweepertoo.py" />
+      <option name="PARAMETERS" value="--sweep --threshold 0.55 --sweep-files 200 --sweep-fast --sweep-enforce-sl-not-first --dir C:\Users\minam\OneDrive\Desktop\serverbackup\oversold_analysis" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_parent_withdip_20_ModelMaker_sweepertoo" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound/method2" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound\method2\rank_oversold_parent_withdip_20_ModelMaker_sweepertoo.py" />
+      <option name="PARAMETERS" value="--sweep --sweep-files 200 --sweep-fast --sweep-enforce-sl-not-first --dir &quot;C:\Users\minam\OneDrive\Desktop\serverbackup\oversold_analysis&quot;" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_parent_withdip_20_Realworld" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/80 compound/rank_oversold_parent_withdip_20_Realworld.py" />
+      <option name="PARAMETERS" value="--dir &quot;C:\Users\minam\OneDrive\Desktop\serverbackup\oversold_analysis&quot; --cache-dir &quot;C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound\kline_store&quot; --threshold 0.61 --retrain --target-pct 0.20 --dl-workers 16" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_parent_withdip_20_sweep (1)" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound/archive" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/80 compound/archive/rank_oversold_parent_withdip_20_sweep.py" />
+      <option name="PARAMETERS" value="--sweep --threshold 0.61 --sweep-files 80 --sweep-fast --sweep-enforce-sl-not-first --dir C:\Users\minam\OneDrive\Desktop\serverbackup\oversold_analysis" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="rank_oversold_parent_withdip_20_sweep" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/80 compound/archive" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\80 compound\method2\rank_oversold_parent_withdip_20_sweep.py" />
+      <option name="PARAMETERS" value="--sweep --sweep-files 200 --sweep-fast --sweep-enforce-sl-not-first" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="supportchecker" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="serverbackup" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="C:\Users\minam\OneDrive\Desktop\serverbackup\archive\supportchecker.py" />
+      <option name="PARAMETERS" value="--train-end-date 2026-01-28    --horizons 5,7,10    --targets 0.20   --min-history-hits 3,2,1 --test-sizes 0.2    --offline-modes 1    --dl-workers 32" />
       <option name="SHOW_COMMAND_LINE" value="false" />
       <option name="EMULATE_TERMINAL" value="false" />
       <option name="MODULE_MODE" value="false" />
@@ -181,18 +623,35 @@
       <method v="2" />
     </configuration>
     <list>
+      <item itemvalue="Python.ETF_algo_1stemail" />
+      <item itemvalue="Python.ETF Algo_buy75_withhistory" />
+      <item itemvalue="Python.rank_oversold_79" />
+      <item itemvalue="Python.rank_oversold_accel" />
+      <item itemvalue="Python.rank_oversold_orig_80" />
+      <item itemvalue="Python.rank_oversold_orig_80_withdip_child" />
+      <item itemvalue="Python.rank_oversold_orig_80_withdip_modeluser_nosweep (1)" />
+      <item itemvalue="Python.rank_oversold_orig_80_withdip_modeluser_nosweep" />
       <item itemvalue="Python.rank_oversold_orig" />
-      <item itemvalue="Python.ETF Algo" />
-      <item itemvalue="Python.bullish" />
+      <item itemvalue="Python.rank_oversold_parent" />
+      <item itemvalue="Python.rank_oversold_parent_withdip_20_ModelMaker_sweepertoo (1)" />
+      <item itemvalue="Python.rank_oversold_parent_withdip_20_ModelMaker_sweepertoo" />
+      <item itemvalue="Python.rank_oversold_parent_withdip_20_Realworld" />
+      <item itemvalue="Python.rank_oversold_parent_withdip_20_sweep (1)" />
+      <item itemvalue="Python.rank_oversold_parent_withdip_20_sweep" />
+      <item itemvalue="Python.supportchecker" />
       <item itemvalue="Python.rank_oversold" />
-      <item itemvalue="Python.rank_oversold_helper" />
+      <item itemvalue="Python.ETFAlgo_buy75(2ndemail)" />
+      <item itemvalue="Python.joblibdecoder" />
+      <item itemvalue="Python.ETF Algo (1)" />
+      <item itemvalue="Python.ETF Algo_withbuy" />
     </list>
     <recent_temporary>
       <list>
-        <item itemvalue="Python.ETF Algo" />
-        <item itemvalue="Python.bullish" />
         <item itemvalue="Python.rank_oversold" />
-        <item itemvalue="Python.rank_oversold_helper" />
+        <item itemvalue="Python.ETF Algo (1)" />
+        <item itemvalue="Python.ETFAlgo_buy75(2ndemail)" />
+        <item itemvalue="Python.joblibdecoder" />
+        <item itemvalue="Python.ETF Algo_withbuy" />
       </list>
     </recent_temporary>
   </component>
@@ -236,13 +695,464 @@
       <option name="project" value="LOCAL" />
       <updated>1770344712644</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="ETF Algo complete ready for testing.">
+      <option name="closed" value="true" />
+      <created>1770347704425</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1770347704425</updated>
+    </task>
+    <task id="LOCAL-00005" summary="Added compounded Gain">
+      <option name="closed" value="true" />
+      <created>1770357723307</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1770357723307</updated>
+    </task>
+    <task id="LOCAL-00006" summary="updated user node to be quicker muchhhhh quicker and same email that works with ETF algo">
+      <option name="closed" value="true" />
+      <created>1770432893482</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1770432893482</updated>
+    </task>
+    <task id="LOCAL-00007" summary="added parent of 80 compound">
+      <option name="closed" value="true" />
+      <created>1770447288602</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1770447288602</updated>
+    </task>
+    <task id="LOCAL-00008" summary="fixed predict dates range in parent to be tied to latest file date.">
+      <option name="closed" value="true" />
+      <created>1770519243113</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1770519243114</updated>
+    </task>
+    <task id="LOCAL-00009" summary="parent now has better probability prediction seperation.">
+      <option name="closed" value="true" />
+      <created>1770531562859</created>
+      <option name="number" value="00009" />
+      <option name="presentableId" value="LOCAL-00009" />
+      <option name="project" value="LOCAL" />
+      <updated>1770531562859</updated>
+    </task>
+    <task id="LOCAL-00010" summary="added ability to buy with SL and TP">
+      <option name="closed" value="true" />
+      <created>1770538019686</created>
+      <option name="number" value="00010" />
+      <option name="presentableId" value="LOCAL-00010" />
+      <option name="project" value="LOCAL" />
+      <updated>1770538019686</updated>
+    </task>
+    <task id="LOCAL-00011" summary="reduced SL to -0.05 from -0.10 to increase wins.">
+      <option name="closed" value="true" />
+      <created>1770548657996</created>
+      <option name="number" value="00011" />
+      <option name="presentableId" value="LOCAL-00011" />
+      <option name="project" value="LOCAL" />
+      <updated>1770548657996</updated>
+    </task>
+    <task id="LOCAL-00012" summary="updated evaluation to be more realistic not lucky">
+      <option name="closed" value="true" />
+      <created>1770595409884</created>
+      <option name="number" value="00012" />
+      <option name="presentableId" value="LOCAL-00012" />
+      <option name="project" value="LOCAL" />
+      <updated>1770595409884</updated>
+    </task>
+    <task id="LOCAL-00013" summary="ETF algo now does buy only over 0.61 OR if symbol p going up">
+      <option name="closed" value="true" />
+      <created>1770598463255</created>
+      <option name="number" value="00013" />
+      <option name="presentableId" value="LOCAL-00013" />
+      <option name="project" value="LOCAL" />
+      <updated>1770598463255</updated>
+    </task>
+    <task id="LOCAL-00014" summary="accureate ranker">
+      <option name="closed" value="true" />
+      <created>1770600247070</created>
+      <option name="number" value="00014" />
+      <option name="presentableId" value="LOCAL-00014" />
+      <option name="project" value="LOCAL" />
+      <updated>1770600247070</updated>
+    </task>
+    <task id="LOCAL-00015" summary="accureate ranker">
+      <option name="closed" value="true" />
+      <created>1770600987487</created>
+      <option name="number" value="00015" />
+      <option name="presentableId" value="LOCAL-00015" />
+      <option name="project" value="LOCAL" />
+      <updated>1770600987487</updated>
+    </task>
+    <task id="LOCAL-00016" summary="added sweep capability">
+      <option name="closed" value="true" />
+      <created>1770603677413</created>
+      <option name="number" value="00016" />
+      <option name="presentableId" value="LOCAL-00016" />
+      <option name="project" value="LOCAL" />
+      <updated>1770603677413</updated>
+    </task>
+    <task id="LOCAL-00017" summary="fixed sweep to use time series.">
+      <option name="closed" value="true" />
+      <created>1770604375400</created>
+      <option name="number" value="00017" />
+      <option name="presentableId" value="LOCAL-00017" />
+      <option name="project" value="LOCAL" />
+      <updated>1770604375400</updated>
+    </task>
+    <task id="LOCAL-00018" summary="fixed sweep to use dip before up logic">
+      <option name="closed" value="true" />
+      <created>1770611925723</created>
+      <option name="number" value="00018" />
+      <option name="presentableId" value="LOCAL-00018" />
+      <option name="project" value="LOCAL" />
+      <updated>1770611925723</updated>
+    </task>
+    <task id="LOCAL-00019" summary="fixed sweep to use:&#10;1. forward time series.&#10;2. check it doesnt dip first&#10;3. doesnt fill in blanks with bogus">
+      <option name="closed" value="true" />
+      <created>1770620136493</created>
+      <option name="number" value="00019" />
+      <option name="presentableId" value="LOCAL-00019" />
+      <option name="project" value="LOCAL" />
+      <updated>1770620136493</updated>
+    </task>
+    <task id="LOCAL-00020" summary="fixed sweep to use:&#10;1. forward time series.&#10;2. check it doesnt dip first&#10;3. doesnt fill in blanks with bogus">
+      <option name="closed" value="true" />
+      <created>1770623980268</created>
+      <option name="number" value="00020" />
+      <option name="presentableId" value="LOCAL-00020" />
+      <option name="project" value="LOCAL" />
+      <updated>1770623980268</updated>
+    </task>
+    <task id="LOCAL-00021" summary="[SWEEP] H=21 DH=21 TP=0.2 DP=0.11&#10;  REALISTIC -&gt; prec1=0.951  rec1=0.125  f1=0.221  buys=185  winners=176&#10;&#10;[SWEEP] H=21 DH=21 TP=0.2 DP=0.12&#10;  REALISTIC -&gt; prec1=0.912  rec1=0.131  f1=0.229  buys=205  winners=187">
+      <option name="closed" value="true" />
+      <created>1770629709919</created>
+      <option name="number" value="00021" />
+      <option name="presentableId" value="LOCAL-00021" />
+      <option name="project" value="LOCAL" />
+      <updated>1770629709919</updated>
+    </task>
+    <task id="LOCAL-00022" summary="[SWEEP] H=21 DH=21 TP=0.2 DP=0.11&#10;  REALISTIC -&gt; prec1=0.951  rec1=0.125  f1=0.221  buys=185  winners=176&#10;&#10;[SWEEP] H=21 DH=21 TP=0.2 DP=0.12&#10;  REALISTIC -&gt; prec1=0.912  rec1=0.131  f1=0.229  buys=205  winners=187">
+      <option name="closed" value="true" />
+      <created>1770636524003</created>
+      <option name="number" value="00022" />
+      <option name="presentableId" value="LOCAL-00022" />
+      <option name="project" value="LOCAL" />
+      <updated>1770636524003</updated>
+    </task>
+    <task id="LOCAL-00023" summary="added prod version of oversold rank with dip">
+      <option name="closed" value="true" />
+      <created>1770641315663</created>
+      <option name="number" value="00023" />
+      <option name="presentableId" value="LOCAL-00023" />
+      <option name="project" value="LOCAL" />
+      <updated>1770641315664</updated>
+    </task>
+    <task id="LOCAL-00024" summary="added prod version of oversold rank with dip">
+      <option name="closed" value="true" />
+      <created>1770644184903</created>
+      <option name="number" value="00024" />
+      <option name="presentableId" value="LOCAL-00024" />
+      <option name="project" value="LOCAL" />
+      <updated>1770644184903</updated>
+    </task>
+    <task id="LOCAL-00025" summary="organised folders.">
+      <option name="closed" value="true" />
+      <created>1770674576187</created>
+      <option name="number" value="00025" />
+      <option name="presentableId" value="LOCAL-00025" />
+      <option name="project" value="LOCAL" />
+      <updated>1770674576187</updated>
+    </task>
+    <task id="LOCAL-00026" summary="ensured configs match thresholds etc">
+      <option name="closed" value="true" />
+      <created>1770707433317</created>
+      <option name="number" value="00026" />
+      <option name="presentableId" value="LOCAL-00026" />
+      <option name="project" value="LOCAL" />
+      <updated>1770707433317</updated>
+    </task>
+    <task id="LOCAL-00027" summary="fixed variables">
+      <option name="closed" value="true" />
+      <created>1770749967059</created>
+      <option name="number" value="00027" />
+      <option name="presentableId" value="LOCAL-00027" />
+      <option name="project" value="LOCAL" />
+      <updated>1770749967059</updated>
+    </task>
+    <task id="LOCAL-00028" summary="fixed variables">
+      <option name="closed" value="true" />
+      <created>1770750207834</created>
+      <option name="number" value="00028" />
+      <option name="presentableId" value="LOCAL-00028" />
+      <option name="project" value="LOCAL" />
+      <updated>1770750207834</updated>
+    </task>
+    <task id="LOCAL-00029" summary="fixed variables">
+      <option name="closed" value="true" />
+      <created>1770752695184</created>
+      <option name="number" value="00029" />
+      <option name="presentableId" value="LOCAL-00029" />
+      <option name="project" value="LOCAL" />
+      <updated>1770752695184</updated>
+    </task>
+    <task id="LOCAL-00030" summary="cleaned code massively">
+      <option name="closed" value="true" />
+      <created>1770756363998</created>
+      <option name="number" value="00030" />
+      <option name="presentableId" value="LOCAL-00030" />
+      <option name="project" value="LOCAL" />
+      <updated>1770756363998</updated>
+    </task>
+    <task id="LOCAL-00031" summary="cleaned code massively">
+      <option name="closed" value="true" />
+      <created>1770759392672</created>
+      <option name="number" value="00031" />
+      <option name="presentableId" value="LOCAL-00031" />
+      <option name="project" value="LOCAL" />
+      <updated>1770759392672</updated>
+    </task>
+    <task id="LOCAL-00032" summary="cleaned code massively">
+      <option name="closed" value="true" />
+      <created>1770759814451</created>
+      <option name="number" value="00032" />
+      <option name="presentableId" value="LOCAL-00032" />
+      <option name="project" value="LOCAL" />
+      <updated>1770759814451</updated>
+    </task>
+    <task id="LOCAL-00033" summary="cleaned code massively">
+      <option name="closed" value="true" />
+      <created>1770760313822</created>
+      <option name="number" value="00033" />
+      <option name="presentableId" value="LOCAL-00033" />
+      <option name="project" value="LOCAL" />
+      <updated>1770760313822</updated>
+    </task>
+    <task id="LOCAL-00034" summary="cleaned code massively">
+      <option name="closed" value="true" />
+      <created>1770761322768</created>
+      <option name="number" value="00034" />
+      <option name="presentableId" value="LOCAL-00034" />
+      <option name="project" value="LOCAL" />
+      <updated>1770761322768</updated>
+    </task>
+    <task id="LOCAL-00035" summary="added rebuild yellow">
+      <option name="closed" value="true" />
+      <created>1770802141903</created>
+      <option name="number" value="00035" />
+      <option name="presentableId" value="LOCAL-00035" />
+      <option name="project" value="LOCAL" />
+      <updated>1770802141903</updated>
+    </task>
+    <task id="LOCAL-00036" summary="Updated ETF algo to buy">
+      <option name="closed" value="true" />
+      <created>1770885949381</created>
+      <option name="number" value="00036" />
+      <option name="presentableId" value="LOCAL-00036" />
+      <option name="project" value="LOCAL" />
+      <updated>1770885949381</updated>
+    </task>
+    <task id="LOCAL-00037" summary="Updated ETF algo to buy">
+      <option name="closed" value="true" />
+      <created>1770888752445</created>
+      <option name="number" value="00037" />
+      <option name="presentableId" value="LOCAL-00037" />
+      <option name="project" value="LOCAL" />
+      <updated>1770888752445</updated>
+    </task>
+    <task id="LOCAL-00038" summary="Updated ETF algo to buy">
+      <option name="closed" value="true" />
+      <created>1770888839290</created>
+      <option name="number" value="00038" />
+      <option name="presentableId" value="LOCAL-00038" />
+      <option name="project" value="LOCAL" />
+      <updated>1770888839290</updated>
+    </task>
+    <task id="LOCAL-00039" summary="123 compound file. highest so far.">
+      <option name="closed" value="true" />
+      <created>1771035393047</created>
+      <option name="number" value="00039" />
+      <option name="presentableId" value="LOCAL-00039" />
+      <option name="project" value="LOCAL" />
+      <updated>1771035393048</updated>
+    </task>
+    <task id="LOCAL-00040" summary="Model 3, added ETF algo and model maker for it.">
+      <option name="closed" value="true" />
+      <created>1771063686915</created>
+      <option name="number" value="00040" />
+      <option name="presentableId" value="LOCAL-00040" />
+      <option name="project" value="LOCAL" />
+      <updated>1771063686915</updated>
+    </task>
+    <task id="LOCAL-00041" summary="Model 3, added ETF algo and model maker for it.">
+      <option name="closed" value="true" />
+      <created>1771064765203</created>
+      <option name="number" value="00041" />
+      <option name="presentableId" value="LOCAL-00041" />
+      <option name="project" value="LOCAL" />
+      <updated>1771064765203</updated>
+    </task>
+    <task id="LOCAL-00042" summary="Model 3, added ETF algo and model maker for it.">
+      <option name="closed" value="true" />
+      <created>1771118958819</created>
+      <option name="number" value="00042" />
+      <option name="presentableId" value="LOCAL-00042" />
+      <option name="project" value="LOCAL" />
+      <updated>1771118958819</updated>
+    </task>
+    <task id="LOCAL-00043" summary="Model 3, added ETF algo and model maker for it.">
+      <option name="closed" value="true" />
+      <created>1771140192529</created>
+      <option name="number" value="00043" />
+      <option name="presentableId" value="LOCAL-00043" />
+      <option name="project" value="LOCAL" />
+      <updated>1771140192529</updated>
+    </task>
+    <task id="LOCAL-00044" summary="Model 3, added ETF algo and model maker for it.">
+      <option name="closed" value="true" />
+      <created>1771140965957</created>
+      <option name="number" value="00044" />
+      <option name="presentableId" value="LOCAL-00044" />
+      <option name="project" value="LOCAL" />
+      <updated>1771140965957</updated>
+    </task>
+    <task id="LOCAL-00045" summary="added a model that auto calibrates before buying.">
+      <option name="closed" value="true" />
+      <created>1771149788309</created>
+      <option name="number" value="00045" />
+      <option name="presentableId" value="LOCAL-00045" />
+      <option name="project" value="LOCAL" />
+      <updated>1771149788309</updated>
+    </task>
+    <option name="localTasksCounter" value="46" />
     <servers />
   </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="OPEN_GENERIC_TABS">
+      <map>
+        <entry key="d74fb92b-9ced-46c9-aabc-4e2fcb9c6b0d" value="TOOL_WINDOW" />
+        <entry key="7bb9eacd-d99a-4b8e-a349-d8e48d6a01ab" value="TOOL_WINDOW" />
+        <entry key="75c61480-3cc9-446e-a582-ee0908b09a15" value="TOOL_WINDOW" />
+      </map>
+    </option>
+    <option name="TAB_STATES">
+      <map>
+        <entry key="75c61480-3cc9-446e-a582-ee0908b09a15">
+          <value>
+            <State>
+              <option name="FILTERS">
+                <map>
+                  <entry key="branch">
+                    <value>
+                      <list>
+                        <option value="HEAD" />
+                      </list>
+                    </value>
+                  </entry>
+                  <entry key="roots">
+                    <value>
+                      <list>
+                        <option value="$PROJECT_DIR$" />
+                      </list>
+                    </value>
+                  </entry>
+                </map>
+              </option>
+              <option name="SHOW_ONLY_AFFECTED_CHANGES" value="true" />
+            </State>
+          </value>
+        </entry>
+        <entry key="7bb9eacd-d99a-4b8e-a349-d8e48d6a01ab">
+          <value>
+            <State>
+              <option name="FILTERS">
+                <map>
+                  <entry key="branch">
+                    <value>
+                      <list>
+                        <option value="HEAD" />
+                      </list>
+                    </value>
+                  </entry>
+                  <entry key="roots">
+                    <value>
+                      <list>
+                        <option value="$PROJECT_DIR$" />
+                      </list>
+                    </value>
+                  </entry>
+                </map>
+              </option>
+              <option name="SHOW_ONLY_AFFECTED_CHANGES" value="true" />
+            </State>
+          </value>
+        </entry>
+        <entry key="MAIN">
+          <value>
+            <State />
+          </value>
+        </entry>
+        <entry key="d74fb92b-9ced-46c9-aabc-4e2fcb9c6b0d">
+          <value>
+            <State>
+              <option name="FILTERS">
+                <map>
+                  <entry key="branch">
+                    <value>
+                      <list>
+                        <option value="HEAD" />
+                      </list>
+                    </value>
+                  </entry>
+                  <entry key="roots">
+                    <value>
+                      <list>
+                        <option value="$PROJECT_DIR$" />
+                      </list>
+                    </value>
+                  </entry>
+                </map>
+              </option>
+              <option name="SHOW_ONLY_AFFECTED_CHANGES" value="true" />
+            </State>
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
   <component name="VcsManagerConfiguration">
-    <MESSAGE value="original code" />
-    <MESSAGE value="added the ability to see gains until today" />
-    <MESSAGE value="updating ETF algo.&#10;Fixed loading rolling bundle." />
-    <option name="LAST_COMMIT_MESSAGE" value="updating ETF algo.&#10;Fixed loading rolling bundle." />
+    <MESSAGE value="Added compounded Gain" />
+    <MESSAGE value="updated user node to be quicker muchhhhh quicker and same email that works with ETF algo" />
+    <MESSAGE value="added parent of 80 compound" />
+    <MESSAGE value="fixed predict dates range in parent to be tied to latest file date." />
+    <MESSAGE value="parent now has better probability prediction seperation." />
+    <MESSAGE value="added ability to buy with SL and TP" />
+    <MESSAGE value="reduced SL to -0.05 from -0.10 to increase wins." />
+    <MESSAGE value="updated evaluation to be more realistic not lucky" />
+    <MESSAGE value="ETF algo now does buy only over 0.61 OR if symbol p going up" />
+    <MESSAGE value="accureate ranker" />
+    <MESSAGE value="added sweep capability" />
+    <MESSAGE value="fixed sweep to use time series." />
+    <MESSAGE value="fixed sweep to use dip before up logic" />
+    <MESSAGE value="fixed sweep to use:&#10;1. forward time series.&#10;2. check it doesnt dip first&#10;3. doesnt fill in blanks with bogus" />
+    <MESSAGE value="[SWEEP] H=21 DH=21 TP=0.2 DP=0.11&#10;  REALISTIC -&gt; prec1=0.951  rec1=0.125  f1=0.221  buys=185  winners=176&#10;&#10;[SWEEP] H=21 DH=21 TP=0.2 DP=0.12&#10;  REALISTIC -&gt; prec1=0.912  rec1=0.131  f1=0.229  buys=205  winners=187" />
+    <MESSAGE value="added prod version of oversold rank with dip" />
+    <MESSAGE value="organised folders." />
+    <MESSAGE value="ensured configs match thresholds etc" />
+    <MESSAGE value="fixed variables" />
+    <MESSAGE value="cleaned code massively" />
+    <MESSAGE value="added rebuild yellow" />
+    <MESSAGE value="Updated ETF algo to buy" />
+    <MESSAGE value="123 compound file. highest so far." />
+    <MESSAGE value="Model 3, added ETF algo and model maker for it." />
+    <MESSAGE value="added a model that auto calibrates before buying." />
+    <option name="LAST_COMMIT_MESSAGE" value="added a model that auto calibrates before buying." />
   </component>
 </project>
