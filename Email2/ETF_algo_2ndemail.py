@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-python3.9 ETF_algo_2ndemail.py --tp-pct 0.2 --sl-pct 0.12 --signals-file "signals.txt" --ask-to-buy-today --live-trade
+python3.9 ETF_algo_2ndemail.py --tp-pct 0.2 --sl-pct 0.12 --signals-file ../signals.txt --ask-to-buy-today --live-trade
 """
 
 from __future__ import annotations
@@ -27,7 +27,8 @@ import requests
 # Parsing signals
 # =============================================================================
 
-FILE_RE = re.compile(r"^\s*file=(\d{4}-\d{2}-\d{2})\b")
+FILE_RE = re.compile(r"^\s*\ufeff?\s*file\s*=?\s*(\d{4}-\d{2}-\d{2})\b", re.I)
+
 BUY_RE = re.compile(r"^\s*BUY\s+([A-Z0-9]+)\b")
 P_RE = re.compile(r"\bp\s*=\s*([0-9]*\.?[0-9]+)\b")  # parses "p=0.563"
 RUNUP_RE = re.compile(
@@ -771,6 +772,11 @@ def run_latest_block_buy_prompt(
 ) -> None:
     latest_day, shortlist = _latest_block_shortlist(signals, p_min=0.75, runup_max_pct=10.0)
 
+    print("\n" + "-" * 80)
+    print(f"LATEST FILE BLOCK DETECTED: file={latest_day.isoformat()}")
+    print(f"BUY signals in latest block: {sum(1 for s in signals if s.file_date == latest_day)}")
+    print("-" * 80)
+
     chosen = _prompt_pick_from_shortlist(shortlist, latest_day)
 
     # MUST check this BEFORE using chosen.*
@@ -801,11 +807,11 @@ def run_latest_block_buy_prompt(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--signals-file", required=True)
+    ap.add_argument("--signals-file", default="./signals2.txt")
     ap.add_argument("--tp-pct", type=float, default=0.20)
     ap.add_argument("--sl-pct", type=float, default=0.12)
-    ap.add_argument("--ask-to-buy-today", action="store_true")
-    ap.add_argument("--live-trade", action="store_true")
+    ap.add_argument("--ask-to-buy-today", action="store_true", default=True)
+    ap.add_argument("--live-trade", action="store_true", default=True)
     args = ap.parse_args()
 
     signals_path = Path(args.signals_file)
@@ -814,6 +820,27 @@ def main() -> int:
         return 2
 
     signals, _raw_blocks = load_signals_file(signals_path)
+    print("\n" + "=" * 80)
+    print("SIGNALS PARSE SUMMARY")
+    print("=" * 80)
+    print(f"Signals file: {signals_path}")
+    print(f"Total BUY signals parsed: {len(signals)}")
+
+    if signals:
+        days = sorted({s.file_date for s in signals})
+        print(f"File date range: {days[0]} -> {days[-1]}")
+        print(f"Unique symbols: {len({s.symbol for s in signals})}")
+    else:
+        print("WARNING: No BUY lines parsed.")
+
+    print("=" * 80 + "\n")
+
+    print("\nFIRST 10 PARSED BUY LINES:")
+    for s in signals[:10]:
+        print(f"  {s.file_date}  BUY {s.symbol}  p={s.p}  runup={s.runup_to_high_pct}  featDropP={s.feat_drop_p}")
+    print("=" * 80 + "\n")
+    # ==========================================================
+
     if not signals:
         print("ERROR: No signals found.", file=sys.stderr)
         return 2
@@ -833,3 +860,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
