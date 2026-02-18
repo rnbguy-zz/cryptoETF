@@ -378,7 +378,7 @@ def send_email_with_analysis(body: str, df: Optional[pd.DataFrame] = None, direc
     msg = MIMEMultipart()
     msg["From"] = SENDER_EMAIL
     msg["To"] = RECIPIENT_EMAIL
-    msg["Subject"] = "Oversold Analysis Alert"
+    msg["Subject"] = "Oversold Analysis Alert1"
     msg.attach(MIMEText(body, "plain"))
 
     if df is not None and not df.empty:
@@ -1905,7 +1905,7 @@ def build_email_body(
     topk: int = 40,
 ) -> str:
     lines: List[str] = []
-    lines.append("Oversold Analysis Alert")
+    lines.append("Oversold Analysis Alert - Email1")
     lines.append("=" * 60)
     lines.append(f"Loaded hits: {loaded_hits}")
     lines.append(f"Total samples (train + predict): {df_all_len}")

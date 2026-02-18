@@ -22,7 +22,7 @@ import requests
 # Parsing (signals text)
 # =============================================================================
 
-FILE_RE = re.compile(r"^\s*file=(\d{4}-\d{2}-\d{2})\b")
+FILE_RE = re.compile(r"^\s*file\s*=?\s*((?:\d{4}|\d{2})-\d{2}-\d{2})\b", re.I)
 META_PREDICT_FROM_RE = re.compile(r"^\s*Model\s+predict_from:\s*(\d{4}-\d{2}-\d{2})\s*$", re.I)
 
 BUY_LINE_RE = re.compile(r"^\s*BUY\s+([A-Z0-9]+)\b")
@@ -41,8 +41,17 @@ class SignalRow:
     drop_p: float
     raw_line: str
 
+def fetch_live_price(symbol: str, session: requests.Session) -> float:
+    j = _session_get_json(session, BINANCE_BASE + "/api/v3/ticker/price", params={"symbol": symbol}, timeout=10)
+    return float(j["price"])
+
 
 def _parse_date(s: str) -> date:
+    s = s.strip()
+    if re.match(r"^\d{2}-\d{2}-\d{2}$", s):
+        # interpret as YY-MM-DD -> 20YY-MM-DD
+        yy, mm, dd = s.split("-")
+        s = f"20{yy}-{mm}-{dd}"
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
@@ -777,21 +786,77 @@ def replay_single_position_from_gated_picks(
         d += timedelta(days=1)
 
     # Build open position summary (if still holding at end_day)
+    # Build open position summary (if still holding at end_day)
     open_pos: Optional[dict] = None
     if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
+        # default mark using latest daily candle close (may be stale intra-day)
         c_last = candles_by_symbol.get(holding_symbol, {}).get(end_day)
         last_close = c_last.c if c_last else holding_entry_open
-        unreal = (last_close / max(holding_entry_open, 1e-12) - 1.0) * 100.0
 
-        open_pos = {
-            "symbol": holding_symbol,
-            "file_date": holding_file_date,
-            "entry_day": holding_entry_day,
-            "entry_open": float(holding_entry_open),
-            "last_day": end_day,
-            "last_close": float(last_close),
-            "unrealized_pct": float(unreal),
-        }
+        # ---- NEW: mark-to-market using LIVE ticker price "as of now" ----
+        # Only meaningful for today's UTC day (otherwise price isn't relevant for historical day)
+        if end_day == datetime.utcnow().date():
+            try:
+                live_px = fetch_live_price(holding_symbol, session=session)
+                last_close = live_px  # override mark with live
+                tp_price = holding_entry_open * (1.0 + tp_pct)
+                sl_price = holding_entry_open * (1.0 - sl_pct)
+
+                # If live price is beyond TP/SL, close it NOW
+                if live_px >= tp_price:
+                    g = _gain_pct(holding_entry_open, float(tp_price))
+                    compounded *= (1.0 + g / 100.0)
+                    trades.append(
+                        ReplayTrade(
+                            symbol=holding_symbol,
+                            file_date=holding_file_date,
+                            entry_day=holding_entry_day,
+                            entry_open=holding_entry_open,
+                            exit_day=end_day,
+                            exit_price=float(tp_price),
+                            exit_reason="TP_NOW",
+                            gain_pct=g,
+                        )
+                    )
+                    holding_symbol = None
+                    holding_entry_open = 0.0
+                    holding_entry_day = None
+                    holding_file_date = None
+
+                elif live_px <= sl_price:
+                    g = _gain_pct(holding_entry_open, float(sl_price))
+                    compounded *= (1.0 + g / 100.0)
+                    trades.append(
+                        ReplayTrade(
+                            symbol=holding_symbol,
+                            file_date=holding_file_date,
+                            entry_day=holding_entry_day,
+                            entry_open=holding_entry_open,
+                            exit_day=end_day,
+                            exit_price=float(sl_price),
+                            exit_reason="SL_NOW",
+                            gain_pct=g,
+                        )
+                    )
+                    holding_symbol = None
+                    holding_entry_open = 0.0
+                    holding_entry_day = None
+                    holding_file_date = None
+            except Exception:
+                pass
+
+        # If still holding after NOW-check, report open position
+        if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
+            unreal = (last_close / max(holding_entry_open, 1e-12) - 1.0) * 100.0
+            open_pos = {
+                "symbol": holding_symbol,
+                "file_date": holding_file_date,
+                "entry_day": holding_entry_day,
+                "entry_open": float(holding_entry_open),
+                "last_day": end_day,
+                "last_close": float(last_close),
+                "unrealized_pct": float(unreal),
+            }
 
     return trades, compounded, open_pos
 
@@ -1171,7 +1236,7 @@ def live_manage_or_buy_with_oco(
 def run_live_prompt_after_gate(
     *,
     open_pos: Optional[dict],
-    gated_picks_by_file_date: Dict[date, SignalRow],  # your #01-per-day picks (future blocks)
+    gated_picks_by_file_date: Dict[date, SignalRow],  # unused now, but keep signature
     entry_lag_days: int,
     tp_pct: float,
     sl_pct: float,
@@ -1179,70 +1244,24 @@ def run_live_prompt_after_gate(
     live_trade: bool,
 ) -> None:
     """
-    Live behavior you asked for:
-
-    1) If we have an OPEN position from the replay (open_pos != None),
-       we assume that's the position to manage NOW:
-         - Do NOT buy anything new
-         - Just add OCO exits for it (if you’re holding it and no exits exist)
-
-    2) Else (no open_pos), take the latest available gated pick (max file_date),
-       compute its ENTRY OPEN from Binance 1D candle on entry_day = file_date + lag,
-       then:
-         - If already holding it -> add OCO exits
-         - Else -> optionally buy then add OCO exits
-
-    TP/SL levels are always based on that entry_open (your requirement).
+    NEW rule:
+      - ONLY manage an OPEN position from replay.
+      - If replay is flat (open_pos is None), do NOTHING (no buys).
     """
-    # Case 1: manage existing open position
-    if open_pos is not None:
-        sym = str(open_pos["symbol"]).upper()
-        ref_entry_open = float(open_pos["entry_open"])
-        print("\n" + "=" * 90)
-        print("LIVE: managing OPEN position from replay (no new buys)")
-        print("=" * 90)
-        live_manage_or_buy_with_oco(
-            symbol=sym,
-            ref_entry_open=ref_entry_open,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            live_trade=live_trade,
-        )
+    if open_pos is None:
+        print("\nLIVE: replay is FLAT (no open position) -> not buying anything.")
         return
 
-    # Case 2: no open position -> use latest gated pick
-    if not gated_picks_by_file_date:
-        print("\nLIVE: no gated picks available to buy/manage.")
-        return
-
-    latest_fd = max(gated_picks_by_file_date.keys())
-    pick = gated_picks_by_file_date[latest_fd]
-    entry_day = latest_fd + timedelta(days=int(entry_lag_days))
-
-    # fetch entry day's OPEN for that symbol (this is your TP/SL anchor)
-    session = requests.Session()
-    cache = load_cache(cache_path)
-    candles = get_candles_cached(
-        pick.symbol,
-        entry_day,
-        entry_day,
-        session=session,
-        cache=cache,
-        cache_path=cache_path,
-    )
-    c = candles.get(entry_day)
-    if c is None:
-        print(f"\nLIVE: missing entry candle for {pick.symbol} on {entry_day.isoformat()} -> cannot compute entry_open anchor.")
-        return
+    sym = str(open_pos["symbol"]).upper()
+    ref_entry_open = float(open_pos["entry_open"])
 
     print("\n" + "=" * 90)
-    print(f"LIVE: latest gated pick is file={latest_fd.isoformat()} -> entry_day={entry_day.isoformat()}")
-    print(f"  #01 BUY {pick.symbol}  p={pick.p:.3f} hits30d={pick.hits30d} featDropP={pick.drop_p:.3f}")
+    print("LIVE: managing OPEN position from replay (no new buys)")
     print("=" * 90)
 
     live_manage_or_buy_with_oco(
-        symbol=pick.symbol,
-        ref_entry_open=float(c.o),
+        symbol=sym,
+        ref_entry_open=ref_entry_open,
         tp_pct=tp_pct,
         sl_pct=sl_pct,
         live_trade=live_trade,
@@ -1254,7 +1273,7 @@ def run_live_prompt_after_gate(
 # =============================================================================
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--signals-file", required=True)
+    ap.add_argument("--signals-file", default="./signals1.txt")
     ap.add_argument("--cache-path", default="binance_cache.json")
 
     ap.add_argument("--entry-lag-days", type=int, default=1)
@@ -1272,9 +1291,9 @@ def main() -> int:
                     help="Disable intraday disambiguation (faster, less accurate).")
 
     # ---- MISSING FLAGS (your crash) ----
-    ap.add_argument("--ask-to-buy-today", action="store_true",
+    ap.add_argument("--ask-to-buy-today", action="store_true",default=True,
                     help="After gate+replay, manage open position (or latest gated pick) on Binance.")
-    ap.add_argument("--live-trade", action="store_true",
+    ap.add_argument("--live-trade", action="store_true",default=True,
                     help="Actually place orders on Binance (default is DRY-RUN).")
 
     args = ap.parse_args()
@@ -1505,3 +1524,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
