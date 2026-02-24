@@ -81,43 +81,43 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "Python.ETF Algo (1).executor": "Run",
-    "Python.ETF Algo.executor": "Run",
-    "Python.ETF Algo_buy75.executor": "Run",
-    "Python.ETF Algo_buy75_withhistory.executor": "Run",
-    "Python.ETF Algo_withbuy (1).executor": "Run",
-    "Python.ETF Algo_withbuy.executor": "Run",
-    "Python.ETF_algo_1stemail.executor": "Run",
-    "Python.bullish.executor": "Run",
-    "Python.joblibdecoder.executor": "Run",
-    "Python.rank_oversold.executor": "Run",
-    "Python.rank_oversold_79.executor": "Run",
-    "Python.rank_oversold_accel.executor": "Run",
-    "Python.rank_oversold_helper.executor": "Run",
-    "Python.rank_oversold_orig - Copy.executor": "Run",
-    "Python.rank_oversold_orig.executor": "Run",
-    "Python.rank_oversold_orig_80.executor": "Run",
-    "Python.rank_oversold_orig_80_withdip.executor": "Run",
-    "Python.rank_oversold_orig_80_withdip_modeluser_nosweep (1).executor": "Run",
-    "Python.rank_oversold_orig_80_withdip_sweep.executor": "Run",
-    "Python.rank_oversold_parent.executor": "Run",
-    "Python.rank_oversold_parent_withdip.executor": "Run",
-    "Python.rank_oversold_parent_withdip_20 (1).executor": "Run",
-    "Python.rank_oversold_parent_withdip_20 (2).executor": "Run",
-    "Python.rank_oversold_parent_withdip_20_ModelMaker.executor": "Run",
-    "Python.rank_oversold_parent_withdip_20_ModelMaker_sweepertoo (1).executor": "Run",
-    "Python.rank_oversold_parent_withdip_20_Realworld.executor": "Run",
-    "Python.supportchecker.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "master",
-    "ignore.virus.scanning.warn.message": "true",
-    "last_opened_file_path": "C:/Users/minam/OneDrive/Desktop/serverbackup",
-    "settings.editor.selected.configurable": "Errors"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Python.ETF Algo (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.ETF Algo.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ETF Algo_buy75.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ETF Algo_buy75_withhistory.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ETF Algo_withbuy (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.ETF Algo_withbuy.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ETF_algo_1stemail.executor&quot;: &quot;Run&quot;,
+    &quot;Python.bullish.executor&quot;: &quot;Run&quot;,
+    &quot;Python.joblibdecoder.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_79.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_accel.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_helper.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_orig - Copy.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_orig.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_orig_80.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_orig_80_withdip.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_orig_80_withdip_modeluser_nosweep (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_orig_80_withdip_sweep.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_parent.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_parent_withdip.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_parent_withdip_20 (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_parent_withdip_20 (2).executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_parent_withdip_20_ModelMaker.executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_parent_withdip_20_ModelMaker_sweepertoo (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.rank_oversold_parent_withdip_20_Realworld.executor&quot;: &quot;Run&quot;,
+    &quot;Python.supportchecker.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+    &quot;ignore.virus.scanning.warn.message&quot;: &quot;true&quot;,
+    &quot;last_opened_file_path&quot;: &quot;C:/Users/minam/OneDrive/Desktop/serverbackup&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;Errors&quot;
   }
-}]]></component>
+}</component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="C:\Users\minam\OneDrive\Desktop\serverbackup" />

@@ -11,3 +11,9 @@
 /models2/
 /logingit.pub
 /logingit
+*.joblib
+*.pkl
+*.pt
+archive/
+**/models/bak/
+**/bak/
