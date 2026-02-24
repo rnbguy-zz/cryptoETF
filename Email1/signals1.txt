@@ -1,0 +1,101 @@
+Oversold Analysis Alert - Email1
+============================================================
+Loaded hits: 82897
+Total samples (train + predict): 81237
+Train dates: 2023-09-14 .. 2026-01-30 (863 days)
+Predict dates (classify only): 2026-01-31 .. 2026-02-23 (24 days)
+
+Model trained_through: 2026-02-01
+Model predict_from: 2026-02-02
+holdout_days: 30
+threshold: 0.5
+target_pct: 0.2
+sklearn: 1.6.1
+created_utc: 2026-02-08T06:47:18Z
+drop_feature: feat_prob_drop10 (from downside model or fallback)
+
+=== TOP CANDIDATES (predict window; BTC mood=BULLISH ONLY) ===
+
+file=2026-01-31 (top 1) threshold=0.5 BTC(2026-01-31)=BULLISH -6.55%
+BUY AWEUSDT p=0.763 hits30d=11 runupToHigh=95.73% maxHighDate=2026-02-18 featDropP=0.174
+
+file=2026-02-01 (top 4) threshold=0.5 BTC(2026-02-01)=BULLISH -2.25%
+BUY BARDUSDT p=0.795 hits30d=1 runupToHigh=32.88% maxHighDate=2026-02-10 featDropP=0.334
+BUY THEUSDT p=0.639 hits30d=4 runupToHigh=36.00% maxHighDate=2026-02-15 featDropP=0.407
+BUY C98USDT p=0.562 hits30d=13 runupToHigh=82.05% maxHighDate=2026-02-05 featDropP=0.634
+BUY RESOLVUSDT p=0.513 hits30d=13 runupToHigh=15.49% maxHighDate=2026-02-08 featDropP=0.644
+
+file=2026-02-02 (top 2) threshold=0.5 BTC(2026-02-02)=BULLISH +2.30%
+BUY AWEUSDT p=0.735 hits30d=11 runupToHigh=85.20% maxHighDate=2026-02-18 featDropP=0.236
+BUY SCRUSDT p=0.658 hits30d=11 runupToHigh=1.88% maxHighDate=2026-02-03 featDropP=0.626
+
+file=2026-02-03 (top 1) threshold=0.5 BTC(2026-02-03)=BULLISH -3.77%
+BUY AWEUSDT p=0.609 hits30d=12 runupToHigh=78.35% maxHighDate=2026-02-18 featDropP=0.440
+
+file=2026-02-04 (top 2) threshold=0.5 BTC(2026-02-04)=BULLISH -3.44%
+BUY BANKUSDT p=0.558 hits30d=2 runupToHigh=23.04% maxHighDate=2026-02-14 featDropP=0.361
+BUY KITEUSDT p=0.549 hits30d=3 runupToHigh=92.73% maxHighDate=2026-02-20 featDropP=0.588
+
+file=2026-02-05 (top 1) threshold=0.5 BTC(2026-02-05)=BULLISH -14.02%
+BUY KITEUSDT p=0.547 hits30d=3 runupToHigh=123.61% maxHighDate=2026-02-20 featDropP=0.591
+
+file=2026-02-07 (top 1) threshold=0.5 BTC(2026-02-07)=BULLISH -1.83%
+BUY KITEUSDT p=0.563 hits30d=3 runupToHigh=96.26% maxHighDate=2026-02-20 featDropP=0.564
+
+file=2026-02-08 (top 2) threshold=0.5 BTC(2026-02-08)=BULLISH +1.50%
+BUY KITEUSDT p=0.570 hits30d=4 runupToHigh=76.70% maxHighDate=2026-02-20 featDropP=0.579
+BUY NEWTUSDT p=0.518 hits30d=15 runupToHigh=12.48% maxHighDate=2026-02-17 featDropP=0.692
+
+file=2026-02-09 (top 3) threshold=0.5 BTC(2026-02-09)=BULLISH -0.27%
+BUY KITEUSDT p=0.569 hits30d=5 runupToHigh=53.83% maxHighDate=2026-02-20 featDropP=0.610
+BUY SCRUSDT p=0.539 hits30d=12 runupToHigh=4.17% maxHighDate=2026-02-14 featDropP=0.643
+BUY SHELLUSDT p=0.515 hits30d=24 runupToHigh=22.96% maxHighDate=2026-02-16 featDropP=0.730
+
+file=2026-02-10 (top 3) threshold=0.5 BTC(2026-02-10)=BULLISH -1.85%
+BUY KITEUSDT p=0.564 hits30d=6 runupToHigh=53.67% maxHighDate=2026-02-20 featDropP=0.614
+BUY NEWTUSDT p=0.544 hits30d=16 runupToHigh=14.31% maxHighDate=2026-02-17 featDropP=0.685
+BUY SHELLUSDT p=0.528 hits30d=25 runupToHigh=27.36% maxHighDate=2026-02-16 featDropP=0.706
+
+file=2026-02-11 (top 2) threshold=0.5 BTC(2026-02-11)=BULLISH -2.55%
+BUY KITEUSDT p=0.563 hits30d=7 runupToHigh=77.46% maxHighDate=2026-02-20 featDropP=0.609
+BUY SHELLUSDT p=0.507 hits30d=25 runupToHigh=25.72% maxHighDate=2026-02-16 featDropP=0.708
+
+file=2026-02-12 (top 2) threshold=0.5 BTC(2026-02-12)=BULLISH -1.21%
+BUY NEWTUSDT p=0.532 hits30d=16 runupToHigh=9.46% maxHighDate=2026-02-17 featDropP=0.699
+BUY SHELLUSDT p=0.521 hits30d=25 runupToHigh=24.92% maxHighDate=2026-02-16 featDropP=0.694
+
+file=2026-02-13 (top 4) threshold=0.5 BTC(2026-02-13)=BULLISH +3.90%
+BUY KITEUSDT p=0.569 hits30d=8 runupToHigh=22.83% maxHighDate=2026-02-20 featDropP=0.617
+BUY NEWTUSDT p=0.542 hits30d=17 runupToHigh=5.44% maxHighDate=2026-02-17 featDropP=0.703
+BUY SENTUSDT p=0.540 hits30d=4 runupToHigh=10.26% maxHighDate=2026-02-23 featDropP=0.488
+BUY SHELLUSDT p=0.511 hits30d=26 runupToHigh=24.92% maxHighDate=2026-02-16 featDropP=0.700
+
+file=2026-02-14 (top 1) threshold=0.5 BTC(2026-02-14)=BULLISH +1.41%
+BUY KITEUSDT p=0.565 hits30d=9 runupToHigh=48.76% maxHighDate=2026-02-20 featDropP=0.621
+
+file=2026-02-15 (top 2) threshold=0.5 BTC(2026-02-15)=BULLISH -1.42%
+BUY NEWTUSDT p=0.505 hits30d=19 runupToHigh=8.39% maxHighDate=2026-02-17 featDropP=0.704
+BUY KITEUSDT p=0.503 hits30d=10 runupToHigh=38.76% maxHighDate=2026-02-20 featDropP=0.634
+
+file=2026-02-16 (top 2) threshold=0.5 BTC(2026-02-16)=BULLISH +0.09%
+BUY SENTUSDT p=0.542 hits30d=5 runupToHigh=18.21% maxHighDate=2026-02-23 featDropP=0.192
+BUY NEWTUSDT p=0.502 hits30d=20 runupToHigh=6.75% maxHighDate=2026-02-17 featDropP=0.703
+
+file=2026-02-17 (top 1) threshold=0.5 BTC(2026-02-17)=BULLISH -2.02%
+BUY NEWTUSDT p=0.545 hits30d=21 runupToHigh=1.09% maxHighDate=2026-02-18 featDropP=0.691
+
+file=2026-02-19 (top 2) threshold=0.5 BTC(2026-02-19)=BULLISH +0.82%
+BUY USUALUSDT p=0.621 hits30d=7 runupToHigh=3.04% maxHighDate=2026-02-20 featDropP=0.633
+BUY ERAUSDT p=0.526 hits30d=19 runupToHigh=2.50% maxHighDate=2026-02-20 featDropP=0.708
+
+file=2026-02-20 (top 1) threshold=0.5 BTC(2026-02-20)=BULLISH +1.52%
+BUY KITEUSDT p=0.507 hits30d=14 runupToHigh=4.27% maxHighDate=2026-02-21 featDropP=0.653
+
+file=2026-02-22 (top 4) threshold=0.5 BTC(2026-02-22)=BULLISH -0.49%
+BUY XPLUSDT p=0.646 hits30d=19 runupToHigh=0.45% maxHighDate=2026-02-23 featDropP=0.608
+BUY SENTUSDT p=0.563 hits30d=6 runupToHigh=21.90% maxHighDate=2026-02-23 featDropP=0.411
+BUY SAGAUSDT p=0.530 hits30d=11 runupToHigh=0.00% maxHighDate=2026-02-23 featDropP=0.521
+BUY VIRTUALUSDT p=0.502 hits30d=24 runupToHigh=1.76% maxHighDate=2026-02-23 featDropP=0.705
+
+file=2026-02-23 (top 1) threshold=0.5 BTC(2026-02-23)=BULLISH -4.42%
+BUY NOTUSDT p=0.508 hits30d=21 runupToHigh=0.55% maxHighDate=2026-02-24 featDropP=0.681
