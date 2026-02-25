@@ -1493,7 +1493,17 @@ def main() -> int:
         for i, r in enumerate(passed, start=1):
             print(f"  #{i:02d} BUY {r.symbol:10s}  p={r.p:.3f}  hits30d={r.hits30d:2d}  featDropP={r.drop_p:.3f}")
 
-        gated_picks_by_file_date[fd] = passed[0]  # #01 per day
+        # ---------------------------------------------------------------------
+        # HARD-CODED DAILY RULE (your request):
+        # If the day has 2+ passed picks and sum(featDropP) > 1.0 -> NO BUY today.
+        # ---------------------------------------------------------------------
+        if len(passed) >= 2:
+            day_drop_sum = sum(r.drop_p for r in passed)
+            if day_drop_sum > 1.0:
+                print(f"  (SKIP DAY) sum(featDropP)={day_drop_sum:.3f} > 1.000  -> no buy today")
+                continue
+
+        gated_picks_by_file_date[fd] = passed[0]  # #01 per day (only if day passes rule)
 
     trades, compounded_factor, open_pos = replay_single_position_from_gated_picks(
         gated_picks_by_file_date=gated_picks_by_file_date,
