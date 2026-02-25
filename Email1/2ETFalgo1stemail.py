@@ -301,8 +301,9 @@ def get_candles_cached(
     today_utc = datetime.utcnow().date()
     refresh_days: List[date] = []
     if end_day >= today_utc:
-        refresh_days.append(today_utc)
-        refresh_days.append(today_utc - timedelta(days=1))  # optional safety
+        # refresh last 4 days (today..today-3) to avoid stale "still forming" cache issues
+        for k in range(0, 4):
+            refresh_days.append(today_utc - timedelta(days=k))
 
     for d in refresh_days:
         have.pop(d.isoformat(), None)  # delete so it becomes "missing" and is refetched
@@ -775,7 +776,15 @@ def replay_single_position_from_gated_picks(
                     holding_entry_day = None
                     holding_file_date = None
 
+                # >>> ADD THIS DEBUG BLOCK HERE <<<
+        if holding_symbol is not None:
+                    for fd, sig in gated_picks_by_file_date.items():
+                        if fd + timedelta(days=entry_lag_days) == d:
+                            print(
+                                f"BLOCKED: wanted {sig.symbol} on {d} but holding {holding_symbol} from {holding_entry_day}")
+
         # 2) If FLAT, see if a pick becomes active today (entry_day == d)
+        print(f"{holding_symbol} entry:{holding_entry_day}")
         if holding_symbol is None:
             candidates: List[SignalRow] = []
             for fd, sig in gated_picks_by_file_date.items():
@@ -793,12 +802,49 @@ def replay_single_position_from_gated_picks(
                     holding_entry_open = c_entry.o
                     holding_entry_day = d
                     holding_file_date = chosen.file_date
+                    # --- NEW: immediately evaluate exit on ENTRY DAY (same-day TP/SL) ---
+                    hit0 = evaluate_exit_reason_and_price(
+                        symbol=holding_symbol,
+                        entry_open=holding_entry_open,
+                        day=d,
+                        day_candle=c_entry,
+                        tp_pct=tp_pct,
+                        sl_pct=sl_pct,
+                        session=session,
+                        cache=cache,
+                        cache_path=cache_path,
+                        intraday_interval=intraday_interval,
+                        ambiguous_fallback=ambiguous_fallback,
+                        resolve_ambiguous_intraday=resolve_ambiguous_intraday,
+                    )
+
+                    if hit0 is not None:
+                        reason0, exit_px0 = hit0
+                        g0 = _gain_pct(holding_entry_open, float(exit_px0))
+                        compounded *= (1.0 + g0 / 100.0)
+                        trades.append(
+                            ReplayTrade(
+                                symbol=holding_symbol,
+                                file_date=holding_file_date,
+                                entry_day=holding_entry_day,
+                                entry_open=holding_entry_open,
+                                exit_day=d,
+                                exit_price=float(exit_px0),
+                                exit_reason=reason0,  # will be "TP" or "SL" etc
+                                gain_pct=g0,
+                            )
+                        )
+                        # go FLAT immediately (so next days are not blocked)
+                        holding_symbol = None
+                        holding_entry_open = 0.0
+                        holding_entry_day = None
+                        holding_file_date = None
 
         d += timedelta(days=1)
 
     # Build open position summary (if still holding at end_day)
     # Build open position summary (if still holding at end_day)
-        # Build open position summary (and optionally auto-close if TP/SL was touched)
+    # Build open position summary (and optionally auto-close if TP/SL was touched)
     open_pos: Optional[dict] = None
     if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
         tp_price = holding_entry_open * (1.0 + tp_pct)
@@ -859,7 +905,7 @@ def replay_single_position_from_gated_picks(
                     file_date=holding_file_date,
                     entry_day=holding_entry_day,
                     entry_open=holding_entry_open,
-                    exit_day=end_day,
+                    exit_day=min(d for d,c in candles_by_symbol[holding_symbol].items() if d >= holding_entry_day and c.h >= tp_price),
                     exit_price=float(tp_price),
                     exit_reason="TP_TOUCHED_SINCE_ENTRY",
                     gain_pct=g,
@@ -1143,7 +1189,7 @@ def _find_exit_orders(open_orders: list) -> Tuple[Optional[dict], Optional[dict]
     Heuristic:
       - TP typically shows as LIMIT
       - SL leg shows as STOP_LOSS_LIMIT (but OCO legs may appear differently across accounts)
-    This is “good enough” to avoid stacking extra exits.
+    This is â€œgood enoughâ€ to avoid stacking extra exits.
     """
     tp = None
     sl = None
@@ -1211,14 +1257,14 @@ def live_manage_or_buy_with_oco(
     tp_order, sl_order = _find_exit_orders(open_orders)
 
     if tp_order or sl_order:
-        print("Existing exit orders detected — not placing another OCO.")
+        print("Existing exit orders detected â€” not placing another OCO.")
         if tp_order:
             print(f"  TP: type={tp_order.get('type')} price={tp_order.get('price')} orderId={tp_order.get('orderId')}")
         if sl_order:
             print(f"  SL: type={sl_order.get('type')} stopPrice={sl_order.get('stopPrice')} orderId={sl_order.get('orderId')}")
         return True
 
-    holding_threshold = step_size  # “>= 1 step” means we consider it a holding
+    holding_threshold = step_size  # â€œ>= 1 stepâ€ means we consider it a holding
 
     # ---- If holding: just place exits for FREE qty ----
     if total_base >= holding_threshold:
@@ -1481,7 +1527,7 @@ def main() -> int:
     print("=" * 90)
 
     if not future_file_dates:
-        print("\n(no future blocks after calibration end — nothing to recommend)")
+        print("\n(no future blocks after calibration end â€” nothing to recommend)")
         return 0
 
     print("\n" + "=" * 90)
