@@ -2,16 +2,222 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlencode
 
 import requests
+
+
+# =============================================================================
+# CoinGecko Market Cap Gate (FINAL GATE)
+#   - Input: Binance-style symbol like KITEUSDT
+#   - Resolve to CoinGecko coin_id via /search (prefers market_cap_rank)
+#   - Fetch market cap via /simple/price?include_market_cap=true
+#   - Pass only if market cap >= MARKETCAP_MIN_USD
+# =============================================================================
+
+MARKETCAP_MIN_USD = 100_000_000.0  # 100M
+
+# =============================================================================
+# Market cap cache policy
+#   - Persist ONLY if mc >= 100M OR mc <= 50M
+#   - Always check persisted cache BEFORE any online lookup
+# =============================================================================
+
+MARKETCAP_PERSIST_HIGH_USD = 100_000_000.0
+MARKETCAP_PERSIST_LOW_USD  = 50_000_000.0
+MARKETCAP_CACHE_EXTREMES_KEY = "_marketcap_extremes"   # stored inside binance_cache.json
+
+def _is_extreme_marketcap(mc: float) -> bool:
+    mc = float(mc)
+    return (mc >= float(MARKETCAP_PERSIST_HIGH_USD)) or (mc <= float(MARKETCAP_PERSIST_LOW_USD))
+
+def _load_extreme_mc_map_once(mc_cache: dict, cache_path: Path) -> Dict[str, dict]:
+    """
+    Loads persisted extreme market caps into memory ONCE per run.
+    Stored under cache[MARKETCAP_CACHE_EXTREMES_KEY][SYMBOL] = {mc,id,provider,ts_utc}
+    """
+    key = ("persisted_mc_extremes", "map")
+    if key in mc_cache and isinstance(mc_cache[key], dict):
+        return mc_cache[key]
+
+    m: Dict[str, dict] = {}
+    try:
+        blob = load_cache(cache_path)
+        raw = blob.get(MARKETCAP_CACHE_EXTREMES_KEY, {})
+        if isinstance(raw, dict):
+            for sym, rec in raw.items():
+                if not isinstance(rec, dict):
+                    continue
+                mc = rec.get("mc")
+                pid = rec.get("id", "")
+                prov = rec.get("provider", "")
+                if mc is None:
+                    continue
+                # persisted map should already contain only extremes,
+                # but we still sanity check:
+                try:
+                    mc_f = float(mc)
+                except Exception:
+                    continue
+                if _is_extreme_marketcap(mc_f):
+                    m[str(sym).upper()] = {
+                        "mc": mc_f,
+                        "id": str(pid),
+                        "provider": str(prov),
+                        "ts_utc": str(rec.get("ts_utc", "")),
+                    }
+    except Exception:
+        pass
+
+    mc_cache[key] = m
+    return m
+
+def _persist_extreme_marketcap(
+    *,
+    cache_path: Path,
+    symbol_usdt: str,
+    mc: float,
+    provider: str,
+    pid: str,
+) -> None:
+    """
+    Writes to disk ONLY for extreme market caps.
+    """
+    mc = float(mc)
+    if not _is_extreme_marketcap(mc):
+        return
+
+    try:
+        blob = load_cache(cache_path)
+        blob.setdefault(MARKETCAP_CACHE_EXTREMES_KEY, {})
+        blob[MARKETCAP_CACHE_EXTREMES_KEY][symbol_usdt.upper()] = {
+            "mc": mc,
+            "provider": str(provider),
+            "id": str(pid),
+            "ts_utc": datetime.utcnow().isoformat(),
+        }
+        save_cache(cache_path, blob)
+    except Exception:
+        # never fail the strategy due to caching
+        pass
+
+def _base_from_usdt_symbol(symbol: str) -> str:
+    s = symbol.strip().upper()
+    if not s.endswith("USDT"):
+        raise ValueError(f"Expected *USDT symbol (e.g. KITEUSDT), got: {symbol}")
+    base = s[:-4]
+    if not base:
+        raise ValueError(f"Bad symbol: {symbol}")
+    return base
+
+def resolve_coingecko_id_from_usdt_symbol(symbol_usdt: str, session: requests.Session, *, debug: bool = False) -> str:
+    """
+    Resolve CoinGecko coin id for a Binance symbol like KITEUSDT.
+
+    Uses /search and picks best candidate by:
+      1) ranked coins first (market_cap_rank not None)
+      2) lowest market_cap_rank number
+    """
+    base = _base_from_usdt_symbol(symbol_usdt)
+    query = base.lower()
+
+    r = session.get(
+        "https://api.coingecko.com/api/v3/search",
+        params={"query": query},
+        timeout=15
+    )
+    r.raise_for_status()
+    coins = r.json().get("coins", [])
+    if not coins:
+        raise ValueError(f"No CoinGecko search results for: {base}")
+
+    def rank_key(c):
+        rank = c.get("market_cap_rank")
+        return (rank is None, rank if rank is not None else 10**9)
+
+    coins.sort(key=rank_key)
+    best = coins[0]
+
+    if debug:
+        print(f"[mc] {symbol_usdt} base='{base}' candidates(top5):")
+        for c in coins[:5]:
+            if coingecko_trades_on_binance(c["id"], session):
+                print(f"     id={c.get('id')!r} sym={c.get('symbol')!r} name={c.get('name')!r} rank={c.get('market_cap_rank')}")
+
+    return str(best["id"])
+
+def fetch_market_cap_usd_by_coingecko_id(coin_id: str, session: requests.Session) -> float:
+    r = session.get(
+        "https://api.coingecko.com/api/v3/simple/price",
+        params={
+            "ids": coin_id,
+            "vs_currencies": "usd",
+            "include_market_cap": "true",
+        },
+        timeout=15
+    )
+    r.raise_for_status()
+    data = r.json()
+    if coin_id not in data:
+        raise RuntimeError(f"CoinGecko missing id in response: {coin_id}")
+    mc = data[coin_id].get("usd_market_cap")
+    if mc is None:
+        raise RuntimeError(f"CoinGecko missing usd_market_cap for id: {coin_id}")
+    return float(mc)
+
+def get_market_cap_usd_for_usdt_symbol(
+    symbol_usdt: str,
+    *,
+    session: requests.Session,
+    mc_cache: dict,
+    cache_path: Optional[Path] = None,
+    debug: bool = False,
+) -> Tuple[str, float]:
+    """
+    Returns (coin_id, market_cap_usd).
+    Caches by symbol to avoid repeated calls.
+    """
+    symbol_usdt = symbol_usdt.upper()
+
+    # in-memory cache first
+    if symbol_usdt in mc_cache:
+        rec = mc_cache[symbol_usdt]
+        return str(rec["coin_id"]), float(rec["market_cap_usd"])
+
+    coin_id = resolve_coingecko_id_from_usdt_symbol(symbol_usdt, session=session, debug=debug)
+    mc = fetch_market_cap_usd_by_coingecko_id(coin_id, session=session)
+
+    mc_cache[symbol_usdt] = {"coin_id": coin_id, "market_cap_usd": float(mc)}
+
+    # optionally persist into your existing json cache file
+    if cache_path is not None:
+        try:
+            cache = load_cache(cache_path)
+            cache.setdefault("_coingecko_marketcap", {})
+            cache["_coingecko_marketcap"][symbol_usdt] = {"coin_id": coin_id, "market_cap_usd": float(mc), "ts_utc": datetime.utcnow().isoformat()}
+            save_cache(cache_path, cache)
+        except Exception:
+            pass
+
+    return coin_id, float(mc)
+
+def _human(n: float) -> str:
+    for unit in ["", "K", "M", "B", "T"]:
+        if abs(n) < 1000:
+            return f"{n:,.2f}{unit}"
+        n /= 1000
+    return f"{n:.2f}P"
 
 
 # =============================================================================
@@ -37,28 +243,16 @@ class SignalRow:
     drop_p: float
     raw_line: str
 
-def fetch_live_price(symbol: str, session: requests.Session) -> float:
-    j = _session_get_json(session, BINANCE_BASE + "/api/v3/ticker/price", params={"symbol": symbol}, timeout=10)
-    return float(j["price"])
-
 
 def _parse_date(s: str) -> date:
     s = s.strip()
     if re.match(r"^\d{2}-\d{2}-\d{2}$", s):
-        # interpret as YY-MM-DD -> 20YY-MM-DD
         yy, mm, dd = s.split("-")
         s = f"20{yy}-{mm}-{dd}"
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
 def parse_signals_text(text: str) -> Tuple[Optional[date], Optional[date], List[SignalRow], Dict[date, List[str]]]:
-    """
-    Returns:
-      trained_through (from header if present, else None)
-      predict_from    (from header if present, else None)
-      signals         (one row per BUY line)
-      raw_blocks      (file_date -> list of original lines in that block)
-    """
     trained_through: Optional[date] = None
     predict_from: Optional[date] = None
     cur_file_date: Optional[date] = None
@@ -88,7 +282,6 @@ def parse_signals_text(text: str) -> Tuple[Optional[date], Optional[date], List[
             mbuy = BUY_LINE_RE.match(line)
             if mbuy:
                 sym = mbuy.group(1).upper()
-
                 mp = P_RE.search(line)
                 mh = HITS_RE.search(line)
                 md = DROP_RE.search(line)
@@ -110,11 +303,9 @@ def parse_signals_text(text: str) -> Tuple[Optional[date], Optional[date], List[
     return trained_through, predict_from, out, raw_blocks
 
 
-
 def load_signals_file(path: Path) -> Tuple[Optional[date], Optional[date], List[SignalRow], Dict[date, List[str]]]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     return parse_signals_text(text)
-
 
 
 # =============================================================================
@@ -165,6 +356,11 @@ def _session_get_json(session: requests.Session, url: str, params: dict, timeout
             last_err = e
             _sleep_backoff(attempt)
     raise RuntimeError(f"HTTP failed after retries: {last_err}")
+
+
+def fetch_live_price(symbol: str, session: requests.Session) -> float:
+    j = _session_get_json(session, BINANCE_BASE + "/api/v3/ticker/price", params={"symbol": symbol}, timeout=10)
+    return float(j["price"])
 
 
 def fetch_1d_klines(symbol: str, start_day: date, end_day: date, session: requests.Session) -> List[Candle]:
@@ -288,25 +484,11 @@ def get_candles_cached(
     cache: dict,
     cache_path: Path,
 ) -> Dict[date, Candle]:
-    """
-    Cached 1d candles with a critical fix:
-      - Force refresh for the most recent 1-2 UTC days because Binance 1d candle is "still forming"
-        and the day's HIGH/LOW/CLOSE can change during the day.
-    """
     sym = symbol.upper()
     cache.setdefault(sym, {}).setdefault("candles_1d", {})
     have = cache[sym]["candles_1d"]
 
-    # ---- NEW: refresh the most recent days (UTC) so H/L are correct intraday ----
     today_utc = datetime.utcnow().date()
-    refresh_days: List[date] = []
-    if end_day >= today_utc:
-        # refresh last 4 days (today..today-3) to avoid stale "still forming" cache issues
-        for k in range(0, 4):
-            refresh_days.append(today_utc - timedelta(days=k))
-
-    for d in refresh_days:
-        have.pop(d.isoformat(), None)  # delete so it becomes "missing" and is refetched
 
     need_days = [start_day + timedelta(days=i) for i in range((end_day - start_day).days + 1)]
     missing = [d for d in need_days if d.isoformat() not in have]
@@ -314,21 +496,31 @@ def get_candles_cached(
     if missing:
         d0, d1 = min(missing), max(missing)
         fetched = fetch_1d_klines(sym, d0, d1, session=session)
+
+        changed = False
         for c in fetched:
+            # ✅ Don't persist today's still-forming candle
+            if c.day >= today_utc:
+                continue
             have[c.day.isoformat()] = {"o": c.o, "h": c.h, "l": c.l, "c": c.c}
-        save_cache(cache_path, cache)
+            changed = True
+
+        if changed:
+            save_cache(cache_path, cache)
 
     out: Dict[date, Candle] = {}
     for d in need_days:
+        if d >= today_utc:
+            # ✅ For today: always pull fresh from Binance instead of cache
+            fresh = fetch_1d_klines(sym, d, d, session=session)
+            if fresh:
+                out[d] = fresh[0]
+            continue
+
         rec = have.get(d.isoformat())
         if rec:
-            out[d] = Candle(
-                day=d,
-                o=float(rec["o"]),
-                h=float(rec["h"]),
-                l=float(rec["l"]),
-                c=float(rec["c"]),
-            )
+            out[d] = Candle(day=d, o=float(rec["o"]), h=float(rec["h"]), l=float(rec["l"]), c=float(rec["c"]))
+
     return out
 
 def get_intraday_cached_for_day(
@@ -381,10 +573,6 @@ def evaluate_tp_sl_first(
     ambiguous_fallback: str,   # "none"|"tp-first"|"sl-first"
     resolve_ambiguous_intraday: bool,
 ) -> Optional[str]:
-    """
-    For a given day candle AFTER entry, determine if TP or SL hit first on that day.
-    Returns "TP" or "SL" (or None if neither hit).
-    """
     tp_price = entry_open * (1.0 + tp_pct)
     sl_price = entry_open * (1.0 - sl_pct)
 
@@ -398,7 +586,6 @@ def evaluate_tp_sl_first(
     if not hit_tp_1d and not hit_sl_1d:
         return None
 
-    # BOTH hit same day
     intra: List[IntraCandle] = []
     if resolve_ambiguous_intraday:
         intra = get_intraday_cached_for_day(
@@ -423,7 +610,6 @@ def evaluate_tp_sl_first(
         if hit_sl and not hit_tp:
             return "SL"
         if hit_tp and hit_sl:
-            # can't resolve inside this intraday candle
             if ambiguous_fallback == "tp-first":
                 return "TP"
             if ambiguous_fallback == "sl-first":
@@ -449,10 +635,6 @@ def simulate_trade_outcome(
     ambiguous_fallback: str,
     resolve_ambiguous_intraday: bool,
 ) -> str:
-    """
-    Walk forward from entry_day inclusive until TP or SL hit first; else OTHER.
-    Returns: "TP", "SL", or "OTHER"
-    """
     last_day = entry_day + timedelta(days=max_hold_days)
     d = entry_day
     while d <= last_day:
@@ -503,8 +685,10 @@ class CalibRow:
     outcome: str  # "TP" | "SL" | "OTHER"
 
 
-def score_gate_ev(rows: List[CalibRow], gate: Gate, tp_pct: float, sl_pct: float) -> dict:
-    taken = tp = sl = other = 0
+def score_gate(rows: List[CalibRow], gate: Gate) -> Tuple[float, int, int, int]:
+    taken = 0
+    tp = 0
+    sl = 0
     for r in rows:
         if passes_gate(r.sig, gate):
             taken += 1
@@ -512,98 +696,74 @@ def score_gate_ev(rows: List[CalibRow], gate: Gate, tp_pct: float, sl_pct: float
                 tp += 1
             elif r.outcome == "SL":
                 sl += 1
-            else:
-                other += 1
 
-    decided = tp + sl
-    precision = (tp / decided) if decided else 0.0
-
-    # Expected value per trade (on decided only), and total EV
-    ev_total = tp * tp_pct - sl * sl_pct
-    ev_per_decided = (ev_total / decided) if decided else -999.0
-
-    return {
-        "taken": taken, "tp": tp, "sl": sl, "other": other,
-        "decided": decided,
-        "precision": precision,
-        "ev_total": ev_total,
-        "ev_per_decided": ev_per_decided,
-    }
+    denom = tp + sl
+    prec = (tp / denom) if denom > 0 else 0.0
+    return prec, taken, tp, sl
 
 
-def pick_best_gate(rows: List[CalibRow], tp_pct: float, sl_pct: float) -> Tuple[Gate, Dict[str, float]]:
-    # Expand grid downward so it can actually choose "lower drop" when it helps
+def pick_best_gate(rows: List[CalibRow]) -> Tuple[Gate, Dict[str, float]]:
     p_grid = [0.50, 0.52, 0.54, 0.55, 0.56, 0.58, 0.60, 0.62, 0.65, 0.70, 0.75]
-    drop_grid = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65]
+    drop_grid = [0.40, 0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65, 0.70]
     hits_grid = [1, 2, 3, 4, 5, 8, 10, 12, 15]
 
-    decided = [r for r in rows if r.outcome in ("TP", "SL")]
-    if len(decided) < 8:
-        # With tiny calibration, avoid "false certainty":
-        # fall back to a conservative gate that doesn't overfit too hard.
-        fallback = Gate(0.55, 0.60, 3)
-        m = score_gate_ev(rows, fallback, tp_pct, sl_pct)
-        return fallback, m
+    best_gate = Gate(0.60, 0.60, 3)
+    best = (-1.0, -1, -1, 10**9)  # (precision, tp, taken, sl)
 
-    best_gate = Gate(0.55, 0.60, 3)
-    best = None
+    decided = [r for r in rows if r.outcome in ("TP", "SL")]
+    if len(decided) == 0:
+        return best_gate, {"precision": 0.0, "taken": 0, "tp": 0, "sl": 0}
 
     for pmin in p_grid:
         for dmax in drop_grid:
             for hmin in hits_grid:
                 gate = Gate(pmin, dmax, hmin)
-                m = score_gate_ev(rows, gate, tp_pct, sl_pct)
+                prec, taken, tp, sl = score_gate(rows, gate)
 
-                # constraints: need enough "evidence"
-                if m["decided"] < 6:
+                if (tp + sl) < 2:
+                    continue
+                if tp < 1:
                     continue
 
-                # Primary: maximize total EV
-                # Tie-breakers: fewer SL, more decided, then LOWER drop_max (your preference), then more taken
-                key = (
-                    m["ev_total"],
-                    -m["sl"],
-                    m["decided"],
-                    -dmax,
-                    m["taken"],
-                    -pmin,
-                    -hmin,
-                )
+                cand = (prec, tp, taken, sl)
+                if cand[0] > best[0]:
+                    best = cand
+                    best_gate = gate
+                elif cand[0] == best[0]:
+                    if cand[1] > best[1]:
+                        best = cand
+                        best_gate = gate
+                    elif cand[1] == best[1]:
+                        if cand[3] < best[3]:
+                            best = cand
+                            best_gate = gate
+                        elif cand[3] == best[3]:
+                            if cand[2] > best[2]:
+                                best = cand
+                                best_gate = gate
 
-                if best is None or key > best[0]:
-                    best = (key, gate, m)
+    prec, taken, tp, sl = score_gate(rows, best_gate)
+    return best_gate, {"precision": prec, "taken": taken, "tp": tp, "sl": sl}
 
-    if best is None:
-        # if nothing satisfied constraints, loosen
-        fallback = Gate(0.52, 0.65, 1)
-        m = score_gate_ev(rows, fallback, tp_pct, sl_pct)
-        return fallback, m
 
-    _, g, m = best
-    return g, m
 # =============================================================================
-# Replay (single-position) + compounding (ETF Algo style)
+# Replay (single-position) + compounding
 # =============================================================================
 
 @dataclass
 class ReplayTrade:
     symbol: str
-    file_date: date          # signal day (file=...)
+    file_date: date
     entry_day: date
     entry_open: float
     exit_day: date
     exit_price: float
-    exit_reason: str         # TP/SL/TP_AMBIG/SL_AMBIG/MAX_HOLD
+    exit_reason: str
     gain_pct: float
 
 
 def _gain_pct(entry: float, exit_px: float) -> float:
     return (exit_px / max(entry, 1e-12) - 1.0) * 100.0
-
-
-def _fmt_d(d: date) -> str:
-    # Windows-friendly day/month formatting
-    return d.strftime("%Y-%m-%d")
 
 
 def evaluate_exit_reason_and_price(
@@ -621,10 +781,6 @@ def evaluate_exit_reason_and_price(
     ambiguous_fallback: str,
     resolve_ambiguous_intraday: bool,
 ) -> Optional[Tuple[str, float]]:
-    """
-    Returns (reason, exit_price) or None.
-    Uses SAME logic as your ETF Algo: TP if hit, SL if hit, if both then intraday resolution else fallback.
-    """
     tp_price = entry_open * (1.0 + tp_pct)
     sl_price = entry_open * (1.0 - sl_pct)
 
@@ -638,7 +794,6 @@ def evaluate_exit_reason_and_price(
     if not hit_tp_1d and not hit_sl_1d:
         return None
 
-    # BOTH hit same day
     intra: List[IntraCandle] = []
     if resolve_ambiguous_intraday:
         intra = get_intraday_cached_for_day(
@@ -652,9 +807,8 @@ def evaluate_exit_reason_and_price(
             return ("TP_AMBIG", tp_price)
         if ambiguous_fallback == "sl-first":
             return ("SL_AMBIG", sl_price)
-        return None  # "none" -> unknown
+        return None
 
-    # scan intraday candles in time order
     for c in intra:
         hit_tp = c.h >= tp_price
         hit_sl = c.l <= sl_price
@@ -664,7 +818,6 @@ def evaluate_exit_reason_and_price(
         if hit_sl and not hit_tp:
             return ("SL", sl_price)
         if hit_tp and hit_sl:
-            # still ambiguous within this intraday candle
             if ambiguous_fallback == "tp-first":
                 return ("TP_AMBIG", tp_price)
             if ambiguous_fallback == "sl-first":
@@ -676,7 +829,7 @@ def evaluate_exit_reason_and_price(
 
 def replay_single_position_from_gated_picks(
     *,
-    gated_picks_by_file_date: Dict[date, SignalRow],  # one pick per file day (#01 per day)
+    gated_picks_by_file_date: Dict[date, SignalRow],
     entry_lag_days: int,
     tp_pct: float,
     sl_pct: float,
@@ -685,7 +838,7 @@ def replay_single_position_from_gated_picks(
     intraday_interval: str,
     ambiguous_fallback: str,
     resolve_ambiguous_intraday: bool,
-    end_day: Optional[date] = None,  # default today UTC
+    end_day: Optional[date] = None,
 ) -> Tuple[List["ReplayTrade"], float, Optional[dict]]:
     if not gated_picks_by_file_date:
         return [], 1.0, None
@@ -699,10 +852,8 @@ def replay_single_position_from_gated_picks(
     if end_day is None:
         end_day = datetime.utcnow().date()
 
-    # All symbols that could be traded (from the gated picks)
     symbols = sorted({s.symbol for s in gated_picks_by_file_date.values()})
 
-    # Fetch candles for each symbol from the first possible entry day through end_day
     candles_by_symbol: Dict[str, Dict[date, Candle]] = {}
     for sym in symbols:
         candles_by_symbol[sym] = get_candles_cached(
@@ -724,7 +875,6 @@ def replay_single_position_from_gated_picks(
 
     d = start_entry_day
     while d <= end_day:
-        # 1) If holding, check exit (TP/SL first; else MAX_HOLD at close)
         if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
             c = candles_by_symbol.get(holding_symbol, {}).get(d)
             if c is not None and d >= holding_entry_day:
@@ -770,21 +920,11 @@ def replay_single_position_from_gated_picks(
                         )
                     )
 
-                    # go FLAT
                     holding_symbol = None
                     holding_entry_open = 0.0
                     holding_entry_day = None
                     holding_file_date = None
 
-                # >>> ADD THIS DEBUG BLOCK HERE <<<
-        if holding_symbol is not None:
-                    for fd, sig in gated_picks_by_file_date.items():
-                        if fd + timedelta(days=entry_lag_days) == d:
-                            print(
-                                f"BLOCKED: wanted {sig.symbol} on {d} but holding {holding_symbol} from {holding_entry_day}")
-
-        # 2) If FLAT, see if a pick becomes active today (entry_day == d)
-        print(f"{holding_symbol} entry:{holding_entry_day}")
         if holding_symbol is None:
             candidates: List[SignalRow] = []
             for fd, sig in gated_picks_by_file_date.items():
@@ -792,7 +932,6 @@ def replay_single_position_from_gated_picks(
                     candidates.append(sig)
 
             if candidates:
-                # If multiple map to same entry day, take highest p (tie-break lower drop, higher hits)
                 candidates.sort(key=lambda s: (-s.p, s.drop_p, -s.hits30d, s.symbol))
                 chosen = candidates[0]
 
@@ -802,7 +941,7 @@ def replay_single_position_from_gated_picks(
                     holding_entry_open = c_entry.o
                     holding_entry_day = d
                     holding_file_date = chosen.file_date
-                    # --- NEW: immediately evaluate exit on ENTRY DAY (same-day TP/SL) ---
+
                     hit0 = evaluate_exit_reason_and_price(
                         symbol=holding_symbol,
                         entry_open=holding_entry_open,
@@ -822,6 +961,7 @@ def replay_single_position_from_gated_picks(
                         reason0, exit_px0 = hit0
                         g0 = _gain_pct(holding_entry_open, float(exit_px0))
                         compounded *= (1.0 + g0 / 100.0)
+
                         trades.append(
                             ReplayTrade(
                                 symbol=holding_symbol,
@@ -830,11 +970,11 @@ def replay_single_position_from_gated_picks(
                                 entry_open=holding_entry_open,
                                 exit_day=d,
                                 exit_price=float(exit_px0),
-                                exit_reason=reason0,  # will be "TP" or "SL" etc
+                                exit_reason=reason0,
                                 gain_pct=g0,
                             )
                         )
-                        # go FLAT immediately (so next days are not blocked)
+
                         holding_symbol = None
                         holding_entry_open = 0.0
                         holding_entry_day = None
@@ -842,131 +982,78 @@ def replay_single_position_from_gated_picks(
 
         d += timedelta(days=1)
 
-    # Build open position summary (if still holding at end_day)
-    # Build open position summary (if still holding at end_day)
-    # Build open position summary (and optionally auto-close if TP/SL was touched)
     open_pos: Optional[dict] = None
     if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
-        tp_price = holding_entry_open * (1.0 + tp_pct)
-        sl_price = holding_entry_open * (1.0 - sl_pct)
+        c_last = candles_by_symbol.get(holding_symbol, {}).get(end_day)
+        last_close = c_last.c if c_last else holding_entry_open
 
-        candles_map = candles_by_symbol.get(holding_symbol, {})
-
-        # mark-to-market (latest daily close)
-        c_last = candles_map.get(end_day)
-        last_mark = c_last.c if c_last else holding_entry_open
-
-        # scan daily highs/lows since entry
-        max_high = holding_entry_open
-        min_low = holding_entry_open
-
-        d2 = holding_entry_day
-        while d2 <= end_day:
-            c = candles_map.get(d2)
-            if c is not None:
-                if c.h > max_high:
-                    max_high = c.h
-                if c.l < min_low:
-                    min_low = c.l
-            d2 += timedelta(days=1)
-
-        # if today UTC, refine with intraday extremes for today
         if end_day == datetime.utcnow().date():
             try:
-                intra = get_intraday_cached_for_day(
-                    holding_symbol,
-                    end_day,
-                    interval=intraday_interval,
-                    session=session,
-                    cache=cache,
-                    cache_path=cache_path,
-                )
-                if intra:
-                    day_high = max(x.h for x in intra)
-                    day_low = min(x.l for x in intra)
+                live_px = fetch_live_price(holding_symbol, session=session)
+                last_close = live_px
+                tp_price = holding_entry_open * (1.0 + tp_pct)
+                sl_price = holding_entry_open * (1.0 - sl_pct)
 
-                    if day_high > max_high:
-                        max_high = day_high
-                    if day_low < min_low:
-                        min_low = day_low
+                if live_px >= tp_price:
+                    g = _gain_pct(holding_entry_open, float(tp_price))
+                    compounded *= (1.0 + g / 100.0)
+                    trades.append(
+                        ReplayTrade(
+                            symbol=holding_symbol,
+                            file_date=holding_file_date,
+                            entry_day=holding_entry_day,
+                            entry_open=holding_entry_open,
+                            exit_day=end_day,
+                            exit_price=float(tp_price),
+                            exit_reason="TP_NOW",
+                            gain_pct=g,
+                        )
+                    )
+                    holding_symbol = None
+                    holding_entry_open = 0.0
+                    holding_entry_day = None
+                    holding_file_date = None
 
-                    # better real-time mark
-                    last_mark = intra[-1].c
+                elif live_px <= sl_price:
+                    g = _gain_pct(holding_entry_open, float(sl_price))
+                    compounded *= (1.0 + g / 100.0)
+                    trades.append(
+                        ReplayTrade(
+                            symbol=holding_symbol,
+                            file_date=holding_file_date,
+                            entry_day=holding_entry_day,
+                            entry_open=holding_entry_open,
+                            exit_day=end_day,
+                            exit_price=float(sl_price),
+                            exit_reason="SL_NOW",
+                            gain_pct=g,
+                        )
+                    )
+                    holding_symbol = None
+                    holding_entry_open = 0.0
+                    holding_entry_day = None
+                    holding_file_date = None
             except Exception:
                 pass
 
-        # ---- NEW: auto-close if TP/SL was TOUCHED any time since entry ----
-        if max_high >= tp_price:
-            g = _gain_pct(holding_entry_open, float(tp_price))
-            compounded *= (1.0 + g / 100.0)
-            trades.append(
-                ReplayTrade(
-                    symbol=holding_symbol,
-                    file_date=holding_file_date,
-                    entry_day=holding_entry_day,
-                    entry_open=holding_entry_open,
-                    exit_day=min(d for d,c in candles_by_symbol[holding_symbol].items() if d >= holding_entry_day and c.h >= tp_price),
-                    exit_price=float(tp_price),
-                    exit_reason="TP_TOUCHED_SINCE_ENTRY",
-                    gain_pct=g,
-                )
-            )
-            holding_symbol = None
-            holding_entry_open = 0.0
-            holding_entry_day = None
-            holding_file_date = None
-
-        elif min_low <= sl_price:
-            g = _gain_pct(holding_entry_open, float(sl_price))
-            compounded *= (1.0 + g / 100.0)
-            trades.append(
-                ReplayTrade(
-                    symbol=holding_symbol,
-                    file_date=holding_file_date,
-                    entry_day=holding_entry_day,
-                    entry_open=holding_entry_open,
-                    exit_day=end_day,
-                    exit_price=float(sl_price),
-                    exit_reason="SL_TOUCHED_SINCE_ENTRY",
-                    gain_pct=g,
-                )
-            )
-            holding_symbol = None
-            holding_entry_open = 0.0
-            holding_entry_day = None
-            holding_file_date = None
-
-        # If still holding after touched-check, report open position
         if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
-            current_unreal = (last_mark / max(holding_entry_open, 1e-12) - 1.0) * 100.0
-            max_runup = (max_high / max(holding_entry_open, 1e-12) - 1.0) * 100.0
-
+            unreal = (last_close / max(holding_entry_open, 1e-12) - 1.0) * 100.0
             open_pos = {
                 "symbol": holding_symbol,
                 "file_date": holding_file_date,
                 "entry_day": holding_entry_day,
                 "entry_open": float(holding_entry_open),
                 "last_day": end_day,
-                "last_close": float(last_mark),
-                "unrealized_pct": float(current_unreal),
-                "max_high_since_entry": float(max_high),
-                "max_runup_pct": float(max_runup),
+                "last_close": float(last_close),
+                "unrealized_pct": float(unreal),
             }
 
     return trades, compounded, open_pos
 
+
 # =============================================================================
 # Binance LIVE trading (Spot) + OCO exits
-# Drop these functions/classes into your script (gate_from_signals.py)
 # =============================================================================
-
-import hashlib
-import hmac
-from decimal import Decimal, ROUND_DOWN
-from urllib.parse import urlencode
-
-BINANCE_BASE = "https://api.binance.com"
-
 
 class BinanceHTTPError(RuntimeError):
     pass
@@ -1023,7 +1110,6 @@ class BinanceClient:
         full_url = url + "?" + qs
         r = self.session.get(full_url, timeout=timeout)
 
-        # auto re-sync time on -1021
         if r.status_code == 400:
             try:
                 j = r.json()
@@ -1071,8 +1157,6 @@ class BinanceClient:
         if not r.ok:
             self._raise_binance(r)
         return r.json()
-
-    # -------- endpoints --------
 
     def exchange_info(self, symbol: str) -> dict:
         return self._get("/api/v3/exchangeInfo", {"symbol": symbol}, signed=False)
@@ -1185,12 +1269,6 @@ def _get_total_asset(acct_json: dict, asset: str) -> Decimal:
 
 
 def _find_exit_orders(open_orders: list) -> Tuple[Optional[dict], Optional[dict]]:
-    """
-    Heuristic:
-      - TP typically shows as LIMIT
-      - SL leg shows as STOP_LOSS_LIMIT (but OCO legs may appear differently across accounts)
-    This is â€œgood enoughâ€ to avoid stacking extra exits.
-    """
     tp = None
     sl = None
     for o in open_orders:
@@ -1205,26 +1283,15 @@ def _find_exit_orders(open_orders: list) -> Tuple[Optional[dict], Optional[dict]
 def live_manage_or_buy_with_oco(
     *,
     symbol: str,
-    ref_entry_open: float,   # IMPORTANT: you asked TP/SL derived from ENTRY DATE OPEN
-    tp_pct: float,           # e.g. 0.20
-    sl_pct: float,           # e.g. 0.12
-    live_trade: bool,        # False => dry-run
+    ref_entry_open: float,
+    tp_pct: float,
+    sl_pct: float,
+    live_trade: bool,
 ) -> bool:
-    """
-    If you already HOLD the symbol (spot) and you have NO exit orders open for it:
-      -> place OCO exits based on ref_entry_open (+20% / -12% etc.)
-
-    Else if you do NOT hold it:
-      -> ask to market buy with (almost) all free USDT, then place OCO exits based on ref_entry_open.
-
-    If exit orders already exist:
-      -> do nothing (return True).
-
-    Returns True if we handled an action path (including dry-run) else False.
-    """
     symbol = symbol.upper()
     base_asset = _base_asset_from_symbol(symbol)
 
+    # SAFER: require env vars (do NOT hardcode keys in code)
     api_key = os.getenv("BINANCE_API_KEY", "tE06bWu6VfzgIB1wlyZfZzaZwPe0F6RyVQrp0Fh7B8fvTzNyhxe8UZSrJV3y0Iu0").strip()
     api_secret = os.getenv("BINANCE_API_SECRET",
                            "bFBUdNU7c8HBW3pNt2CnT1m7RlASUw6ReFsWYRqPFWLyj7NIjVFLK7j2BIaFTGLf").strip()
@@ -1242,7 +1309,7 @@ def live_manage_or_buy_with_oco(
 
     tp_dec = _round_step(_dec(tp_price), tick_size)
     sl_stop_dec = _round_step(_dec(sl_price), tick_size)
-    sl_limit_dec = _round_step(sl_stop_dec * Decimal("0.999"), tick_size)  # slightly below stop
+    sl_limit_dec = _round_step(sl_stop_dec * Decimal("0.999"), tick_size)
 
     print("\n" + "=" * 90)
     print(f"BINANCE LIVE MANAGER: {symbol}")
@@ -1257,16 +1324,15 @@ def live_manage_or_buy_with_oco(
     tp_order, sl_order = _find_exit_orders(open_orders)
 
     if tp_order or sl_order:
-        print("Existing exit orders detected â€” not placing another OCO.")
+        print("Existing exit orders detected — not placing another OCO.")
         if tp_order:
             print(f"  TP: type={tp_order.get('type')} price={tp_order.get('price')} orderId={tp_order.get('orderId')}")
         if sl_order:
             print(f"  SL: type={sl_order.get('type')} stopPrice={sl_order.get('stopPrice')} orderId={sl_order.get('orderId')}")
         return True
 
-    holding_threshold = step_size  # â€œ>= 1 stepâ€ means we consider it a holding
+    holding_threshold = step_size
 
-    # ---- If holding: just place exits for FREE qty ----
     if total_base >= holding_threshold:
         free_base = _get_free_asset(acct, base_asset)
         qty = _round_step(free_base, step_size)
@@ -1290,7 +1356,6 @@ def live_manage_or_buy_with_oco(
         print(json.dumps(resp, indent=2))
         return True
 
-    # ---- Not holding: buy then place exits ----
     print(f"Not holding {base_asset}. Free USDT={free_usdt}")
     if free_usdt <= Decimal("0"):
         print("No free USDT to buy.")
@@ -1328,21 +1393,17 @@ def live_manage_or_buy_with_oco(
     print(json.dumps(resp, indent=2))
     return True
 
+
 def run_live_prompt_after_gate(
     *,
     open_pos: Optional[dict],
-    gated_picks_by_file_date: Dict[date, SignalRow],  # unused now, but keep signature
+    gated_picks_by_file_date: Dict[date, SignalRow],
     entry_lag_days: int,
     tp_pct: float,
     sl_pct: float,
     cache_path: Path,
     live_trade: bool,
 ) -> None:
-    """
-    NEW rule:
-      - ONLY manage an OPEN position from replay.
-      - If replay is flat (open_pos is None), do NOTHING (no buys).
-    """
     if open_pos is None:
         print("\nLIVE: replay is FLAT (no open position) -> not buying anything.")
         return
@@ -1362,6 +1423,277 @@ def run_live_prompt_after_gate(
         live_trade=live_trade,
     )
 
+# =============================================================================
+# Market Cap Gate (CoinGecko primary, CoinPaprika fallback) + caching + 429 backoff
+# =============================================================================
+
+MARKETCAP_MIN_USD = 100_000_000.0  # 100M
+
+def _base_from_usdt_symbol(symbol: str) -> str:
+    s = symbol.strip().upper()
+    if not s.endswith("USDT"):
+        raise ValueError(f"Expected *USDT symbol (e.g. KITEUSDT), got: {symbol}")
+    base = s[:-4]
+    if not base:
+        raise ValueError(f"Bad symbol: {symbol}")
+    return base
+
+def _get_json_with_429_backoff(
+    session: requests.Session,
+    url: str,
+    *,
+    params: dict | None = None,
+    timeout: int = 15,
+    max_attempts: int = 6,
+    base_sleep: float = 1.0,
+):
+    """
+    Retries on 429 with exponential backoff.
+    """
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = session.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                # backoff: 1s, 2s, 4s, 8s... (cap ~30s)
+                sleep_s = min(30.0, base_sleep * (2 ** (attempt - 1)))
+                time.sleep(sleep_s)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(min(10.0, 0.5 * attempt))
+    raise RuntimeError(f"HTTP failed after retries: {last_err}")
+
+def coingecko_trades_on_binance(coin_id: str, session: requests.Session) -> bool:
+    r = session.get(
+        f"https://api.coingecko.com/api/v3/coins/{coin_id}/tickers",
+        params={
+            "exchange_ids": "binance",
+            "include_exchange_logo": "false",
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    tickers = r.json().get("tickers", [])
+    return any(t.get("target") == "USDT" for t in tickers)
+
+# ---------- CoinGecko ----------
+def resolve_coingecko_id_from_usdt_symbol(symbol_usdt: str, session: requests.Session, debug=False) -> str:
+    base = symbol_usdt.replace("USDT", "").lower()
+
+    r = session.get(
+        "https://api.coingecko.com/api/v3/search",
+        params={"query": base},
+        timeout=15,
+    )
+    r.raise_for_status()
+    coins = r.json().get("coins", [])
+
+    if not coins:
+        raise ValueError(f"No CoinGecko results for {symbol_usdt}")
+
+    # Prefer ranked coins first
+    coins.sort(key=lambda c: (c.get("market_cap_rank") is None,
+                              c.get("market_cap_rank", 10**9)))
+
+    for c in coins:
+        cid = c["id"]
+
+        try:
+            if coingecko_trades_on_binance(cid, session):
+                if debug:
+                    print(f"[mc] {symbol_usdt} resolved to {cid} (Binance verified)")
+                return cid
+        except Exception:
+            continue
+
+    raise RuntimeError(f"No Binance-listed CoinGecko match for {symbol_usdt}")
+
+def fetch_market_cap_usd_coingecko(coin_id: str, session: requests.Session) -> float:
+    data = _get_json_with_429_backoff(
+        session,
+        "https://api.coingecko.com/api/v3/simple/price",
+        params={"ids": coin_id, "vs_currencies": "usd", "include_market_cap": "true"},
+        timeout=15,
+        max_attempts=6,
+        base_sleep=1.0,
+    )
+    if coin_id not in data or data[coin_id].get("usd_market_cap") is None:
+        raise RuntimeError(f"CoinGecko missing usd_market_cap for id={coin_id}")
+    return float(data[coin_id]["usd_market_cap"])
+
+def get_market_cap_usd_coingecko(
+    symbol_usdt: str,
+    *,
+    session: requests.Session,
+    mc_cache: dict,
+    cache_path: Optional[Path],
+    debug: bool = False,
+) -> Tuple[str, float]:
+    symbol_usdt = symbol_usdt.upper()
+    key = ("coingecko", symbol_usdt)
+    if key in mc_cache:
+        rec = mc_cache[key]
+        return rec["id"], float(rec["mc"])
+
+    coin_id = resolve_coingecko_id_from_usdt_symbol(symbol_usdt, session=session, debug=debug)
+    mc = fetch_market_cap_usd_coingecko(coin_id, session=session)
+
+    mc_cache[key] = {"id": coin_id, "mc": float(mc)}
+
+    # optional persistence inside your existing json cache
+    if cache_path is not None:
+        try:
+            cache = load_cache(cache_path)
+            cache.setdefault("_marketcap", {})
+            cache["_marketcap"].setdefault("coingecko", {})
+            cache["_marketcap"]["coingecko"][symbol_usdt] = {"id": coin_id, "mc": float(mc), "ts_utc": datetime.utcnow().isoformat()}
+            save_cache(cache_path, cache)
+        except Exception:
+            pass
+
+    return coin_id, float(mc)
+
+# ---------- CoinPaprika fallback ----------
+def _coinpaprika_symbol_map(session: requests.Session, mc_cache: dict) -> Dict[str, str]:
+    """
+    Build symbol->coinpaprika_id map once per run (cached).
+    Note: symbol collisions exist; we pick the first occurrence.
+    """
+    key = ("coinpaprika", "symbol_map")
+    if key in mc_cache:
+        return mc_cache[key]
+
+    coins = session.get("https://api.coinpaprika.com/v1/coins", timeout=30).json()
+    m: Dict[str, str] = {}
+    for c in coins:
+        sym = (c.get("symbol") or "").upper()
+        cid = c.get("id")
+        is_active = c.get("is_active", True)
+        if not sym or not cid or not is_active:
+            continue
+        # first wins (simple); good enough for most symbols
+        m.setdefault(sym, cid)
+
+    mc_cache[key] = m
+    return m
+
+def get_market_cap_usd_coinpaprika(
+    symbol_usdt: str,
+    *,
+    session: requests.Session,
+    mc_cache: dict,
+    debug: bool = False,
+) -> Tuple[str, float]:
+    symbol_usdt = symbol_usdt.upper()
+    base = _base_from_usdt_symbol(symbol_usdt)  # e.g. KITE
+    key = ("coinpaprika", symbol_usdt)
+    if key in mc_cache:
+        rec = mc_cache[key]
+        return rec["id"], float(rec["mc"])
+
+    sym_map = _coinpaprika_symbol_map(session, mc_cache)
+    coin_id = sym_map.get(base.upper())
+    if not coin_id:
+        raise ValueError(f"CoinPaprika: no id found for symbol {base}")
+
+    data = session.get(f"https://api.coinpaprika.com/v1/tickers/{coin_id}", timeout=20).json()
+    mc = (((data.get("quotes") or {}).get("USD") or {}).get("market_cap"))
+    if mc is None:
+        raise RuntimeError(f"CoinPaprika: missing USD market_cap for {coin_id}")
+
+    if debug:
+        print(f"[mc] CP {symbol_usdt} -> {coin_id} name={data.get('name')} mc={mc}")
+
+    mc_cache[key] = {"id": coin_id, "mc": float(mc)}
+    return coin_id, float(mc)
+
+def passes_marketcap_gate(
+    symbol_usdt: str,
+    *,
+    session: requests.Session,
+    mc_cache: dict,
+    cache_path: Path,
+    min_usd: float = MARKETCAP_MIN_USD,
+    debug: bool = False,
+) -> Tuple[bool, float, str, str]:
+    """
+    Returns (passes, market_cap_usd, provider_id, provider_name)
+
+    Policy:
+      1) Check persisted EXTREMES cache first (disk -> loaded once per run).
+      2) Then check per-run memory cache.
+      3) Only if still missing, go online (CoinGecko then CoinPaprika).
+      4) Persist result ONLY if mc >= 100M OR mc <= 50M.
+    """
+    symbol_usdt = symbol_usdt.upper()
+    min_usd = float(min_usd)
+
+    # 1) persisted extremes (NO internet)
+    persisted_map = _load_extreme_mc_map_once(mc_cache, cache_path)
+    if symbol_usdt in persisted_map:
+        rec = persisted_map[symbol_usdt]
+        mc = float(rec["mc"])
+        pid = str(rec.get("id", ""))
+        prov = str(rec.get("provider", ""))
+        return (mc >= min_usd), mc, pid, prov
+
+    # 2) per-run memory (fast)
+    run_key = ("final", symbol_usdt)
+    if run_key in mc_cache:
+        rec = mc_cache[run_key]
+        mc = float(rec["mc"])
+        return (mc >= min_usd), mc, str(rec.get("id", "")), str(rec.get("provider", "none"))
+
+    # 3) CoinGecko
+    try:
+        cid, mc = get_market_cap_usd_coingecko(
+            symbol_usdt,
+            session=session,
+            mc_cache=mc_cache,
+            cache_path=None,   # <— IMPORTANT: don't let the old function persist everything
+            debug=debug,
+        )
+        mc_f = float(mc)
+        mc_cache[run_key] = {"mc": mc_f, "id": cid, "provider": "coingecko"}
+
+        # 4) persist only if extreme
+        _persist_extreme_marketcap(cache_path=cache_path, symbol_usdt=symbol_usdt, mc=mc_f, provider="coingecko", pid=cid)
+
+        # also update in-memory persisted map so later calls don't hit disk
+        if _is_extreme_marketcap(mc_f):
+            persisted_map[symbol_usdt] = {"mc": mc_f, "id": str(cid), "provider": "coingecko", "ts_utc": datetime.utcnow().isoformat()}
+
+        return (mc_f >= min_usd), mc_f, str(cid), "coingecko"
+    except Exception as e:
+        if debug:
+            print(f"[mc] CoinGecko failed for {symbol_usdt}: {e}")
+
+    # 5) CoinPaprika fallback
+    try:
+        pid, mc = get_market_cap_usd_coinpaprika(
+            symbol_usdt,
+            session=session,
+            mc_cache=mc_cache,
+            debug=debug,
+        )
+        mc_f = float(mc)
+        mc_cache[run_key] = {"mc": mc_f, "id": pid, "provider": "coinpaprika"}
+
+        _persist_extreme_marketcap(cache_path=cache_path, symbol_usdt=symbol_usdt, mc=mc_f, provider="coinpaprika", pid=pid)
+
+        if _is_extreme_marketcap(mc_f):
+            persisted_map[symbol_usdt] = {"mc": mc_f, "id": str(pid), "provider": "coinpaprika", "ts_utc": datetime.utcnow().isoformat()}
+
+        return (mc_f >= min_usd), mc_f, str(pid), "coinpaprika"
+    except Exception as e:
+        if debug:
+            print(f"[mc] CoinPaprika failed for {symbol_usdt}: {e}")
+
+    mc_cache[run_key] = {"mc": 0.0, "id": "", "provider": "none"}
+    return (False, 0.0, "", "none")
 
 # =============================================================================
 # Main
@@ -1385,11 +1717,16 @@ def main() -> int:
     ap.add_argument("--no-intraday-resolve", action="store_true",
                     help="Disable intraday disambiguation (faster, less accurate).")
 
-    # ---- MISSING FLAGS (your crash) ----
-    ap.add_argument("--ask-to-buy-today", action="store_true",default=True,
-                    help="After gate+replay, manage open position (or latest gated pick) on Binance.")
-    ap.add_argument("--live-trade", action="store_true",default=True,
+    ap.add_argument("--ask-to-buy-today", action="store_true", default=True,
+                    help="After gate+replay, manage open position on Binance.")
+    ap.add_argument("--live-trade", action="store_true", default=True,
                     help="Actually place orders on Binance (default is DRY-RUN).")
+
+    # Market cap gate flags (optional)
+    ap.add_argument("--min-marketcap-usd", type=float, default=MARKETCAP_MIN_USD,
+                    help="Final gate: require CoinGecko market cap >= this USD amount (default 100M).")
+    ap.add_argument("--marketcap-debug", action="store_true",
+                    help="Print CoinGecko candidate matches for each symbol (debug).")
 
     args = ap.parse_args()
 
@@ -1410,19 +1747,16 @@ def main() -> int:
 
     if trained_through is None:
         trained_through = max(file_dates)
-        print(f"[warn] No 'Model trained_through' found in header. Using latest file date as trained_through: {trained_through.isoformat()}")
+        print(f"[warn] No 'Model trained_through' found. Using latest file date as trained_through: {trained_through.isoformat()}")
 
-    # Calibration = known data (<= trained_through)
     calib_file_dates = [d for d in file_dates if d <= trained_through]
     if not calib_file_dates:
         print(f"ERROR: No calibration blocks <= trained_through ({trained_through.isoformat()}).")
         return 2
     calib_end = max(calib_file_dates)
 
-    # Future = predicted window (> trained_through)
     future_file_dates = [d for d in file_dates if d > calib_end]
 
-    # Group signals by file_date
     sig_by_file: Dict[date, List[SignalRow]] = {}
     for s in signals:
         sig_by_file.setdefault(s.file_date, []).append(s)
@@ -1430,7 +1764,6 @@ def main() -> int:
     lag = int(args.entry_lag_days)
     max_hold = int(args.max_hold_days)
 
-    # Candle range needed for calibration simulation (entry day through hold window)
     calib_min_entry = min(d + timedelta(days=lag) for d in calib_file_dates)
     calib_max_last = max(d + timedelta(days=lag + max_hold) for d in calib_file_dates)
 
@@ -1438,6 +1771,7 @@ def main() -> int:
     fetch_end = min(calib_max_last, today_utc)
 
     session = requests.Session()
+    mc_cache: Dict[tuple, dict] = {}  # in-memory, per-run cache
     cache_path = Path(args.cache_path)
     cache = load_cache(cache_path)
 
@@ -1518,7 +1852,8 @@ def main() -> int:
     print(f"Calibration outcomes: TP={decided_tp}  SL={decided_sl}  OTHER={undecided}  missing_entry={missing}")
     print("-" * 90)
 
-    gate, metrics = pick_best_gate(calib_rows, tp_pct=float(args.tp_pct), sl_pct=float(args.sl_pct))
+    gate, metrics = pick_best_gate(calib_rows)
+
     print("\n" + "=" * 90)
     print("CHOSEN GATE (fit on calibration)")
     print("=" * 90)
@@ -1527,11 +1862,14 @@ def main() -> int:
     print("=" * 90)
 
     if not future_file_dates:
-        print("\n(no future blocks after calibration end â€” nothing to recommend)")
+        print("\n(no future blocks after calibration end — nothing to recommend)")
         return 0
 
+    mc_cache: Dict[tuple, dict] = {}  # keep this (tuple keys used elsewhere)
     print("\n" + "=" * 90)
     print("RECOMMENDED BUYS (apply gate to remaining predicted days)")
+    print("NOTE: FINAL GATE ADDED -> market cap must be >= "
+          f"{_human(float(args.min_marketcap_usd))} USD (CoinGecko)")
     print("=" * 90)
 
     gated_picks_by_file_date: Dict[date, SignalRow] = {}
@@ -1541,18 +1879,43 @@ def main() -> int:
         if not rows:
             continue
 
-        passed = [r for r in rows if passes_gate(r, gate)]
-        passed.sort(key=lambda x: (-x.p, x.drop_p, -x.hits30d, x.symbol))
+        # first apply normal gate
+        prelim = [r for r in rows if passes_gate(r, gate)]
+        prelim.sort(key=lambda x: (-x.p, x.drop_p, -x.hits30d, x.symbol))
 
-        print(f"\nfile={fd.isoformat()}  (passed {len(passed)}/{len(rows)})")
-        if not passed:
+        print(f"\nfile={fd.isoformat()}  (prelim passed {len(prelim)}/{len(rows)})")
+        if not prelim:
             print("  (none)")
             continue
 
-        for i, r in enumerate(passed, start=1):
-            print(f"  #{i:02d} BUY {r.symbol:10s}  p={r.p:.3f}  hits30d={r.hits30d:2d}  featDropP={r.drop_p:.3f}")
+        # now apply FINAL market cap gate
+        final_passed: List[SignalRow] = []
+        for r in prelim:
+            ok, mc, pid, provider = passes_marketcap_gate(
+                r.symbol,
+                session=session,
+                mc_cache=mc_cache,
+                cache_path=cache_path,
+                min_usd=float(args.min_marketcap_usd),
+                debug=bool(args.marketcap_debug),
+            )
+            if ok:
+                final_passed.append(r)
+                print(
+                    f"  PASS  BUY {r.symbol:10s}  p={r.p:.3f} hits30d={r.hits30d:2d} featDropP={r.drop_p:.3f}  mc={_human(mc)} USD  ({provider}:{pid})")
+            else:
+                if mc > 0:
+                    print(
+                        f"  FAIL  {r.symbol:10s}  (market cap {_human(mc)} USD < {_human(float(args.min_marketcap_usd))} USD)")
+                else:
+                    print(f"  FAIL  {r.symbol:10s}  (market cap lookup failed)")
+        if not final_passed:
+            print("  (none after market cap gate)")
+            continue
 
-        gated_picks_by_file_date[fd] = passed[0]  # #01 per day
+        # If multiple remain, keep your ordering: highest p, lower drop, higher hits
+        final_passed.sort(key=lambda x: (-x.p, x.drop_p, -x.hits30d, x.symbol))
+        gated_picks_by_file_date[fd] = final_passed[0]  # #01 per day
 
     trades, compounded_factor, open_pos = replay_single_position_from_gated_picks(
         gated_picks_by_file_date=gated_picks_by_file_date,
@@ -1583,25 +1946,23 @@ def main() -> int:
             )
 
     if open_pos is not None:
-     print("\nOPEN POSITION (not closed yet):")
-     print(
+        print("\nOPEN POSITION (not closed yet):")
+        print(
             f"  {open_pos['symbol']}  "
             f"signal_file={open_pos['file_date'].isoformat()}  "
             f"entry={open_pos['entry_day'].isoformat()}  "
             f"open={open_pos['entry_open']:.8g}  "
             f"last_day={open_pos['last_day'].isoformat()}  "
             f"last_close={open_pos['last_close']:.8g}  "
-            f"unrealized={open_pos['unrealized_pct']:+.2f}%  "
-            f"max_high={open_pos['max_high_since_entry']:.8g}  "
-            f"max_runup={open_pos['max_runup_pct']:+.2f}%"
+            f"unrealized={open_pos['unrealized_pct']:+.2f}%"
         )
+
     compounded_pct = (compounded_factor - 1.0) * 100.0
     print("\n" + "-" * 90)
     print(f"Compounded factor: {compounded_factor:.6f}")
     print(f"Compounded gain:   {compounded_pct:+.2f}%")
     print("-" * 90)
 
-    # ---- LIVE prompt (optional) ----
     if args.ask_to_buy_today:
         run_live_prompt_after_gate(
             open_pos=open_pos,
@@ -1616,8 +1977,5 @@ def main() -> int:
     return 0
 
 
-
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

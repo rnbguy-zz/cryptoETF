@@ -288,9 +288,25 @@ def get_candles_cached(
     cache: dict,
     cache_path: Path,
 ) -> Dict[date, Candle]:
+    """
+    Cached 1d candles with a critical fix:
+      - Force refresh for the most recent 1-2 UTC days because Binance 1d candle is "still forming"
+        and the day's HIGH/LOW/CLOSE can change during the day.
+    """
     sym = symbol.upper()
     cache.setdefault(sym, {}).setdefault("candles_1d", {})
     have = cache[sym]["candles_1d"]
+
+    # ---- NEW: refresh the most recent days (UTC) so H/L are correct intraday ----
+    today_utc = datetime.utcnow().date()
+    refresh_days: List[date] = []
+    if end_day >= today_utc:
+        # refresh last 4 days (today..today-3) to avoid stale "still forming" cache issues
+        for k in range(0, 4):
+            refresh_days.append(today_utc - timedelta(days=k))
+
+    for d in refresh_days:
+        have.pop(d.isoformat(), None)  # delete so it becomes "missing" and is refetched
 
     need_days = [start_day + timedelta(days=i) for i in range((end_day - start_day).days + 1)]
     missing = [d for d in need_days if d.isoformat() not in have]
@@ -306,9 +322,14 @@ def get_candles_cached(
     for d in need_days:
         rec = have.get(d.isoformat())
         if rec:
-            out[d] = Candle(day=d, o=float(rec["o"]), h=float(rec["h"]), l=float(rec["l"]), c=float(rec["c"]))
+            out[d] = Candle(
+                day=d,
+                o=float(rec["o"]),
+                h=float(rec["h"]),
+                l=float(rec["l"]),
+                c=float(rec["c"]),
+            )
     return out
-
 
 def get_intraday_cached_for_day(
     symbol: str,
@@ -482,15 +503,8 @@ class CalibRow:
     outcome: str  # "TP" | "SL" | "OTHER"
 
 
-def score_gate(rows: List[CalibRow], gate: Gate) -> Tuple[float, int, int, int]:
-    """
-    Returns: (precision, taken, tp, sl)
-    Precision is computed on TP/(TP+SL) for taken rows where outcome in {TP,SL}.
-    OTHER outcomes are counted in taken but do not affect precision denominator.
-    """
-    taken = 0
-    tp = 0
-    sl = 0
+def score_gate_ev(rows: List[CalibRow], gate: Gate, tp_pct: float, sl_pct: float) -> dict:
+    taken = tp = sl = other = 0
     for r in rows:
         if passes_gate(r.sig, gate):
             taken += 1
@@ -498,62 +512,75 @@ def score_gate(rows: List[CalibRow], gate: Gate) -> Tuple[float, int, int, int]:
                 tp += 1
             elif r.outcome == "SL":
                 sl += 1
+            else:
+                other += 1
 
-    denom = tp + sl
-    prec = (tp / denom) if denom > 0 else 0.0
-    return prec, taken, tp, sl
+    decided = tp + sl
+    precision = (tp / decided) if decided else 0.0
+
+    # Expected value per trade (on decided only), and total EV
+    ev_total = tp * tp_pct - sl * sl_pct
+    ev_per_decided = (ev_total / decided) if decided else -999.0
+
+    return {
+        "taken": taken, "tp": tp, "sl": sl, "other": other,
+        "decided": decided,
+        "precision": precision,
+        "ev_total": ev_total,
+        "ev_per_decided": ev_per_decided,
+    }
 
 
-def pick_best_gate(rows: List[CalibRow]) -> Tuple[Gate, Dict[str, float]]:
-    # Coarse-but-safe grid (fast + avoids overfit)
+def pick_best_gate(rows: List[CalibRow], tp_pct: float, sl_pct: float) -> Tuple[Gate, Dict[str, float]]:
+    # Expand grid downward so it can actually choose "lower drop" when it helps
     p_grid = [0.50, 0.52, 0.54, 0.55, 0.56, 0.58, 0.60, 0.62, 0.65, 0.70, 0.75]
-    drop_grid = [0.40, 0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65, 0.70]
+    drop_grid = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65]
     hits_grid = [1, 2, 3, 4, 5, 8, 10, 12, 15]
 
-    best_gate = Gate(0.60, 0.60, 3)
-    best = (-1.0, -1, -1, 10**9)  # (precision, tp, taken, sl) with sl as tie-breaker (lower better)
-
-    # Require at least some decided outcomes exist in calibration
     decided = [r for r in rows if r.outcome in ("TP", "SL")]
-    if len(decided) == 0:
-        # fallback gate (your current empiric)
-        return best_gate, {"precision": 0.0, "taken": 0, "tp": 0, "sl": 0}
+    if len(decided) < 8:
+        # With tiny calibration, avoid "false certainty":
+        # fall back to a conservative gate that doesn't overfit too hard.
+        fallback = Gate(0.55, 0.60, 3)
+        m = score_gate_ev(rows, fallback, tp_pct, sl_pct)
+        return fallback, m
+
+    best_gate = Gate(0.55, 0.60, 3)
+    best = None
 
     for pmin in p_grid:
         for dmax in drop_grid:
             for hmin in hits_grid:
                 gate = Gate(pmin, dmax, hmin)
-                prec, taken, tp, sl = score_gate(rows, gate)
+                m = score_gate_ev(rows, gate, tp_pct, sl_pct)
 
-                # Hard constraints to avoid silly "precision=1.0 with 1 trade"
-                if (tp + sl) < 2:
-                    continue
-                if tp < 1:
+                # constraints: need enough "evidence"
+                if m["decided"] < 6:
                     continue
 
-                cand = (prec, tp, taken, sl)
-                if cand[0] > best[0]:
-                    best = cand
-                    best_gate = gate
-                elif cand[0] == best[0]:
-                    # tie-break: prefer more TP
-                    if cand[1] > best[1]:
-                        best = cand
-                        best_gate = gate
-                    elif cand[1] == best[1]:
-                        # then prefer fewer SL
-                        if cand[3] < best[3]:
-                            best = cand
-                            best_gate = gate
-                        elif cand[3] == best[3]:
-                            # then prefer more taken (coverage)
-                            if cand[2] > best[2]:
-                                best = cand
-                                best_gate = gate
+                # Primary: maximize total EV
+                # Tie-breakers: fewer SL, more decided, then LOWER drop_max (your preference), then more taken
+                key = (
+                    m["ev_total"],
+                    -m["sl"],
+                    m["decided"],
+                    -dmax,
+                    m["taken"],
+                    -pmin,
+                    -hmin,
+                )
 
-    prec, taken, tp, sl = score_gate(rows, best_gate)
-    return best_gate, {"precision": prec, "taken": taken, "tp": tp, "sl": sl}
+                if best is None or key > best[0]:
+                    best = (key, gate, m)
 
+    if best is None:
+        # if nothing satisfied constraints, loosen
+        fallback = Gate(0.52, 0.65, 1)
+        m = score_gate_ev(rows, fallback, tp_pct, sl_pct)
+        return fallback, m
+
+    _, g, m = best
+    return g, m
 # =============================================================================
 # Replay (single-position) + compounding (ETF Algo style)
 # =============================================================================
@@ -660,17 +687,6 @@ def replay_single_position_from_gated_picks(
     resolve_ambiguous_intraday: bool,
     end_day: Optional[date] = None,  # default today UTC
 ) -> Tuple[List["ReplayTrade"], float, Optional[dict]]:
-    """
-    Single-position replay (NO ROLLING):
-      - If FLAT: enter the pick for file_date on entry_day = file_date + entry_lag_days (at OPEN).
-      - If HOLDING: ignore ALL new picks until exit.
-      - Exit ONLY on TP/SL (intraday resolve when both hit same day) OR max_hold_days at CLOSE.
-
-    Returns:
-      trades            List[ReplayTrade] for CLOSED trades only
-      compounded_factor Product of (1 + gain) for CLOSED trades only
-      open_pos          dict describing OPEN position at end_day (or None)
-    """
     if not gated_picks_by_file_date:
         return [], 1.0, None
 
@@ -760,7 +776,15 @@ def replay_single_position_from_gated_picks(
                     holding_entry_day = None
                     holding_file_date = None
 
+                # >>> ADD THIS DEBUG BLOCK HERE <<<
+        if holding_symbol is not None:
+                    for fd, sig in gated_picks_by_file_date.items():
+                        if fd + timedelta(days=entry_lag_days) == d:
+                            print(
+                                f"BLOCKED: wanted {sig.symbol} on {d} but holding {holding_symbol} from {holding_entry_day}")
+
         # 2) If FLAT, see if a pick becomes active today (entry_day == d)
+        print(f"{holding_symbol} entry:{holding_entry_day}")
         if holding_symbol is None:
             candidates: List[SignalRow] = []
             for fd, sig in gated_picks_by_file_date.items():
@@ -798,7 +822,6 @@ def replay_single_position_from_gated_picks(
                         reason0, exit_px0 = hit0
                         g0 = _gain_pct(holding_entry_open, float(exit_px0))
                         compounded *= (1.0 + g0 / 100.0)
-
                         trades.append(
                             ReplayTrade(
                                 symbol=holding_symbol,
@@ -807,12 +830,11 @@ def replay_single_position_from_gated_picks(
                                 entry_open=holding_entry_open,
                                 exit_day=d,
                                 exit_price=float(exit_px0),
-                                exit_reason=reason0,
+                                exit_reason=reason0,  # will be "TP" or "SL" etc
                                 gain_pct=g0,
                             )
                         )
-
-                        # go FLAT immediately (so later days aren't blocked)
+                        # go FLAT immediately (so next days are not blocked)
                         holding_symbol = None
                         holding_entry_open = 0.0
                         holding_entry_day = None
@@ -822,75 +844,113 @@ def replay_single_position_from_gated_picks(
 
     # Build open position summary (if still holding at end_day)
     # Build open position summary (if still holding at end_day)
+    # Build open position summary (and optionally auto-close if TP/SL was touched)
     open_pos: Optional[dict] = None
     if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
-        # default mark using latest daily candle close (may be stale intra-day)
-        c_last = candles_by_symbol.get(holding_symbol, {}).get(end_day)
-        last_close = c_last.c if c_last else holding_entry_open
+        tp_price = holding_entry_open * (1.0 + tp_pct)
+        sl_price = holding_entry_open * (1.0 - sl_pct)
 
-        # ---- NEW: mark-to-market using LIVE ticker price "as of now" ----
-        # Only meaningful for today's UTC day (otherwise price isn't relevant for historical day)
+        candles_map = candles_by_symbol.get(holding_symbol, {})
+
+        # mark-to-market (latest daily close)
+        c_last = candles_map.get(end_day)
+        last_mark = c_last.c if c_last else holding_entry_open
+
+        # scan daily highs/lows since entry
+        max_high = holding_entry_open
+        min_low = holding_entry_open
+
+        d2 = holding_entry_day
+        while d2 <= end_day:
+            c = candles_map.get(d2)
+            if c is not None:
+                if c.h > max_high:
+                    max_high = c.h
+                if c.l < min_low:
+                    min_low = c.l
+            d2 += timedelta(days=1)
+
+        # if today UTC, refine with intraday extremes for today
         if end_day == datetime.utcnow().date():
             try:
-                live_px = fetch_live_price(holding_symbol, session=session)
-                last_close = live_px  # override mark with live
-                tp_price = holding_entry_open * (1.0 + tp_pct)
-                sl_price = holding_entry_open * (1.0 - sl_pct)
+                intra = get_intraday_cached_for_day(
+                    holding_symbol,
+                    end_day,
+                    interval=intraday_interval,
+                    session=session,
+                    cache=cache,
+                    cache_path=cache_path,
+                )
+                if intra:
+                    day_high = max(x.h for x in intra)
+                    day_low = min(x.l for x in intra)
 
-                # If live price is beyond TP/SL, close it NOW
-                if live_px >= tp_price:
-                    g = _gain_pct(holding_entry_open, float(tp_price))
-                    compounded *= (1.0 + g / 100.0)
-                    trades.append(
-                        ReplayTrade(
-                            symbol=holding_symbol,
-                            file_date=holding_file_date,
-                            entry_day=holding_entry_day,
-                            entry_open=holding_entry_open,
-                            exit_day=end_day,
-                            exit_price=float(tp_price),
-                            exit_reason="TP_NOW",
-                            gain_pct=g,
-                        )
-                    )
-                    holding_symbol = None
-                    holding_entry_open = 0.0
-                    holding_entry_day = None
-                    holding_file_date = None
+                    if day_high > max_high:
+                        max_high = day_high
+                    if day_low < min_low:
+                        min_low = day_low
 
-                elif live_px <= sl_price:
-                    g = _gain_pct(holding_entry_open, float(sl_price))
-                    compounded *= (1.0 + g / 100.0)
-                    trades.append(
-                        ReplayTrade(
-                            symbol=holding_symbol,
-                            file_date=holding_file_date,
-                            entry_day=holding_entry_day,
-                            entry_open=holding_entry_open,
-                            exit_day=end_day,
-                            exit_price=float(sl_price),
-                            exit_reason="SL_NOW",
-                            gain_pct=g,
-                        )
-                    )
-                    holding_symbol = None
-                    holding_entry_open = 0.0
-                    holding_entry_day = None
-                    holding_file_date = None
+                    # better real-time mark
+                    last_mark = intra[-1].c
             except Exception:
                 pass
 
-        # If still holding after NOW-check, report open position
+        # ---- NEW: auto-close if TP/SL was TOUCHED any time since entry ----
+        if max_high >= tp_price:
+            g = _gain_pct(holding_entry_open, float(tp_price))
+            compounded *= (1.0 + g / 100.0)
+            trades.append(
+                ReplayTrade(
+                    symbol=holding_symbol,
+                    file_date=holding_file_date,
+                    entry_day=holding_entry_day,
+                    entry_open=holding_entry_open,
+                    exit_day=min(d for d,c in candles_by_symbol[holding_symbol].items() if d >= holding_entry_day and c.h >= tp_price),
+                    exit_price=float(tp_price),
+                    exit_reason="TP_TOUCHED_SINCE_ENTRY",
+                    gain_pct=g,
+                )
+            )
+            holding_symbol = None
+            holding_entry_open = 0.0
+            holding_entry_day = None
+            holding_file_date = None
+
+        elif min_low <= sl_price:
+            g = _gain_pct(holding_entry_open, float(sl_price))
+            compounded *= (1.0 + g / 100.0)
+            trades.append(
+                ReplayTrade(
+                    symbol=holding_symbol,
+                    file_date=holding_file_date,
+                    entry_day=holding_entry_day,
+                    entry_open=holding_entry_open,
+                    exit_day=end_day,
+                    exit_price=float(sl_price),
+                    exit_reason="SL_TOUCHED_SINCE_ENTRY",
+                    gain_pct=g,
+                )
+            )
+            holding_symbol = None
+            holding_entry_open = 0.0
+            holding_entry_day = None
+            holding_file_date = None
+
+        # If still holding after touched-check, report open position
         if holding_symbol is not None and holding_entry_day is not None and holding_file_date is not None:
-            unreal = (last_close / max(holding_entry_open, 1e-12) - 1.0) * 100.0
+            current_unreal = (last_mark / max(holding_entry_open, 1e-12) - 1.0) * 100.0
+            max_runup = (max_high / max(holding_entry_open, 1e-12) - 1.0) * 100.0
+
             open_pos = {
                 "symbol": holding_symbol,
                 "file_date": holding_file_date,
                 "entry_day": holding_entry_day,
                 "entry_open": float(holding_entry_open),
                 "last_day": end_day,
-                "last_close": float(last_close),
-                "unrealized_pct": float(unreal),
+                "last_close": float(last_mark),
+                "unrealized_pct": float(current_unreal),
+                "max_high_since_entry": float(max_high),
+                "max_runup_pct": float(max_runup),
             }
 
     return trades, compounded, open_pos
@@ -1129,7 +1189,7 @@ def _find_exit_orders(open_orders: list) -> Tuple[Optional[dict], Optional[dict]
     Heuristic:
       - TP typically shows as LIMIT
       - SL leg shows as STOP_LOSS_LIMIT (but OCO legs may appear differently across accounts)
-    This is “good enough” to avoid stacking extra exits.
+    This is â€œgood enoughâ€ to avoid stacking extra exits.
     """
     tp = None
     sl = None
@@ -1197,14 +1257,14 @@ def live_manage_or_buy_with_oco(
     tp_order, sl_order = _find_exit_orders(open_orders)
 
     if tp_order or sl_order:
-        print("Existing exit orders detected — not placing another OCO.")
+        print("Existing exit orders detected â€” not placing another OCO.")
         if tp_order:
             print(f"  TP: type={tp_order.get('type')} price={tp_order.get('price')} orderId={tp_order.get('orderId')}")
         if sl_order:
             print(f"  SL: type={sl_order.get('type')} stopPrice={sl_order.get('stopPrice')} orderId={sl_order.get('orderId')}")
         return True
 
-    holding_threshold = step_size  # “>= 1 step” means we consider it a holding
+    holding_threshold = step_size  # â€œ>= 1 stepâ€ means we consider it a holding
 
     # ---- If holding: just place exits for FREE qty ----
     if total_base >= holding_threshold:
@@ -1458,8 +1518,7 @@ def main() -> int:
     print(f"Calibration outcomes: TP={decided_tp}  SL={decided_sl}  OTHER={undecided}  missing_entry={missing}")
     print("-" * 90)
 
-    gate, metrics = pick_best_gate(calib_rows)
-
+    gate, metrics = pick_best_gate(calib_rows, tp_pct=float(args.tp_pct), sl_pct=float(args.sl_pct))
     print("\n" + "=" * 90)
     print("CHOSEN GATE (fit on calibration)")
     print("=" * 90)
@@ -1468,7 +1527,7 @@ def main() -> int:
     print("=" * 90)
 
     if not future_file_dates:
-        print("\n(no future blocks after calibration end — nothing to recommend)")
+        print("\n(no future blocks after calibration end â€” nothing to recommend)")
         return 0
 
     print("\n" + "=" * 90)
@@ -1524,17 +1583,18 @@ def main() -> int:
             )
 
     if open_pos is not None:
-        print("\nOPEN POSITION (not closed yet):")
-        print(
+     print("\nOPEN POSITION (not closed yet):")
+     print(
             f"  {open_pos['symbol']}  "
             f"signal_file={open_pos['file_date'].isoformat()}  "
             f"entry={open_pos['entry_day'].isoformat()}  "
             f"open={open_pos['entry_open']:.8g}  "
             f"last_day={open_pos['last_day'].isoformat()}  "
             f"last_close={open_pos['last_close']:.8g}  "
-            f"unrealized={open_pos['unrealized_pct']:+.2f}%"
+            f"unrealized={open_pos['unrealized_pct']:+.2f}%  "
+            f"max_high={open_pos['max_high_since_entry']:.8g}  "
+            f"max_runup={open_pos['max_runup_pct']:+.2f}%"
         )
-
     compounded_pct = (compounded_factor - 1.0) * 100.0
     print("\n" + "-" * 90)
     print(f"Compounded factor: {compounded_factor:.6f}")
@@ -1559,5 +1619,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
